@@ -159,10 +159,17 @@ impl MoexProvider {
             .collect()
     }
 
-    /// Get the first row matching the primary board (TQBR), or fallback to first available row.
+    /// Get the first row matching the primary board (TQBR for stocks, CETS for currency),
+    /// or fallback to first available row.
     fn get_primary_board_data(data: &MoexDataTable) -> Option<Vec<Option<serde_json::Value>>> {
-        // Try primary board first
+        // Try stock engine primary board first
         let filtered = Self::filter_by_board(data, PRIMARY_BOARD);
+        if !filtered.is_empty() {
+            return filtered.into_iter().next().cloned();
+        }
+
+        // Try currency engine primary board
+        let filtered = Self::filter_by_board(data, "CETS");
         if !filtered.is_empty() {
             return filtered.into_iter().next().cloned();
         }
@@ -216,6 +223,85 @@ impl MoexProvider {
             currency.to_string()
         }
     }
+
+    /// Parse latest quote from a MOEX response.
+    fn parse_latest_quote(
+        &self,
+        body: MoexLatestResponse,
+        symbol: &str,
+        context: &QuoteContext,
+    ) -> Result<Quote, MarketDataError> {
+        let marketdata = body
+            .marketdata
+            .ok_or_else(|| MarketDataError::NoDataForRange)?;
+
+        // Find primary board data
+        let row = Self::get_primary_board_data(&marketdata)
+            .ok_or_else(|| MarketDataError::SymbolNotFound(symbol.to_string()))?;
+
+        // Extract trade date from dataversion (if available)
+        let trade_date = body.dataversion.as_ref().and_then(|dv| {
+            let trade_date_col = Self::find_column_index(&dv.columns, "trade_date");
+            dv.data
+                .first()
+                .and_then(|r| Self::extract_string_value(r, trade_date_col))
+        });
+
+        debug!(
+            "MOEX latest quote: trade_date={:?}, symbol={}",
+            trade_date, symbol
+        );
+
+        // Extract column indices
+        let last_col = Self::find_column_index(&marketdata.columns, "LAST");
+        let open_col = Self::find_column_index(&marketdata.columns, "OPEN");
+        let high_col = Self::find_column_index(&marketdata.columns, "HIGH");
+        let low_col = Self::find_column_index(&marketdata.columns, "LOW");
+        let volume_col = Self::find_column_index(&marketdata.columns, "VOLTODAY");
+        let time_col = Self::find_column_index(&marketdata.columns, "UPDATETIME");
+
+        // Extract values
+        let close = Self::extract_f64_value(&row, last_col)
+            .ok_or_else(|| MarketDataError::NoDataForRange)?;
+
+        let close = Decimal::try_from(close).map_err(|_| MarketDataError::ValidationFailed {
+            message: "Failed to convert price to decimal".to_string(),
+        })?;
+
+        let open = Self::extract_f64_value(&row, open_col).and_then(|v| Decimal::try_from(v).ok());
+        let high = Self::extract_f64_value(&row, high_col).and_then(|v| Decimal::try_from(v).ok());
+        let low = Self::extract_f64_value(&row, low_col).and_then(|v| Decimal::try_from(v).ok());
+        let volume =
+            Self::extract_f64_value(&row, volume_col).and_then(|v| Decimal::try_from(v).ok());
+
+        // Parse timestamp
+        let update_time = Self::extract_string_value(&row, time_col);
+
+        let timestamp = match (&trade_date, &update_time) {
+            (Some(date), Some(time)) => Self::parse_market_timestamp(date, time),
+            (Some(date), None) => Self::parse_historical_date(date),
+            _ => None,
+        }
+        .unwrap_or_else(Utc::now);
+
+        // Determine currency
+        let currency = context
+            .currency_hint
+            .as_ref()
+            .map(|c| Self::normalize_currency(c))
+            .unwrap_or_else(|| "RUB".to_string());
+
+        Ok(Quote::ohlcv(
+            timestamp,
+            open.unwrap_or(close),
+            high.unwrap_or(close),
+            low.unwrap_or(close),
+            close,
+            volume.unwrap_or_default(),
+            currency,
+            PROVIDER_ID.to_string(),
+        ))
+    }
 }
 
 // ============================================================================
@@ -268,102 +354,43 @@ impl MarketDataProvider for MoexProvider {
         let symbol = instrument.to_symbol_string();
         debug!("MOEX: Fetching latest quote for {}", symbol);
 
-        // Build URL for latest quote
-        let url = format!(
-            "{}/engines/stock/markets/shares/securities/{}.json",
-            BASE_URL, symbol
-        );
+        // Try stock engine first, then currency engine
+        let endpoints = [
+            format!(
+                "{}/engines/stock/markets/shares/securities/{}.json",
+                BASE_URL, symbol
+            ),
+            format!(
+                "{}/engines/currency/markets/selt/securities/{}.json",
+                BASE_URL, symbol
+            ),
+        ];
 
-        let resp = self.make_request(&url).await?;
+        let mut last_error = None;
 
-        if !resp.status().is_success() {
-            return Err(MarketDataError::SymbolNotFound(symbol));
+        for url in &endpoints {
+            let resp = self.make_request(url).await?;
+
+            if !resp.status().is_success() {
+                continue;
+            }
+
+            let body: MoexLatestResponse =
+                resp.json()
+                    .await
+                    .map_err(|e| MarketDataError::ProviderError {
+                        provider: PROVIDER_ID.to_string(),
+                        message: format!("Failed to parse response: {}", e),
+                    })?;
+
+            if let Some(ref marketdata) = body.marketdata {
+                if !marketdata.data.is_empty() {
+                    return self.parse_latest_quote(body, &symbol, context);
+                }
+            }
         }
 
-        let body: MoexLatestResponse =
-            resp.json()
-                .await
-                .map_err(|e| MarketDataError::ProviderError {
-                    provider: PROVIDER_ID.to_string(),
-                    message: format!("Failed to parse response: {}", e),
-                })?;
-
-        let marketdata = body
-            .marketdata
-            .ok_or_else(|| MarketDataError::NoDataForRange)?;
-
-        // Find primary board data
-        let row = Self::get_primary_board_data(&marketdata)
-            .ok_or_else(|| MarketDataError::SymbolNotFound(symbol.clone()))?;
-
-        // Extract trade date from dataversion (if available)
-        let trade_date = body.dataversion.as_ref().and_then(|dv| {
-            let trade_date_col = Self::find_column_index(&dv.columns, "trade_date");
-            dv.data
-                .first()
-                .and_then(|r| Self::extract_string_value(r, trade_date_col))
-        });
-
-        debug!(
-            "MOEX latest quote: trade_date={:?}, symbol={}",
-            trade_date, symbol
-        );
-
-        // Extract column indices
-        let last_col = Self::find_column_index(&marketdata.columns, "LAST");
-        let open_col = Self::find_column_index(&marketdata.columns, "OPEN");
-        let high_col = Self::find_column_index(&marketdata.columns, "HIGH");
-        let low_col = Self::find_column_index(&marketdata.columns, "LOW");
-        let volume_col = Self::find_column_index(&marketdata.columns, "VOLTODAY");
-        let time_col = Self::find_column_index(&marketdata.columns, "UPDATETIME");
-        let currency_col = Self::find_column_index(&marketdata.columns, "CURRENCYID");
-
-        // Extract values
-        let close = Self::extract_f64_value(&row, last_col)
-            .ok_or_else(|| MarketDataError::NoDataForRange)?;
-
-        let close = Decimal::try_from(close).map_err(|_| MarketDataError::ValidationFailed {
-            message: "Failed to convert price to decimal".to_string(),
-        })?;
-
-        let open = Self::extract_f64_value(&row, open_col).and_then(|v| Decimal::try_from(v).ok());
-        let high = Self::extract_f64_value(&row, high_col).and_then(|v| Decimal::try_from(v).ok());
-        let low = Self::extract_f64_value(&row, low_col).and_then(|v| Decimal::try_from(v).ok());
-        let volume =
-            Self::extract_f64_value(&row, volume_col).and_then(|v| Decimal::try_from(v).ok());
-
-        // Parse timestamp
-        // marketdata has UPDATETIME (time only), trade date comes from dataversion
-        let update_time = Self::extract_string_value(&row, time_col);
-
-        let timestamp = match (&trade_date, &update_time) {
-            (Some(date), Some(time)) => Self::parse_market_timestamp(date, time),
-            (Some(date), None) => Self::parse_historical_date(date),
-            _ => None,
-        }
-        .unwrap_or_else(Utc::now);
-
-        // Determine currency
-        let currency = Self::extract_string_value(&row, currency_col)
-            .map(|c| Self::normalize_currency(&c))
-            .or_else(|| {
-                context
-                    .currency_hint
-                    .as_ref()
-                    .map(|c| Self::normalize_currency(c))
-            })
-            .unwrap_or_else(|| "RUB".to_string());
-
-        Ok(Quote::ohlcv(
-            timestamp,
-            open.unwrap_or(close),
-            high.unwrap_or(close),
-            low.unwrap_or(close),
-            close,
-            volume.unwrap_or_default(),
-            currency,
-            PROVIDER_ID.to_string(),
-        ))
+        Err(last_error.unwrap_or_else(|| MarketDataError::SymbolNotFound(symbol)))
     }
 
     async fn get_historical_quotes(
@@ -381,133 +408,137 @@ impl MarketDataProvider for MoexProvider {
             end.format("%Y-%m-%d")
         );
 
-        // Build URL for historical data
-        let url = format!(
-            "{}/history/engines/stock/markets/shares/securities/{}.json?from={}&till={}",
-            BASE_URL,
-            symbol,
-            start.format("%Y-%m-%d"),
-            end.format("%Y-%m-%d")
-        );
+        // Try stock engine first, then currency engine
+        let endpoints = [
+            format!(
+                "{}/history/engines/stock/markets/shares/securities/{}.json?from={}&till={}",
+                BASE_URL,
+                symbol,
+                start.format("%Y-%m-%d"),
+                end.format("%Y-%m-%d")
+            ),
+            format!(
+                "{}/history/engines/currency/markets/selt/securities/{}.json?from={}&till={}",
+                BASE_URL,
+                symbol,
+                start.format("%Y-%m-%d"),
+                end.format("%Y-%m-%d")
+            ),
+        ];
 
-        let resp = self.make_request(&url).await?;
+        let mut all_quotes: Vec<Quote> = Vec::new();
 
-        if !resp.status().is_success() {
-            return Err(MarketDataError::SymbolNotFound(symbol));
-        }
+        for url in &endpoints {
+            let resp = self.make_request(url).await?;
 
-        let body: MoexHistoryResponse =
-            resp.json()
-                .await
-                .map_err(|e| MarketDataError::ProviderError {
-                    provider: PROVIDER_ID.to_string(),
-                    message: format!("Failed to parse response: {}", e),
-                })?;
+            if !resp.status().is_success() {
+                continue;
+            }
 
-        let history = body.history;
+            let body: MoexHistoryResponse =
+                resp.json()
+                    .await
+                    .map_err(|e| MarketDataError::ProviderError {
+                        provider: PROVIDER_ID.to_string(),
+                        message: format!("Failed to parse response: {}", e),
+                    })?;
 
-        // History endpoint returns one row per trading date, all with BOARDID = TQBR.
-        // Filter all rows to get all trading dates.
-        let rows = Self::filter_by_board(&history, PRIMARY_BOARD);
+            let history = body.history;
 
-        debug!(
-            "MOEX history response: {} columns, {} total rows, {} TQBR rows",
-            history.columns.len(),
-            history.data.len(),
-            rows.len()
-        );
+            if history.data.is_empty() {
+                continue;
+            }
 
-        if rows.is_empty() {
-            return Err(MarketDataError::NoDataForRange);
-        }
+            debug!(
+                "MOEX history response: {} columns, {} rows",
+                history.columns.len(),
+                history.data.len()
+            );
 
-        // Extract column indices
-        let close_col = Self::find_column_index(&history.columns, "CLOSE");
-        let open_col = Self::find_column_index(&history.columns, "OPEN");
-        let high_col = Self::find_column_index(&history.columns, "HIGH");
-        let low_col = Self::find_column_index(&history.columns, "LOW");
-        let volume_col = Self::find_column_index(&history.columns, "VOLUME");
-        let tradedate_col = Self::find_column_index(&history.columns, "TRADEDATE");
-        let currency_col = Self::find_column_index(&history.columns, "CURRENCYID");
+            // Extract column indices
+            let close_col = Self::find_column_index(&history.columns, "CLOSE");
+            let open_col = Self::find_column_index(&history.columns, "OPEN");
+            let high_col = Self::find_column_index(&history.columns, "HIGH");
+            let low_col = Self::find_column_index(&history.columns, "LOW");
+            let volume_col = Self::find_column_index(&history.columns, "VOLUME");
+            let tradedate_col = Self::find_column_index(&history.columns, "TRADEDATE");
 
-        // Determine currency (from first row or context)
-        let currency = rows
-            .first()
-            .and_then(|row| Self::extract_string_value(row, currency_col))
-            .map(|c| Self::normalize_currency(c.as_str()))
-            .or_else(|| {
-                context
-                    .currency_hint
-                    .as_ref()
-                    .map(|c| Self::normalize_currency(c.as_ref()))
-            })
-            .unwrap_or_else(|| "RUB".to_string());
+            // Determine currency from context
+            let currency = context
+                .currency_hint
+                .as_ref()
+                .map(|c| Self::normalize_currency(c))
+                .unwrap_or_else(|| "RUB".to_string());
 
-        // Parse rows into quotes
-        let mut quotes = Vec::new();
+            // Process all rows
+            for row in &history.data {
+                let close =
+                    Self::extract_f64_value(row, close_col).and_then(|v| Decimal::try_from(v).ok());
 
-        for row in &rows {
-            let close =
-                Self::extract_f64_value(row, close_col).and_then(|v| Decimal::try_from(v).ok());
+                let close = match close {
+                    Some(c) => c,
+                    None => continue,
+                };
 
-            let close = match close {
-                Some(c) => c,
-                None => continue, // Skip rows without close price
-            };
+                let open =
+                    Self::extract_f64_value(row, open_col).and_then(|v| Decimal::try_from(v).ok());
+                let high =
+                    Self::extract_f64_value(row, high_col).and_then(|v| Decimal::try_from(v).ok());
+                let low =
+                    Self::extract_f64_value(row, low_col).and_then(|v| Decimal::try_from(v).ok());
+                let volume = Self::extract_f64_value(row, volume_col)
+                    .and_then(|v| Decimal::try_from(v).ok());
 
-            let open =
-                Self::extract_f64_value(row, open_col).and_then(|v| Decimal::try_from(v).ok());
-            let high =
-                Self::extract_f64_value(row, high_col).and_then(|v| Decimal::try_from(v).ok());
-            let low = Self::extract_f64_value(row, low_col).and_then(|v| Decimal::try_from(v).ok());
-            let volume =
-                Self::extract_f64_value(row, volume_col).and_then(|v| Decimal::try_from(v).ok());
+                let timestamp = Self::extract_string_value(row, tradedate_col)
+                    .and_then(|d| Self::parse_historical_date(&d));
 
-            // Parse timestamp
-            let timestamp = Self::extract_string_value(row, tradedate_col)
-                .and_then(|d| Self::parse_historical_date(&d));
+                if let Some(ts) = timestamp {
+                    all_quotes.push(Quote::ohlcv(
+                        ts,
+                        open.unwrap_or(close),
+                        high.unwrap_or(close),
+                        low.unwrap_or(close),
+                        close,
+                        volume.unwrap_or_default(),
+                        currency.clone(),
+                        PROVIDER_ID.to_string(),
+                    ));
+                }
+            }
 
-            if let Some(ts) = timestamp {
-                quotes.push(Quote::ohlcv(
-                    ts,
-                    open.unwrap_or(close),
-                    high.unwrap_or(close),
-                    low.unwrap_or(close),
-                    close,
-                    volume.unwrap_or_default(),
-                    currency.clone(),
-                    PROVIDER_ID.to_string(),
-                ));
+            // If we got quotes from this endpoint, stop trying others
+            if !all_quotes.is_empty() {
+                break;
             }
         }
 
-        // Sort by timestamp ascending
-        quotes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        // Sort by timestamp ascending and deduplicate
+        all_quotes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        all_quotes.dedup_by(|a, b| a.timestamp == b.timestamp);
 
-        if quotes.is_empty() {
+        if all_quotes.is_empty() {
             return Err(MarketDataError::NoDataForRange);
         }
 
-        // History endpoint only has finalized end-of-day data.
         // If the requested range includes today, also fetch the marketdata endpoint
         // to get the current day's intraday quote.
         let today_utc = Utc::now().date_naive();
         let end_date_naive = end.date_naive();
 
         if end_date_naive >= today_utc {
-            // Reuse get_latest_quote via the trait method
             if let Ok(latest_quote) = self.get_latest_quote(context, instrument.clone()).await {
                 debug!(
                     "MOEX: Appending latest quote for historical range: {}",
                     symbol
                 );
-                quotes.push(latest_quote);
-                // Re-sort after appending
-                quotes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+                all_quotes.push(latest_quote);
+                // Re-sort and dedup after appending
+                all_quotes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+                all_quotes.dedup_by(|a, b| a.timestamp == b.timestamp);
             }
         }
 
-        Ok(quotes)
+        Ok(all_quotes)
     }
 
     async fn search(&self, query: &str) -> Result<Vec<SearchResult>, MarketDataError> {
@@ -683,7 +714,7 @@ fn map_moex_type_to_asset_type(moex_type: &str) -> String {
 /// Filters out index funds, structural products, and other non-tradeable types.
 fn should_include_security_type(moex_type: &str) -> bool {
     match moex_type.to_lowercase().as_str() {
-        // Include these tradeable types
+        // Stock engine - equities, bonds, ETFs
         "common_share"
         | "preferred_share"
         | "exchange_bond"
@@ -691,8 +722,13 @@ fn should_include_security_type(moex_type: &str) -> bool {
         | "government_bond"
         | "etf_share"
         | "exchange_fund_share"
-        | "currency_pair"
-        | "fx" => true,
+        // Currency engine - FX pairs, metals
+        | "gold_metal"
+        | "silver_metal"
+        | "platinum_metal"
+        | "palladium_metal"
+        | "currency"
+        | "currency_wap" => true,
         // Exclude index funds, structural products, etc.
         _ => false,
     }
@@ -856,13 +892,14 @@ mod tests {
 
     #[test]
     fn test_should_include_security_type() {
-        // Include tradeable types
+        // Include tradeable types - stock engine
         assert!(should_include_security_type("common_share"));
         assert!(should_include_security_type("preferred_share"));
         assert!(should_include_security_type("exchange_bond"));
         assert!(should_include_security_type("etf_share"));
-        assert!(should_include_security_type("currency_pair"));
-
+        // Include currency engine types
+        assert!(should_include_security_type("gold_metal"));
+        assert!(should_include_security_type("currency"));
         // Exclude index funds and other non-tradeable types
         assert!(!should_include_security_type("stock_index_pf"));
         assert!(!should_include_security_type("stock_index"));
