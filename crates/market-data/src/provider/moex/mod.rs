@@ -44,6 +44,7 @@ struct MoexDataTable {
 struct MoexLatestResponse {
     marketdata: Option<MoexDataTable>,
     securities: Option<MoexDataTable>,
+    dataversion: Option<MoexDataTable>,
 }
 
 /// Historical quotes response structure.
@@ -295,6 +296,19 @@ impl MarketDataProvider for MoexProvider {
         let row = Self::get_primary_board_data(&marketdata)
             .ok_or_else(|| MarketDataError::SymbolNotFound(symbol.clone()))?;
 
+        // Extract trade date from dataversion (if available)
+        let trade_date = body.dataversion.as_ref().and_then(|dv| {
+            let trade_date_col = Self::find_column_index(&dv.columns, "trade_date");
+            dv.data
+                .first()
+                .and_then(|r| Self::extract_string_value(r, trade_date_col))
+        });
+
+        debug!(
+            "MOEX latest quote: trade_date={:?}, symbol={}",
+            trade_date, symbol
+        );
+
         // Extract column indices
         let last_col = Self::find_column_index(&marketdata.columns, "LAST");
         let open_col = Self::find_column_index(&marketdata.columns, "OPEN");
@@ -302,7 +316,6 @@ impl MarketDataProvider for MoexProvider {
         let low_col = Self::find_column_index(&marketdata.columns, "LOW");
         let volume_col = Self::find_column_index(&marketdata.columns, "VOLTODAY");
         let time_col = Self::find_column_index(&marketdata.columns, "UPDATETIME");
-        let tradedate_col = Self::find_column_index(&marketdata.columns, "TRADEDATE");
         let currency_col = Self::find_column_index(&marketdata.columns, "CURRENCYID");
 
         // Extract values
@@ -320,12 +333,12 @@ impl MarketDataProvider for MoexProvider {
             Self::extract_f64_value(&row, volume_col).and_then(|v| Decimal::try_from(v).ok());
 
         // Parse timestamp
-        let timestamp = match (
-            Self::extract_string_value(&row, tradedate_col),
-            Self::extract_string_value(&row, time_col),
-        ) {
-            (Some(date), Some(time)) => Self::parse_market_timestamp(&date, &time),
-            (Some(date), None) => Self::parse_historical_date(&date),
+        // marketdata has UPDATETIME (time only), trade date comes from dataversion
+        let update_time = Self::extract_string_value(&row, time_col);
+
+        let timestamp = match (&trade_date, &update_time) {
+            (Some(date), Some(time)) => Self::parse_market_timestamp(date, time),
+            (Some(date), None) => Self::parse_historical_date(date),
             _ => None,
         }
         .unwrap_or_else(Utc::now);
@@ -473,6 +486,25 @@ impl MarketDataProvider for MoexProvider {
 
         if quotes.is_empty() {
             return Err(MarketDataError::NoDataForRange);
+        }
+
+        // History endpoint only has finalized end-of-day data.
+        // If the requested range includes today, also fetch the marketdata endpoint
+        // to get the current day's intraday quote.
+        let today_utc = Utc::now().date_naive();
+        let end_date_naive = end.date_naive();
+
+        if end_date_naive >= today_utc {
+            // Reuse get_latest_quote via the trait method
+            if let Ok(latest_quote) = self.get_latest_quote(context, instrument.clone()).await {
+                debug!(
+                    "MOEX: Appending latest quote for historical range: {}",
+                    symbol
+                );
+                quotes.push(latest_quote);
+                // Re-sort after appending
+                quotes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            }
         }
 
         Ok(quotes)
