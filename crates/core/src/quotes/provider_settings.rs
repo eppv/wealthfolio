@@ -96,6 +96,16 @@ impl ProviderCapabilities {
                 coverage: "User-defined".to_string(),
                 features: vec!["Real-time".to_string(), "Historical".to_string()],
             }),
+            "MOEX" => Some(Self {
+                instruments: "Stocks • Forex".to_string(),
+                coverage: "Russia".to_string(),
+                features: vec![
+                    "Real-time".to_string(),
+                    "Historical".to_string(),
+                    "Search".to_string(),
+                    "Profiles".to_string(),
+                ],
+            }),
             _ => None,
         }
     }
