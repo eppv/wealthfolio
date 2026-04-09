@@ -703,6 +703,17 @@
       "timezone": "Africa/Cairo",
       "close": [14, 30],
       "yahoo": { "suffix": ".CA", "codes": ["CAI"] }
+    },
+    {
+      "mic": "XMOS",
+      "name": "MOEX",
+      "long_name": "Moscow Exchange",
+      "currency": "RUB",
+      "timezone": "Europe/Moscow",
+      "close": [18, 45],
+      "yahoo": { "suffix": ".ME", "codes": ["MCX"] },
+      "alpha_vantage": { "suffix": ".MCX", "currency": "RUB" },
+      "moex": { "suffix": "", "currency": "RUB" }
     }
   ],
   "currency_priority": {
@@ -729,6 +740,7 @@
     "PLN": ["XWAR"],
     "ILS": ["XTAE"],
     "ZAR": ["XJSE"],
-    "TWD": ["XTAI", "XTAI_OTC"]
+    "TWD": ["XTAI", "XTAI_OTC"],
+    "RUB": ["XMOS"]
   }
 }

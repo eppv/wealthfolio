@@ -79,6 +79,21 @@ impl ExchangeMap {
                 );
             }
 
+            if let Some(ref moex) = entry.moex {
+                let currency = moex
+                    .currency
+                    .as_deref()
+                    .or(entry.currency.as_deref())
+                    .unwrap_or("RUB");
+                provider_map.insert(
+                    Cow::Owned("MOEX".to_string()),
+                    ExchangeSuffix {
+                        suffix: Cow::Owned(moex.suffix.clone()),
+                        currency: Cow::Owned(currency.to_string()),
+                    },
+                );
+            }
+
             if !provider_map.is_empty() {
                 self.mappings
                     .insert(Cow::Owned(entry.mic.clone()), provider_map);

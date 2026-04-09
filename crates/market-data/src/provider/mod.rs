@@ -27,6 +27,7 @@ pub mod boerse_frankfurt;
 pub mod finnhub;
 pub mod marketdata_app;
 pub mod metal_price_api;
+pub mod moex;
 pub mod openfigi;
 pub mod us_treasury_calc;
 pub mod yahoo;

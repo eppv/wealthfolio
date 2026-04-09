@@ -33,6 +33,8 @@ pub struct ExchangeEntry {
     pub yahoo: Option<YahooInfo>,
     #[serde(default)]
     pub alpha_vantage: Option<ProviderInfo>,
+    #[serde(default)]
+    pub moex: Option<ProviderInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]

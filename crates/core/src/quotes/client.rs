@@ -39,7 +39,7 @@ use crate::secrets::SecretStore;
 use wealthfolio_market_data::{
     mic_to_currency, mic_to_exchange_name, yahoo_exchange_to_mic, yahoo_suffix_to_mic,
     AlphaVantageProvider, AssetProfile as MarketAssetProfile, BoerseFrankfurtProvider,
-    BondQuoteMetadata, FinnhubProvider, MarketDataAppProvider, MetalPriceApiProvider,
+    BondQuoteMetadata, FinnhubProvider, MarketDataAppProvider, MetalPriceApiProvider, MoexProvider,
     OpenFigiProvider, ProviderId, ProviderRegistry, Quote as MarketQuote, QuoteContext,
     ResolverChain, SearchResult as MarketSearchResult, SplitEvent, UsTreasuryCalcProvider,
     YahooProvider,
@@ -226,6 +226,17 @@ impl MarketDataClient {
                     }
                 }
                 Ok(None)
+            }
+            DATA_SOURCE_MOEX => {
+                // MOEX may or may not require an API key depending on usage tier
+                if let Ok(Some(key)) = secret_store.get_secret(provider_id) {
+                    let provider = MoexProvider::new(Some(key));
+                    return Ok(Some(Arc::new(provider)));
+                } else {
+                    // Try without API key (free tier may have limited access)
+                    let provider = MoexProvider::new(None);
+                    return Ok(Some(Arc::new(provider)));
+                }
             }
             DATA_SOURCE_OPENFIGI => {
                 // OpenFIGI doesn't need an API key (free tier)

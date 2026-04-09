@@ -75,6 +75,7 @@ impl ProviderId {
     pub const MARKETDATA_APP: &'static str = "MARKETDATA_APP";
     pub const METAL_PRICE_API: &'static str = "METAL_PRICE_API";
     pub const FINNHUB: &'static str = "FINNHUB";
+    pub const MOEX: &'static str = "MOEX";
     pub const US_TREASURY_CALC: &'static str = "US_TREASURY_CALC";
     pub const BOERSE_FRANKFURT: &'static str = "BOERSE_FRANKFURT";
     pub const OPENFIGI: &'static str = "OPENFIGI";
@@ -103,6 +104,10 @@ impl ProviderId {
 
     pub fn finnhub() -> Self {
         Self(Self::FINNHUB.to_string())
+    }
+
+    pub fn moex() -> Self {
+        Self(Self::MOEX.to_string())
     }
 
     pub fn us_treasury_calc() -> Self {
