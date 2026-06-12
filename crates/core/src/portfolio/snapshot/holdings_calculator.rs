@@ -1,7 +1,10 @@
+use crate::accounts::account_types;
 use crate::activities::{Activity, ActivityType};
 use crate::assets::AssetRepositoryTrait;
+use crate::constants::DECIMAL_PRECISION;
 use crate::errors::{CalculatorError, Error, Result};
 use crate::fx::FxServiceTrait;
+use crate::lots::{extract_lot_records_with_cost_basis_method, LotClosure, LotDisposal, LotRecord};
 use crate::portfolio::snapshot::AccountStateSnapshot;
 use crate::portfolio::snapshot::HoldingsCalculationResult;
 use crate::portfolio::snapshot::HoldingsCalculationWarning;
@@ -25,6 +28,81 @@ fn add_cash(state: &mut AccountStateSnapshot, currency: &str, delta: Decimal) {
         .or_insert(Decimal::ZERO) += delta;
 }
 
+#[derive(Clone)]
+struct AssetPositionInfo {
+    currency: String,
+    is_alternative: bool,
+    contract_multiplier: Decimal,
+    is_bond: bool,
+}
+
+type AssetCache = HashMap<String, AssetPositionInfo>;
+
+impl AssetPositionInfo {
+    fn fallback(activity_currency: &str) -> Self {
+        Self {
+            currency: activity_currency.to_string(),
+            is_alternative: false,
+            contract_multiplier: Decimal::ONE,
+            is_bond: false,
+        }
+    }
+}
+
+fn should_use_activity_amount(activity: &Activity, asset_info: &AssetPositionInfo) -> bool {
+    let has_amount = activity.amount.is_some_and(|amount| !amount.is_zero());
+    if !has_amount {
+        return false;
+    }
+
+    let is_buy_or_sell = matches!(
+        ActivityType::from_str(&activity.activity_type),
+        Ok(ActivityType::Buy | ActivityType::Sell)
+    );
+    if !is_buy_or_sell {
+        return true;
+    }
+
+    let has_qty = activity.quantity.is_some_and(|qty| !qty.is_zero());
+    let has_unit_price = activity.unit_price.is_some_and(|price| !price.is_zero());
+
+    asset_info.is_bond || !has_qty || !has_unit_price
+}
+
+/// Gross trade value (pre-fee) for a BUY/SELL/TRANSFER lot.
+/// Plain trades use qty * price; bonds and incomplete price/quantity rows use
+/// broker amount when present.
+#[inline]
+fn gross_trade_amount(activity: &Activity, asset_info: &AssetPositionInfo) -> Decimal {
+    if should_use_activity_amount(activity, asset_info) {
+        activity.amt()
+    } else {
+        activity.qty() * activity.price() * asset_info.contract_multiplier
+    }
+}
+
+fn parse_decimal_lossy(value: &str) -> Decimal {
+    value.parse::<Decimal>().unwrap_or(Decimal::ZERO)
+}
+
+fn storage_money(value: Decimal) -> Decimal {
+    value.round_dp(DECIMAL_PRECISION)
+}
+
+/// Per-share/per-contract acquisition price for a lot (multiplier-inclusive).
+///
+/// Mirrors `gross_trade_amount`: when `amount` is authoritative, derive the
+/// per-unit price from it so the lot's cost basis matches the booked cash.
+#[inline]
+fn effective_unit_price(activity: &Activity, asset_info: &AssetPositionInfo) -> Decimal {
+    let qty = activity.qty();
+    if should_use_activity_amount(activity, asset_info) && !qty.is_zero() {
+        activity.amt() / qty
+    } else {
+        activity.price() * asset_info.contract_multiplier
+    }
+}
+
 /// Calculates the holding state (positions, cash, cost basis, net deposits) based on activities.
 /// It does not calculate market values or base currency conversions related to valuation.
 #[derive(Clone)]
@@ -38,6 +116,13 @@ pub struct HoldingsCalculator {
     /// the lots are consumed from this cache and added to the destination position,
     /// preserving original acquisition dates and cost basis.
     transfer_lots_cache: Arc<Mutex<HashMap<String, Vec<super::Lot>>>>,
+    /// Accumulates lot closures (fully consumed lots) during a recalculation run,
+    /// keyed by account_id. Cleared at the start of each run.
+    disposed_lots: Arc<Mutex<HashMap<String, Vec<LotClosure>>>>,
+    /// Accumulates sell disposal slices during a recalculation run.
+    lot_disposals: Arc<Mutex<HashMap<String, Vec<LotDisposal>>>>,
+    /// Cost-basis method selected for each account during the active run.
+    cost_basis_methods: Arc<Mutex<HashMap<String, String>>>,
 }
 impl HoldingsCalculator {
     pub fn new(
@@ -65,6 +150,9 @@ impl HoldingsCalculator {
             timezone,
             asset_repository,
             transfer_lots_cache: Arc::new(Mutex::new(HashMap::new())),
+            disposed_lots: Arc::new(Mutex::new(HashMap::new())),
+            lot_disposals: Arc::new(Mutex::new(HashMap::new())),
+            cost_basis_methods: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -76,9 +164,308 @@ impl HoldingsCalculator {
         }
     }
 
+    /// Clears the disposed lots log. Should be called at the start of each recalculation run.
+    pub fn clear_disposed_lots(&self) {
+        if let Ok(mut log) = self.disposed_lots.lock() {
+            log.clear();
+        }
+        if let Ok(mut log) = self.lot_disposals.lock() {
+            log.clear();
+        }
+        if let Ok(mut methods) = self.cost_basis_methods.lock() {
+            methods.clear();
+        }
+    }
+
+    pub fn set_cost_basis_method_for_account(&self, account_id: &str, cost_basis_method: &str) {
+        if let Ok(mut methods) = self.cost_basis_methods.lock() {
+            methods.insert(
+                account_id.to_string(),
+                cost_basis_method.trim().to_ascii_uppercase(),
+            );
+        }
+    }
+
+    fn cost_basis_method_for_account(&self, account_id: &str) -> String {
+        self.cost_basis_methods
+            .lock()
+            .ok()
+            .and_then(|methods| methods.get(account_id).cloned())
+            .unwrap_or_else(|| "FIFO".to_string())
+    }
+
+    /// Returns and removes all accumulated lot closures for the given account.
+    pub fn take_disposed_lots(&self, account_id: &str, cost_basis_method: &str) -> Vec<LotClosure> {
+        if let Ok(mut log) = self.disposed_lots.lock() {
+            let mut closures = log.remove(account_id).unwrap_or_default();
+            let cost_basis_method = cost_basis_method.trim().to_ascii_uppercase();
+            for closure in &mut closures {
+                closure.cost_basis_method = cost_basis_method.clone();
+            }
+            closures
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn take_lot_disposals(
+        &self,
+        account_id: &str,
+        cost_basis_method: &str,
+    ) -> Vec<LotDisposal> {
+        if let Ok(mut log) = self.lot_disposals.lock() {
+            let mut disposals = log.remove(account_id).unwrap_or_default();
+            let cost_basis_method = cost_basis_method.trim().to_ascii_uppercase();
+            for disposal in &mut disposals {
+                disposal.cost_basis_method = cost_basis_method.clone();
+            }
+            disposals
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn extract_lot_records_with_base(
+        &self,
+        snapshot: &AccountStateSnapshot,
+        cost_basis_method: &str,
+    ) -> Vec<LotRecord> {
+        let mut records = extract_lot_records_with_cost_basis_method(snapshot, cost_basis_method);
+        let base_currency = self.base_currency.read().unwrap().clone();
+        let position_currency_by_asset: HashMap<&str, &str> = snapshot
+            .positions
+            .values()
+            .map(|position| (position.asset_id.as_str(), position.currency.as_str()))
+            .collect();
+
+        for record in &mut records {
+            let lot_currency = position_currency_by_asset
+                .get(record.asset_id.as_str())
+                .copied()
+                .unwrap_or(snapshot.currency.as_str());
+            let acquisition_date = NaiveDate::parse_from_str(&record.open_date, "%Y-%m-%d")
+                .unwrap_or(snapshot.snapshot_date);
+            let fx_rate_to_base =
+                self.fx_rate_to_base(lot_currency, &base_currency, acquisition_date);
+            let original_cost_basis = parse_decimal_lossy(&record.original_cost_basis);
+            let remaining_cost_basis = parse_decimal_lossy(&record.remaining_cost_basis);
+            let fee_allocated = parse_decimal_lossy(&record.fee_allocated);
+
+            record.currency = lot_currency.to_string();
+            record.base_currency = base_currency.clone();
+            record.fx_rate_to_base = fx_rate_to_base.to_string();
+            record.original_cost_basis_base = (original_cost_basis * fx_rate_to_base).to_string();
+            record.remaining_cost_basis_base = (remaining_cost_basis * fx_rate_to_base).to_string();
+            record.fee_allocated_base = (fee_allocated * fx_rate_to_base).to_string();
+        }
+
+        records
+    }
+
+    fn fx_rate_to_base(
+        &self,
+        from_currency: &str,
+        base_currency: &str,
+        date: NaiveDate,
+    ) -> Decimal {
+        if from_currency == base_currency {
+            return Decimal::ONE;
+        }
+
+        match self.fx_service.convert_currency_for_date(
+            Decimal::ONE,
+            from_currency,
+            base_currency,
+            date,
+        ) {
+            Ok(rate) => rate,
+            Err(err) => {
+                warn!(
+                    "Failed to convert lot basis {}->{} on {}: {}. Base values use 0.",
+                    from_currency, base_currency, date, err
+                );
+                Decimal::ZERO
+            }
+        }
+    }
+
+    /// Records a lot closure in the disposed lots log, carrying the full lot
+    /// data so the persistence layer can INSERT the closed lot if it was never
+    /// written to the database (e.g. during a full recalc/replay).
+    fn record_lot_closure(
+        &self,
+        account_id: &str,
+        asset_id: &str,
+        lot: &super::Lot,
+        close_date: &str,
+        activity_id: &str,
+        position_currency: &str,
+    ) {
+        let orig_qty = if lot.original_quantity.is_zero() {
+            lot.quantity
+        } else {
+            lot.original_quantity
+        };
+        // `acquisition_fees` is mutated on partial sells, so use the immutable
+        // `original_fees()` accessor here. Otherwise a lot bought with a $10
+        // fee, half-sold, then fully consumed would persist closure rows with
+        // a $5 original fee.
+        let orig_fees = lot.original_fees();
+        let original_cost_basis = lot.acquisition_price * orig_qty + orig_fees;
+        let base_currency = self.base_currency.read().unwrap().clone();
+        let acquisition_date = lot.acquisition_date.date_naive();
+        let fx_rate_to_base =
+            self.fx_rate_to_base(position_currency, &base_currency, acquisition_date);
+        let cost_basis_method = self.cost_basis_method_for_account(account_id);
+        if let Ok(mut log) = self.disposed_lots.lock() {
+            log.entry(account_id.to_string())
+                .or_default()
+                .push(LotClosure {
+                    lot_id: lot.id.clone(),
+                    close_date: close_date.to_string(),
+                    close_activity_id: Some(activity_id.to_string()),
+                    open_activity_id: lot.source_activity_id.clone(),
+                    account_id: account_id.to_string(),
+                    asset_id: asset_id.to_string(),
+                    open_date: lot.acquisition_date.format("%Y-%m-%d").to_string(),
+                    original_quantity: orig_qty.to_string(),
+                    cost_per_unit: lot.acquisition_price.to_string(),
+                    // Original/at-acquisition cost basis, reconstructed from
+                    // the immutable acquisition_price / original_quantity /
+                    // original_acquisition_fees.
+                    original_cost_basis: original_cost_basis.to_string(),
+                    original_cost_basis_base: (original_cost_basis * fx_rate_to_base).to_string(),
+                    remaining_cost_basis_base: Decimal::ZERO.to_string(),
+                    fee_allocated: orig_fees.to_string(),
+                    fee_allocated_base: (orig_fees * fx_rate_to_base).to_string(),
+                    currency: position_currency.to_string(),
+                    base_currency: base_currency.clone(),
+                    fx_rate_to_base: fx_rate_to_base.to_string(),
+                    cost_basis_method: cost_basis_method.clone(),
+                    // Carry the cumulative split ratio as of closure. A lot
+                    // that lived through a 2:1 split before being fully
+                    // consumed must persist with split_ratio = 2; otherwise
+                    // downstream tax-lot reporting sees a wrong split history.
+                    split_ratio: lot.effective_split_ratio().to_string(),
+                });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_lot_disposals(
+        &self,
+        account_id: &str,
+        asset_id: &str,
+        activity: &Activity,
+        removed_lots: &[super::Lot],
+        total_proceeds: Decimal,
+        total_quantity_reduced: Decimal,
+        position_currency: &str,
+    ) {
+        if removed_lots.is_empty() || total_quantity_reduced.is_zero() {
+            return;
+        }
+
+        let disposal_date = self.activity_local_date(activity);
+        let base_currency = self.base_currency.read().unwrap().clone();
+        let disposal_fx_rate_to_base = if position_currency == base_currency {
+            Decimal::ONE
+        } else {
+            match self.fx_service.convert_currency_for_date(
+                Decimal::ONE,
+                position_currency,
+                &base_currency,
+                disposal_date,
+            ) {
+                Ok(rate) => rate,
+                Err(err) => {
+                    warn!(
+                        "Failed to convert lot disposal {} {}->{} on {}: {}. Base values use 0.",
+                        activity.id, position_currency, base_currency, disposal_date, err
+                    );
+                    Decimal::ZERO
+                }
+            }
+        };
+        let disposal_base_available = !disposal_fx_rate_to_base.is_zero();
+        if !disposal_base_available {
+            warn!(
+                "Persisting local lot disposal facts for activity {} with zero base attribution because disposal FX is missing.",
+                activity.id
+            );
+        }
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let cost_basis_method = self.cost_basis_method_for_account(account_id);
+
+        if let Ok(mut log) = self.lot_disposals.lock() {
+            let entries = log.entry(account_id.to_string()).or_default();
+            for (index, lot) in removed_lots.iter().enumerate() {
+                let effective_quantity = lot.effective_quantity();
+                let proceeds = if total_quantity_reduced.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    total_proceeds * effective_quantity / total_quantity_reduced
+                };
+                let cost_basis = lot.cost_basis;
+                let acquisition_date = self.activity_local_date_from_utc(lot.acquisition_date);
+                let acquisition_fx_rate_to_base =
+                    self.fx_rate_to_base(position_currency, &base_currency, acquisition_date);
+                let acquisition_base_available = !acquisition_fx_rate_to_base.is_zero();
+                if !acquisition_base_available {
+                    warn!(
+                        "Persisting local lot disposal facts for activity {} lot {} with zero base attribution because acquisition FX is missing.",
+                        activity.id, lot.id
+                    );
+                }
+                let base_available = disposal_base_available && acquisition_base_available;
+                let proceeds_base = if base_available {
+                    proceeds * disposal_fx_rate_to_base
+                } else {
+                    Decimal::ZERO
+                };
+                let cost_basis_base = if base_available {
+                    cost_basis * acquisition_fx_rate_to_base
+                } else {
+                    Decimal::ZERO
+                };
+                let stored_proceeds = storage_money(proceeds);
+                let stored_cost_basis = storage_money(cost_basis);
+                let stored_realized_pnl = storage_money(stored_proceeds - stored_cost_basis);
+                let stored_proceeds_base = storage_money(proceeds_base);
+                let stored_cost_basis_base = storage_money(cost_basis_base);
+                let stored_realized_pnl_base =
+                    storage_money(stored_proceeds_base - stored_cost_basis_base);
+                entries.push(LotDisposal {
+                    id: format!("{}:{}:{}", activity.id, lot.id, index),
+                    lot_id: lot.id.clone(),
+                    account_id: account_id.to_string(),
+                    asset_id: asset_id.to_string(),
+                    disposal_activity_id: activity.id.clone(),
+                    disposal_date: disposal_date.to_string(),
+                    quantity: effective_quantity.to_string(),
+                    proceeds: stored_proceeds.to_string(),
+                    cost_basis: stored_cost_basis.to_string(),
+                    realized_pnl: stored_realized_pnl.to_string(),
+                    proceeds_base: stored_proceeds_base.to_string(),
+                    cost_basis_base: stored_cost_basis_base.to_string(),
+                    realized_pnl_base: stored_realized_pnl_base.to_string(),
+                    currency: position_currency.to_string(),
+                    base_currency: base_currency.clone(),
+                    fx_rate_to_base: disposal_fx_rate_to_base.to_string(),
+                    cost_basis_method: cost_basis_method.clone(),
+                    created_at: now.clone(),
+                });
+            }
+        }
+    }
+
     fn activity_local_date(&self, activity: &Activity) -> NaiveDate {
+        self.activity_local_date_from_utc(activity.activity_date)
+    }
+
+    fn activity_local_date_from_utc(&self, activity_date: DateTime<Utc>) -> NaiveDate {
         let tz = parse_user_timezone_or_default(&self.timezone.read().unwrap());
-        activity_date_in_tz(activity.activity_date, tz)
+        activity_date_in_tz(activity_date, tz)
     }
 
     /// Calculates the next day's holding state based on the previous state and today's activities.
@@ -93,6 +480,21 @@ impl HoldingsCalculator {
         previous_snapshot: &AccountStateSnapshot,
         activities_today: &[Activity], // Assumes these are for the *target* date and already split-adjusted
         target_date: NaiveDate,
+    ) -> Result<HoldingsCalculationResult> {
+        self.calculate_next_holdings_for_account_type(
+            previous_snapshot,
+            activities_today,
+            target_date,
+            None,
+        )
+    }
+
+    pub fn calculate_next_holdings_for_account_type(
+        &self,
+        previous_snapshot: &AccountStateSnapshot,
+        activities_today: &[Activity], // Assumes these are for the *target* date and already split-adjusted
+        target_date: NaiveDate,
+        account_type: Option<&str>,
     ) -> Result<HoldingsCalculationResult> {
         debug!(
             "Calculating holdings for account {} on date {}",
@@ -110,8 +512,7 @@ impl HoldingsCalculator {
         let mut warnings: Vec<HoldingsCalculationWarning> = Vec::new();
 
         // Session-wide asset info cache to avoid DB lookups per unique asset.
-        // Stores (currency, is_alternative, contract_multiplier) for each asset.
-        let mut asset_cache: HashMap<String, (String, bool, Decimal)> = HashMap::new();
+        let mut asset_cache: AssetCache = HashMap::new();
 
         for activity in activities_today {
             if self.activity_local_date(activity) != target_date {
@@ -134,6 +535,7 @@ impl HoldingsCalculator {
                 &mut next_state,
                 &account_currency,
                 &mut asset_cache,
+                account_type,
             ) {
                 Ok(_) => {} // Activity processed successfully
                 Err(e) => {
@@ -211,7 +613,8 @@ impl HoldingsCalculator {
         activity: &Activity,
         state: &mut AccountStateSnapshot,
         account_currency: &str,
-        asset_cache: &mut HashMap<String, (String, bool, Decimal)>,
+        asset_cache: &mut AssetCache,
+        account_type: Option<&str>,
     ) -> Result<()> {
         let activity_type = ActivityType::from_str(&activity.activity_type).map_err(|_| {
             CalculatorError::UnsupportedActivityType(activity.activity_type.clone())
@@ -224,6 +627,9 @@ impl HoldingsCalculator {
             ActivityType::Sell => self.handle_sell(activity, state, account_currency, asset_cache),
             ActivityType::Deposit => self.handle_deposit(activity, state, account_currency),
             ActivityType::Withdrawal => self.handle_withdrawal(activity, state, account_currency),
+            ActivityType::Interest if account_type == Some(account_types::CREDIT_CARD) => {
+                self.handle_charge(activity, state, &activity_type)
+            }
             ActivityType::Dividend | ActivityType::Interest | ActivityType::Credit => {
                 self.handle_income(activity, state, account_currency)
             }
@@ -236,9 +642,7 @@ impl HoldingsCalculator {
             ActivityType::TransferOut => {
                 self.handle_transfer_out(activity, state, account_currency, asset_cache)
             }
-            // Split activities are NO-OPs here: the snapshot service retroactively
-            // adjusts historical activity quantities/prices before the calculator runs.
-            ActivityType::Split => Ok(()),
+            ActivityType::Split => self.handle_split(activity, state, asset_cache),
             ActivityType::Adjustment => self.handle_adjustment(activity, state, asset_cache),
             ActivityType::Unknown => {
                 warn!(
@@ -260,7 +664,7 @@ impl HoldingsCalculator {
         activity: &Activity,
         state: &mut AccountStateSnapshot,
         account_currency: &str,
-        asset_cache: &mut HashMap<String, (String, bool, Decimal)>,
+        asset_cache: &mut AssetCache,
     ) -> Result<()> {
         let activity_currency = &activity.currency;
         let asset_id = activity.asset_id.as_deref().unwrap_or("");
@@ -278,17 +682,16 @@ impl HoldingsCalculator {
         let needs_conversion =
             !position_currency.is_empty() && position_currency != activity.currency;
 
-        // For options, price is per-share but each contract covers `multiplier` shares
-        let multiplier = asset_cache
+        let asset_info = asset_cache
             .get(asset_id)
-            .map(|(_, _, m)| *m)
-            .unwrap_or(Decimal::ONE);
+            .cloned()
+            .unwrap_or_else(|| AssetPositionInfo::fallback(activity_currency));
 
-        // Get values for lot, converting if needed
-        // Multiply unit price by contract multiplier so lot cost basis reflects true cost
+        // Get values for lot, converting if needed.
+        let lot_unit_price = effective_unit_price(activity, &asset_info);
         let (unit_price_for_lot, fee_for_lot, fx_rate_used) = if needs_conversion {
             let (converted_price, converted_fee, fx_rate) = self.convert_to_position_currency(
-                activity.price() * multiplier,
+                lot_unit_price,
                 activity.fee_amt(),
                 activity,
                 &position_currency,
@@ -296,7 +699,7 @@ impl HoldingsCalculator {
             )?;
             (converted_price, converted_fee, fx_rate)
         } else {
-            (activity.price() * multiplier, activity.fee_amt(), None)
+            (lot_unit_price, activity.fee_amt(), None)
         };
 
         // Use add_lot_values to avoid cloning Activity
@@ -307,10 +710,10 @@ impl HoldingsCalculator {
             fee_for_lot,
             activity.activity_date,
             fx_rate_used,
+            Some(activity.id.clone()),
         )?;
 
-        // Book cash outflow
-        let total_cost = (activity.qty() * activity.price() * multiplier) + activity.fee_amt();
+        let total_cost = gross_trade_amount(activity, &asset_info) + activity.fee_amt();
         if activity_currency != account_currency {
             if let Some(fx_rate) = activity.fx_rate.filter(|r| *r != Decimal::ZERO) {
                 // Broker converted at transaction time — book in account currency
@@ -334,7 +737,7 @@ impl HoldingsCalculator {
         activity: &Activity,
         state: &mut AccountStateSnapshot,
         account_currency: &str,
-        asset_cache: &mut HashMap<String, (String, bool, Decimal)>,
+        asset_cache: &mut AssetCache,
     ) -> Result<()> {
         let activity_currency = &activity.currency;
         let asset_id = activity.asset_id.as_deref().unwrap_or("");
@@ -342,12 +745,11 @@ impl HoldingsCalculator {
         // Ensure cache is populated for multiplier lookup
         self.ensure_asset_cached(asset_id, activity_currency, asset_cache);
 
-        // Book cash inflow (proceeds = qty * price * multiplier - fee)
-        let multiplier = asset_cache
+        let asset_info = asset_cache
             .get(asset_id)
-            .map(|(_, _, m)| *m)
-            .unwrap_or(Decimal::ONE);
-        let total_proceeds = (activity.qty() * activity.price() * multiplier) - activity.fee_amt();
+            .cloned()
+            .unwrap_or_else(|| AssetPositionInfo::fallback(activity_currency));
+        let total_proceeds = gross_trade_amount(activity, &asset_info) - activity.fee_amt();
         if activity_currency != account_currency {
             if let Some(fx_rate) = activity.fx_rate.filter(|r| *r != Decimal::ZERO) {
                 // Broker converted at transaction time — book in account currency
@@ -361,7 +763,36 @@ impl HoldingsCalculator {
         }
 
         if let Some(position) = state.positions.get_mut(asset_id) {
-            let _reduction = position.reduce_lots_fifo(activity.qty())?;
+            let position_currency = position.currency.clone();
+            let total_proceeds_position_currency = self
+                .convert_activity_amount_to_position_currency(
+                    total_proceeds,
+                    activity,
+                    &position_currency,
+                    account_currency,
+                    "sell proceeds",
+                )?;
+            let reduction = position.reduce_lots_fifo(activity.qty())?;
+            self.record_lot_disposals(
+                &state.account_id,
+                asset_id,
+                activity,
+                &reduction.removed_lots,
+                total_proceeds_position_currency,
+                reduction.quantity_reduced,
+                &position_currency,
+            );
+            let close_date = self.activity_local_date(activity).to_string();
+            for lot in &reduction.fully_consumed_lots {
+                self.record_lot_closure(
+                    &state.account_id,
+                    asset_id,
+                    lot,
+                    &close_date,
+                    &activity.id,
+                    &position_currency,
+                );
+            }
         } else {
             warn!(
                 "Attempted to Sell non-existent/zero position {} via activity {}. Applying cash effect only.",
@@ -572,7 +1003,7 @@ impl HoldingsCalculator {
         activity: &Activity,
         state: &mut AccountStateSnapshot,
         account_currency: &str,
-        asset_cache: &mut HashMap<String, (String, bool, Decimal)>,
+        asset_cache: &mut AssetCache,
     ) -> Result<()> {
         let activity_currency = &activity.currency;
         let activity_amount = activity.amt();
@@ -648,16 +1079,16 @@ impl HoldingsCalculator {
                         activity.id
                     );
                 }
-                // For options, price is per-share but each contract covers `multiplier` shares
-                let multiplier = asset_cache
+                let asset_info = asset_cache
                     .get(asset_id)
-                    .map(|(_, _, m)| *m)
-                    .unwrap_or(Decimal::ONE);
+                    .cloned()
+                    .unwrap_or_else(|| AssetPositionInfo::fallback(activity_currency));
 
+                let lot_unit_price = effective_unit_price(activity, &asset_info);
                 let (unit_price_for_lot, fee_for_lot, fx_rate_used) = if needs_conversion {
                     let (converted_price, converted_fee, fx_rate) = self
                         .convert_to_position_currency(
-                            activity.price() * multiplier,
+                            lot_unit_price,
                             activity.fee_amt(),
                             activity,
                             &position_currency,
@@ -665,7 +1096,7 @@ impl HoldingsCalculator {
                         )?;
                     (converted_price, converted_fee, fx_rate)
                 } else {
-                    (activity.price() * multiplier, activity.fee_amt(), None)
+                    (lot_unit_price, activity.fee_amt(), None)
                 };
 
                 position.add_lot_values(
@@ -675,6 +1106,7 @@ impl HoldingsCalculator {
                     fee_for_lot,
                     activity.activity_date,
                     fx_rate_used,
+                    Some(activity.id.clone()),
                 )?
             };
 
@@ -720,7 +1152,7 @@ impl HoldingsCalculator {
         activity: &Activity,
         state: &mut AccountStateSnapshot,
         account_currency: &str,
-        _asset_cache: &mut HashMap<String, (String, bool, Decimal)>,
+        _asset_cache: &mut AssetCache,
     ) -> Result<()> {
         let activity_currency = &activity.currency;
         let activity_date = self.activity_local_date(activity);
@@ -778,6 +1210,19 @@ impl HoldingsCalculator {
                 let reduction = position.reduce_lots_fifo(activity.qty())?;
                 let cost_basis_removed = reduction.cost_basis_removed;
 
+                // Record fully consumed lots as closed
+                let close_date = activity_date.to_string();
+                for lot in &reduction.fully_consumed_lots {
+                    self.record_lot_closure(
+                        &state.account_id,
+                        asset_id,
+                        lot,
+                        &close_date,
+                        &activity.id,
+                        &position_currency,
+                    );
+                }
+
                 // Cache removed lots for paired TRANSFER_IN (lot-level transfer)
                 if let Some(ref group_id) = activity.source_group_id {
                     if !reduction.removed_lots.is_empty() {
@@ -826,6 +1271,71 @@ impl HoldingsCalculator {
         Ok(())
     }
 
+    /// Handle SPLIT activity.
+    ///
+    /// Multiplies the cumulative `split_ratio` of every open lot acquired
+    /// before the split's user-local calendar date, leaving `quantity`,
+    /// `acquisition_price`, `cost_basis`, and `acquisition_fees` unchanged.
+    /// Lots opened on or after the split date are not affected (their
+    /// as-acquired units are already post-split). See
+    /// positions_model::Position::apply_split and
+    /// docs/architecture/data_model.md §3.5.
+    ///
+    /// SPLIT has no cash effect. Fractional cashouts must be reported by the
+    /// importer as a paired SELL activity; this handler does not synthesize one.
+    ///
+    /// The ratio is read from `activity.amount` (JB/MS bridge convention) with
+    /// a fallback to `activity.quantity` if amount is NULL or zero — the API's
+    /// import paths historically wrote quantity but not amount in some cases,
+    /// and a SPLIT row whose amount column is NULL would otherwise be silently
+    /// skipped. Both fields carry the same number when both are set.
+    fn handle_split(
+        &self,
+        activity: &Activity,
+        state: &mut AccountStateSnapshot,
+        _asset_cache: &mut AssetCache,
+    ) -> Result<()> {
+        let asset_id = match activity.asset_id.as_deref() {
+            Some(id) if !id.is_empty() => id,
+            _ => {
+                warn!("SPLIT activity {} has no asset_id; skipping.", activity.id);
+                return Ok(());
+            }
+        };
+
+        let ratio = {
+            let amt = activity.amt();
+            if amt.is_sign_positive() && !amt.is_zero() {
+                amt
+            } else {
+                activity.qty()
+            }
+        };
+        if !ratio.is_sign_positive() || ratio.is_zero() {
+            warn!(
+                "SPLIT activity {} on {} has non-positive ratio (amount={:?}, quantity={:?}); skipping.",
+                activity.id, activity.activity_date, activity.amount, activity.quantity
+            );
+            return Ok(());
+        }
+
+        if let Some(position) = state.positions.get_mut(asset_id) {
+            let split_date = self.activity_local_date(activity);
+            let tz = parse_user_timezone_or_default(&self.timezone.read().unwrap());
+            position.apply_split(ratio, split_date, &activity.id, |instant| {
+                activity_date_in_tz(instant, tz)
+            })?;
+        } else {
+            // Position not yet open in this account, so there are no local lots
+            // for this split to adjust.
+            debug!(
+                "SPLIT activity {} for asset {} on {}: no open position, skipping.",
+                activity.id, asset_id, activity.activity_date
+            );
+        }
+        Ok(())
+    }
+
     /// Handle ADJUSTMENT activity.
     /// Dispatches on subtype:
     /// - OPTION_EXPIRY: removes option lots via FIFO, no cash effect
@@ -834,16 +1344,37 @@ impl HoldingsCalculator {
         &self,
         activity: &Activity,
         state: &mut AccountStateSnapshot,
-        _asset_cache: &mut HashMap<String, (String, bool, Decimal)>,
+        _asset_cache: &mut AssetCache,
     ) -> Result<()> {
         use crate::activities::ACTIVITY_SUBTYPE_OPTION_EXPIRY;
 
         match activity.subtype.as_deref() {
-            Some(ACTIVITY_SUBTYPE_OPTION_EXPIRY) => {
+            Some(subtype) if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_OPTION_EXPIRY) => {
                 let asset_id = activity.asset_id.as_deref().unwrap_or("");
                 if let Some(position) = state.positions.get_mut(asset_id) {
+                    let position_currency = position.currency.clone();
                     let qty = activity.qty();
                     let reduction = position.reduce_lots_fifo(qty)?;
+                    self.record_lot_disposals(
+                        &state.account_id,
+                        asset_id,
+                        activity,
+                        &reduction.removed_lots,
+                        Decimal::ZERO,
+                        reduction.quantity_reduced,
+                        &position_currency,
+                    );
+                    let close_date = self.activity_local_date(activity).to_string();
+                    for lot in &reduction.fully_consumed_lots {
+                        self.record_lot_closure(
+                            &state.account_id,
+                            asset_id,
+                            lot,
+                            &close_date,
+                            &activity.id,
+                            &position_currency,
+                        );
+                    }
                     debug!(
                         "OPTION_EXPIRY: removed qty={} cost_basis={} from {} (activity {})",
                         reduction.quantity_reduced,
@@ -868,21 +1399,16 @@ impl HoldingsCalculator {
     }
 
     /// Populates the asset cache for a given asset_id if not already present.
-    fn ensure_asset_cached(
-        &self,
-        asset_id: &str,
-        activity_currency: &str,
-        cache: &mut HashMap<String, (String, bool, Decimal)>,
-    ) {
+    fn ensure_asset_cached(&self, asset_id: &str, activity_currency: &str, cache: &mut AssetCache) {
         if !asset_id.is_empty() && !cache.contains_key(asset_id) {
-            let (ccy, is_alt, multiplier) = self.get_position_info(asset_id).unwrap_or_else(|_| {
+            let asset_info = self.get_position_info(asset_id).unwrap_or_else(|_| {
                 warn!(
                     "Failed to get asset info for {}, using activity currency {} and multiplier 1",
                     asset_id, activity_currency
                 );
-                (activity_currency.to_string(), false, Decimal::ONE)
+                AssetPositionInfo::fallback(activity_currency)
             });
-            cache.insert(asset_id.to_string(), (ccy, is_alt, multiplier));
+            cache.insert(asset_id.to_string(), asset_info);
         }
     }
 
@@ -935,15 +1461,21 @@ impl HoldingsCalculator {
         }
     }
 
-    /// Determines the currency, alternative asset flag, and contract multiplier for a position.
-    /// Returns (currency, is_alternative, contract_multiplier).
-    fn get_position_info(&self, asset_id: &str) -> Result<(String, bool, Decimal)> {
+    /// Determines the cached asset facts needed to create and value a position.
+    fn get_position_info(&self, asset_id: &str) -> Result<AssetPositionInfo> {
         debug!("Getting position info for asset_id: {}", asset_id);
         match self.asset_repository.get_by_id(asset_id) {
             Ok(asset) => {
                 let is_alternative = asset.is_alternative();
-                let multiplier = asset.contract_multiplier();
-                Ok((asset.quote_ccy, is_alternative, multiplier))
+                let contract_multiplier = asset.contract_multiplier();
+                let is_bond = asset.is_bond();
+
+                Ok(AssetPositionInfo {
+                    currency: asset.quote_ccy,
+                    is_alternative,
+                    contract_multiplier,
+                    is_bond,
+                })
             }
             Err(e) => {
                 error!("Failed to get asset for asset_id '{}': {}", asset_id, e);
@@ -1004,16 +1536,52 @@ impl HoldingsCalculator {
         }
     }
 
+    fn convert_activity_amount_to_position_currency(
+        &self,
+        amount: Decimal,
+        activity: &Activity,
+        position_currency: &str,
+        account_currency: &str,
+        context: &str,
+    ) -> Result<Decimal> {
+        if position_currency.is_empty() || position_currency == activity.currency {
+            return Ok(amount);
+        }
+
+        let can_use_fx_rate =
+            position_currency == account_currency || activity.currency == account_currency;
+        if can_use_fx_rate {
+            if let Some(fx_rate) = activity.fx_rate.filter(|r| *r != Decimal::ZERO) {
+                debug!(
+                    "Using activity fx_rate {} for {} conversion {} -> {} (activity {})",
+                    fx_rate, context, activity.currency, position_currency, activity.id
+                );
+                return Ok(amount * fx_rate);
+            }
+        }
+
+        let activity_date = self.activity_local_date(activity);
+        self.fx_service
+            .convert_currency_for_date(amount, &activity.currency, position_currency, activity_date)
+            .map_err(|e| {
+                CalculatorError::CurrencyConversion(format!(
+                    "Failed to convert {} from {} to {}: {}",
+                    context, activity.currency, position_currency, e
+                ))
+                .into()
+            })
+    }
+
     /// Helper method to get/create position with asset currency caching.
     /// Uses cache to avoid repeated DB lookups for the same asset.
-    /// Cache stores (currency, is_alternative, contract_multiplier) tuple for each asset.
+    /// Cache stores asset facts for each asset.
     fn get_or_create_position_mut_cached<'a>(
         &self,
         state: &'a mut AccountStateSnapshot,
         asset_id: &str,
         activity_currency: &str,
         date: DateTime<Utc>,
-        cache: &mut HashMap<String, (String, bool, Decimal)>,
+        cache: &mut AssetCache,
     ) -> std::result::Result<&'a mut Position, CalculatorError> {
         if asset_id.is_empty() {
             return Err(CalculatorError::InvalidActivity(format!(
@@ -1024,7 +1592,9 @@ impl HoldingsCalculator {
 
         self.ensure_asset_cached(asset_id, activity_currency, cache);
 
-        let (ref position_currency, is_alternative, multiplier) = cache[asset_id];
+        let asset_info = cache
+            .get(asset_id)
+            .expect("asset cache should be populated before position creation");
 
         Ok(state
             .positions
@@ -1033,10 +1603,10 @@ impl HoldingsCalculator {
                 Position::new_with_alternative_flag(
                     state.account_id.clone(),
                     asset_id.to_string(),
-                    position_currency.clone(),
+                    asset_info.currency.clone(),
                     date,
-                    is_alternative,
-                    multiplier,
+                    asset_info.is_alternative,
+                    asset_info.contract_multiplier,
                 )
             }))
     }

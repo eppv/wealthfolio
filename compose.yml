@@ -1,18 +1,18 @@
 # Wealthfolio - Production Docker Compose
 #
-# Usage: docker compose up -d
-# Dev overlay: docker compose -f compose.yml -f compose.dev.yml up
+# Usage: docker compose --env-file .env.docker up -d
+# Reverse proxy overlay: docker compose --env-file .env.docker -f compose.yml -f compose.proxy.yml up -d
+# Dev overlay: docker compose --env-file .env.docker -f compose.yml -f compose.dev.yml up
 #
-# Works with any reverse proxy (Coolify, Nginx, Caddy, Traefik).
-# Uses expose (not ports) — the proxy handles external traffic.
+# Publishes port 8088 for direct browser access.
 
 services:
   wealthfolio:
-    image: afadil/wealthfolio:latest
+    image: wealthfolio/wealthfolio:latest
     container_name: wealthfolio
     restart: unless-stopped
-    expose:
-      - "8088"
+    ports:
+      - "${WF_PORT:-8088}:8088"
     volumes:
       - wealthfolio-data:/data
     environment:
@@ -25,8 +25,9 @@ services:
       # Required when listening on 0.0.0.0 (the default for Docker).
       # Provide an Argon2id PHC hash of your password.
       #
-      # IMPORTANT — the hash contains "$" signs that need escaping:
-      #   .env file  → WF_AUTH_PASSWORD_HASH=$argon2id$v=19$...  (no quotes, no escaping)
+      # IMPORTANT — Docker Compose interpolates "$" in .env files and YAML:
+      #   .env file  → WF_AUTH_PASSWORD_HASH='$argon2id$v=19$...'  (single quotes)
+      #   .env file  → WF_AUTH_PASSWORD_HASH=$$argon2id$$v=19$$...  (double every $)
       #   YAML inline → WF_AUTH_PASSWORD_HASH: '$$argon2id$$v=19$$...'  (double every $)
       #
       # Generate a hash:
@@ -40,7 +41,7 @@ services:
       # WF_AUTH_REQUIRED: "true"
 
       # Required when auth is enabled — set to your app's origin, e.g. https://wealthfolio.example.com
-      WF_CORS_ALLOW_ORIGINS: "${WF_CORS_ALLOW_ORIGINS}"
+      WF_CORS_ALLOW_ORIGINS: "${WF_CORS_ALLOW_ORIGINS:-}"
       WF_REQUEST_TIMEOUT_MS: "${WF_REQUEST_TIMEOUT_MS:-30000}"
     healthcheck:
       test:

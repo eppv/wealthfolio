@@ -1,5 +1,23 @@
 //! Activity domain models.
 
+use crate::activities::activities_constants::{
+    ACTIVITY_SUBTYPE_BONUS, ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND, ACTIVITY_SUBTYPE_DRIP,
+    ACTIVITY_SUBTYPE_OPTION_EXPIRY, ACTIVITY_SUBTYPE_REBATE, ACTIVITY_SUBTYPE_REFUND,
+    ACTIVITY_SUBTYPE_STAKING_REWARD, ACTIVITY_TYPE_ADJUSTMENT, ACTIVITY_TYPE_BUY,
+    ACTIVITY_TYPE_CREDIT, ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_DIVIDEND, ACTIVITY_TYPE_FEE,
+    ACTIVITY_TYPE_INTEREST, ACTIVITY_TYPE_SELL, ACTIVITY_TYPE_SPLIT, ACTIVITY_TYPE_TAX,
+    ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL,
+};
+use crate::activities::csv_parser::ParseConfig;
+use crate::assets::NewAsset;
+use crate::Result;
+use crate::{activities::activities_errors::ActivityError, QuoteMode};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::str::FromStr;
+
 /// Discriminator values for `import_account_templates.context_kind`.
 pub mod import_type {
     pub const ACTIVITY: &str = "CSV_ACTIVITY";
@@ -43,16 +61,6 @@ pub fn normalize_context_kind_value(raw: &str) -> &str {
         _ => raw,
     }
 }
-
-use crate::activities::csv_parser::ParseConfig;
-use crate::assets::NewAsset;
-use crate::Result;
-use crate::{activities::activities_errors::ActivityError, QuoteMode};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::str::FromStr;
 
 /// Helper function to parse a string into a Decimal,
 /// with support for scientific notation.
@@ -216,23 +224,27 @@ impl Activity {
 /// Consolidates all asset-related fields into a single nested object.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct SymbolInput {
-    /// Asset ID - optional, for backward compatibility with existing assets
+pub struct AssetResolutionInput {
+    /// Existing asset ID. When provided without natural identity, it must refer to a persisted asset.
     pub id: Option<String>,
-    /// Symbol (e.g., "AAPL", "BTC") - used to generate canonical asset ID
+    /// Symbol (e.g., "AAPL", "BTC") used to resolve or create an asset.
     pub symbol: Option<String>,
-    /// Exchange MIC code (e.g., "XNAS", "XTSE") for securities
+    /// Exchange MIC code (e.g., "XNAS", "XTSE") for securities.
     pub exchange_mic: Option<String>,
-    /// Asset kind input (e.g., "SECURITY", "CRYPTO") - if not provided, inferred
+    /// Asset kind hint (e.g., "SECURITY", "CRYPTO") - if not provided, inferred.
     pub kind: Option<String>,
-    /// Asset name for custom/manual assets
+    /// Asset name hint for custom/manual assets.
     pub name: Option<String>,
-    /// Quote mode: "MARKET" or "MANUAL" - controls how asset is priced
+    /// Quote mode hint: "MARKET" or "MANUAL".
     pub quote_mode: Option<String>,
-    /// Optional quote currency from symbol search/provider (e.g., "GBp")
+    /// Optional quote currency from symbol search/provider (e.g., "GBp").
     pub quote_ccy: Option<String>,
-    /// Optional instrument type from symbol search/provider (e.g., "EQUITY", "CRYPTO")
+    /// Optional instrument type from symbol search/provider (e.g., "EQUITY", "CRYPTO").
     pub instrument_type: Option<String>,
+    /// Market data provider that resolved this symbol, if selected.
+    pub provider_id: Option<String>,
+    /// Provider-native symbol/code selected by search/import.
+    pub provider_symbol: Option<String>,
 }
 
 /// Input model for creating a new activity
@@ -242,10 +254,10 @@ pub struct NewActivity {
     pub id: Option<String>,
     pub account_id: String,
 
-    /// Symbol input - consolidates id, symbol, exchangeMic, kind, name, quoteMode
+    /// Asset resolution input. Accepts the old `symbol` JSON field during transition.
     /// Optional for cash activities which don't require an asset
-    #[serde(alias = "asset")]
-    pub symbol: Option<SymbolInput>,
+    #[serde(alias = "symbol")]
+    pub asset: Option<AssetResolutionInput>,
 
     pub activity_type: String,
     pub subtype: Option<String>, // Semantic variation (DRIP, STAKING_REWARD, etc.)
@@ -289,6 +301,91 @@ pub struct NewActivity {
 }
 
 impl NewActivity {
+    pub fn canonicalize_subtype(subtype: Option<&str>) -> Option<String> {
+        let subtype = subtype.map(str::trim).filter(|value| !value.is_empty())?;
+
+        let canonical = if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DRIP) {
+            ACTIVITY_SUBTYPE_DRIP
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND) {
+            ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_STAKING_REWARD) {
+            ACTIVITY_SUBTYPE_STAKING_REWARD
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_BONUS) {
+            ACTIVITY_SUBTYPE_BONUS
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REBATE) {
+            ACTIVITY_SUBTYPE_REBATE
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REFUND) {
+            ACTIVITY_SUBTYPE_REFUND
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_OPTION_EXPIRY) {
+            ACTIVITY_SUBTYPE_OPTION_EXPIRY
+        } else {
+            subtype
+        };
+
+        Some(canonical.to_string())
+    }
+
+    pub(crate) fn is_asset_backed_income_subtype(
+        activity_type: &str,
+        subtype: Option<&str>,
+    ) -> bool {
+        let Some(subtype) = subtype.map(str::trim).filter(|value| !value.is_empty()) else {
+            return false;
+        };
+
+        (activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_DIVIDEND)
+            && (subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DRIP)
+                || subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND)))
+            || (activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_INTEREST)
+                && subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_STAKING_REWARD))
+    }
+
+    pub(crate) fn validate_asset_backed_income_values(
+        activity_type: &str,
+        subtype: Option<&str>,
+        quantity: Option<Decimal>,
+        unit_price: Option<Decimal>,
+        amount: Option<Decimal>,
+    ) -> std::result::Result<(), ActivityError> {
+        if !Self::is_asset_backed_income_subtype(activity_type, subtype) {
+            return Ok(());
+        }
+
+        match quantity {
+            Some(quantity) if quantity.is_sign_positive() && !quantity.is_zero() => {}
+            _ => {
+                return Err(ActivityError::InvalidData(
+                    "Asset-backed income activities require a positive quantity".to_string(),
+                ));
+            }
+        }
+
+        let has_positive_unit_price =
+            unit_price.is_some_and(|value| value.is_sign_positive() && !value.is_zero());
+        let has_positive_amount =
+            amount.is_some_and(|value| value.is_sign_positive() && !value.is_zero());
+
+        if !has_positive_unit_price && !has_positive_amount {
+            return Err(ActivityError::InvalidData(
+                "Asset-backed income activities require an amount or FMV per unit".to_string(),
+            ));
+        }
+
+        if unit_price.is_some_and(|value| value.is_sign_negative()) {
+            return Err(ActivityError::InvalidData(
+                "FMV per unit cannot be negative".to_string(),
+            ));
+        }
+
+        if amount.is_some_and(|value| value.is_sign_negative()) {
+            return Err(ActivityError::InvalidData(
+                "Income amount cannot be negative".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Validates the new activity data
     pub fn validate(&self) -> std::result::Result<(), ActivityError> {
         if self.account_id.trim().is_empty() {
@@ -311,41 +408,61 @@ impl NewActivity {
             ));
         }
 
+        Self::validate_asset_backed_income_values(
+            &self.activity_type,
+            self.subtype.as_deref(),
+            self.quantity,
+            self.unit_price,
+            self.amount,
+        )?;
+
         Ok(())
     }
 
-    // Helper methods to extract fields from nested `symbol`
+    // Helper methods to extract fields from nested asset resolution input.
+
+    pub fn get_asset_resolution_id(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.id.as_deref())
+    }
+
+    pub fn get_asset_symbol(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.symbol.as_deref())
+    }
+
+    pub fn get_asset_exchange_mic(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.exchange_mic.as_deref())
+    }
 
     pub fn get_symbol_id(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.id.as_deref())
+        self.get_asset_resolution_id()
     }
 
     pub fn get_symbol_code(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.symbol.as_deref())
+        self.get_asset_symbol()
     }
 
     pub fn get_exchange_mic(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.exchange_mic.as_deref())
+        self.get_asset_exchange_mic()
     }
 
     pub fn get_kind(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.kind.as_deref())
+        self.asset.as_ref().and_then(|a| a.kind.as_deref())
     }
 
     pub fn get_name(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.name.as_deref())
+        self.asset.as_ref().and_then(|a| a.name.as_deref())
     }
 
     pub fn get_quote_mode(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.quote_mode.as_deref())
+        self.asset.as_ref().and_then(|a| a.quote_mode.as_deref())
     }
 
     pub fn get_quote_ccy(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.quote_ccy.as_deref())
+        self.asset.as_ref().and_then(|a| a.quote_ccy.as_deref())
     }
 
     pub fn get_instrument_type(&self) -> Option<&str> {
-        self.symbol
+        self.asset
             .as_ref()
             .and_then(|a| a.instrument_type.as_deref())
     }
@@ -358,12 +475,16 @@ pub struct ActivityUpdate {
     pub id: String,
     pub account_id: String,
 
-    /// Symbol input - consolidates id, symbol, exchangeMic, kind, name, quoteMode
+    /// Asset resolution input. Accepts the old `symbol` JSON field during transition.
     /// Optional for cash activities which don't require an asset
-    #[serde(alias = "asset")]
-    pub symbol: Option<SymbolInput>,
+    #[serde(alias = "symbol")]
+    pub asset: Option<AssetResolutionInput>,
 
     pub activity_type: String,
+    #[serde(
+        default,
+        deserialize_with = "subtype_patch_format::deserialize_patch_subtype"
+    )]
     pub subtype: Option<String>, // Semantic variation (DRIP, STAKING_REWARD, etc.)
     pub activity_date: String,
     #[serde(
@@ -422,38 +543,50 @@ impl ActivityUpdate {
         Ok(())
     }
 
-    // Helper methods to extract fields from nested `symbol`
+    // Helper methods to extract fields from nested asset resolution input.
+
+    pub fn get_asset_resolution_id(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.id.as_deref())
+    }
+
+    pub fn get_asset_symbol(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.symbol.as_deref())
+    }
+
+    pub fn get_asset_exchange_mic(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.exchange_mic.as_deref())
+    }
 
     pub fn get_symbol_id(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.id.as_deref())
+        self.get_asset_resolution_id()
     }
 
     pub fn get_symbol_code(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.symbol.as_deref())
+        self.get_asset_symbol()
     }
 
     pub fn get_exchange_mic(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.exchange_mic.as_deref())
+        self.get_asset_exchange_mic()
     }
 
     pub fn get_kind(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.kind.as_deref())
+        self.asset.as_ref().and_then(|a| a.kind.as_deref())
     }
 
     pub fn get_name(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.name.as_deref())
+        self.asset.as_ref().and_then(|a| a.name.as_deref())
     }
 
     pub fn get_quote_mode(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.quote_mode.as_deref())
+        self.asset.as_ref().and_then(|a| a.quote_mode.as_deref())
     }
 
     pub fn get_quote_ccy(&self) -> Option<&str> {
-        self.symbol.as_ref().and_then(|a| a.quote_ccy.as_deref())
+        self.asset.as_ref().and_then(|a| a.quote_ccy.as_deref())
     }
 
     pub fn get_instrument_type(&self) -> Option<&str> {
-        self.symbol
+        self.asset
             .as_ref()
             .and_then(|a| a.instrument_type.as_deref())
     }
@@ -482,6 +615,70 @@ pub struct ActivityBulkMutationResult {
     pub created_mappings: Vec<ActivityBulkIdentifierMapping>,
     #[serde(default)]
     pub errors: Vec<ActivityBulkMutationError>,
+}
+
+/// Pair-aware request for creating or updating an internal cash transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalTransferPairRequest {
+    #[serde(default)]
+    pub transfer_out_id: Option<String>,
+    #[serde(default)]
+    pub transfer_in_id: Option<String>,
+    #[serde(default)]
+    pub source_group_id: Option<String>,
+    pub from_account_id: String,
+    pub to_account_id: String,
+    pub activity_date: String,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub source_amount: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub destination_amount: Option<Decimal>,
+    pub source_currency: String,
+    pub destination_currency: String,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub fx_rate: Option<Decimal>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub transfer_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalTransferPairResponse {
+    pub transfer_out: Activity,
+    pub transfer_in: Activity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferMatchCandidateRequest {
+    pub activity_id: String,
+    #[serde(default)]
+    pub window_days: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferMatchCandidate {
+    pub activity: Activity,
+    pub match_kind: String,
+    pub confidence: String,
+    pub score: i32,
+    pub reasons: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Structured error reported for a single bulk mutation entry.
@@ -532,6 +729,7 @@ pub struct ActivityDetails {
     // Sync/source metadata
     pub source_system: Option<String>,
     pub source_record_id: Option<String>,
+    pub source_group_id: Option<String>,
     pub idempotency_key: Option<String>,
     pub import_run_id: Option<String>,
     pub is_user_modified: bool,
@@ -638,6 +836,14 @@ pub struct ActivityImport {
     pub instrument_type: Option<String>,
     /// Optional quote mode (e.g., "MANUAL", "MARKET")
     pub quote_mode: Option<String>,
+    /// Market data provider that resolved this import row, if selected.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Provider-native symbol/code selected by search/import.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_symbol: Option<String>,
     pub errors: Option<std::collections::HashMap<String, Vec<String>>>,
     pub warnings: Option<std::collections::HashMap<String, Vec<String>>>,
     #[serde(default)]
@@ -669,6 +875,11 @@ pub struct ActivityImport {
     /// DB unique constraint is not violated. Set by the user in the review step.
     #[serde(default)]
     pub force_import: bool,
+    /// True when a TRANSFER_IN/OUT crosses the tracked-account boundary (e.g. RSU grant deposit).
+    /// Persisted as `metadata.flow.is_external` so net-contribution and flow classification work.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_external: Option<bool>,
 }
 
 /// Model for sorting activities
@@ -837,6 +1048,10 @@ pub struct ImportAssetCandidate {
     pub exchange_mic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -853,6 +1068,8 @@ pub struct ImportAssetPreviewItem {
     pub key: String,
     pub status: ImportAssetPreviewStatus,
     pub resolution_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_symbol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -981,19 +1198,23 @@ impl Default for ImportMappingData {
         );
 
         let mut activity_mappings = std::collections::HashMap::new();
-        activity_mappings.insert("BUY".to_string(), vec!["BUY".to_string()]);
-        activity_mappings.insert("SELL".to_string(), vec!["SELL".to_string()]);
-        activity_mappings.insert("DIVIDEND".to_string(), vec!["DIVIDEND".to_string()]);
-        activity_mappings.insert("INTEREST".to_string(), vec!["INTEREST".to_string()]);
-        activity_mappings.insert("DEPOSIT".to_string(), vec!["DEPOSIT".to_string()]);
-        activity_mappings.insert("WITHDRAWAL".to_string(), vec!["WITHDRAWAL".to_string()]);
-        activity_mappings.insert("TRANSFER_IN".to_string(), vec!["TRANSFER_IN".to_string()]);
-        activity_mappings.insert("TRANSFER_OUT".to_string(), vec!["TRANSFER_OUT".to_string()]);
-        activity_mappings.insert("SPLIT".to_string(), vec!["SPLIT".to_string()]);
-        activity_mappings.insert("FEE".to_string(), vec!["FEE".to_string()]);
-        activity_mappings.insert("TAX".to_string(), vec!["TAX".to_string()]);
-        activity_mappings.insert("CREDIT".to_string(), vec!["CREDIT".to_string()]);
-        activity_mappings.insert("ADJUSTMENT".to_string(), vec!["ADJUSTMENT".to_string()]);
+        for activity_type in [
+            ACTIVITY_TYPE_BUY,
+            ACTIVITY_TYPE_SELL,
+            ACTIVITY_TYPE_DIVIDEND,
+            ACTIVITY_TYPE_INTEREST,
+            ACTIVITY_TYPE_DEPOSIT,
+            ACTIVITY_TYPE_WITHDRAWAL,
+            ACTIVITY_TYPE_TRANSFER_IN,
+            ACTIVITY_TYPE_TRANSFER_OUT,
+            ACTIVITY_TYPE_SPLIT,
+            ACTIVITY_TYPE_FEE,
+            ACTIVITY_TYPE_TAX,
+            ACTIVITY_TYPE_CREDIT,
+            ACTIVITY_TYPE_ADJUSTMENT,
+        ] {
+            activity_mappings.insert(activity_type.to_string(), vec![activity_type.to_string()]);
+        }
 
         ImportMappingData {
             account_id: String::new(),
@@ -1329,6 +1550,19 @@ mod decimal_input_format {
     }
 }
 
+mod subtype_patch_format {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize_patch_subtype<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Some(
+            Option::<String>::deserialize(deserializer)?.unwrap_or_default(),
+        ))
+    }
+}
+
 // Custom serialization for optional Decimal fields to handle string representation
 mod optional_decimal_format {
     use rust_decimal::Decimal;
@@ -1486,19 +1720,24 @@ pub struct PrepareActivitiesResult {
 
 impl From<ActivityImport> for NewActivity {
     fn from(import: ActivityImport) -> Self {
-        let symbol = if import.symbol.is_empty() {
-            import.asset_id.as_ref().map(|asset_id| SymbolInput {
-                id: Some(asset_id.clone()),
-                symbol: None,
-                exchange_mic: None,
-                kind: None,
-                name: import.symbol_name.clone(),
-                quote_mode: import.quote_mode.clone(),
-                quote_ccy: import.quote_ccy.clone(),
-                instrument_type: import.instrument_type.clone(),
-            })
+        let asset = if import.symbol.is_empty() {
+            import
+                .asset_id
+                .as_ref()
+                .map(|asset_id| AssetResolutionInput {
+                    id: Some(asset_id.clone()),
+                    symbol: None,
+                    exchange_mic: None,
+                    kind: None,
+                    name: import.symbol_name.clone(),
+                    quote_mode: import.quote_mode.clone(),
+                    quote_ccy: import.quote_ccy.clone(),
+                    instrument_type: import.instrument_type.clone(),
+                    provider_id: import.provider_id.clone(),
+                    provider_symbol: import.provider_symbol.clone(),
+                })
         } else {
-            Some(SymbolInput {
+            Some(AssetResolutionInput {
                 id: import.asset_id.clone(),
                 symbol: Some(import.symbol),
                 exchange_mic: import.exchange_mic,
@@ -1507,6 +1746,8 @@ impl From<ActivityImport> for NewActivity {
                 quote_mode: import.quote_mode.clone(),
                 quote_ccy: import.quote_ccy,
                 instrument_type: import.instrument_type,
+                provider_id: import.provider_id,
+                provider_symbol: import.provider_symbol,
             })
         };
 
@@ -1516,10 +1757,20 @@ impl From<ActivityImport> for NewActivity {
             Some(ActivityStatus::Posted)
         };
 
+        // Persist `is_external` as flow metadata so net_contribution and flow classification
+        // see this transfer the same way the manual activity form would.
+        let is_transfer = import.activity_type == ACTIVITY_TYPE_TRANSFER_IN
+            || import.activity_type == ACTIVITY_TYPE_TRANSFER_OUT;
+        let metadata = if is_transfer && import.is_external == Some(true) {
+            Some(serde_json::json!({ "flow": { "is_external": true } }).to_string())
+        } else {
+            None
+        };
+
         NewActivity {
             id: import.id,
             account_id: import.account_id.unwrap_or_default(),
-            symbol,
+            asset,
             activity_type: import.activity_type,
             subtype: import.subtype,
             activity_date: import.date,
@@ -1531,7 +1782,7 @@ impl From<ActivityImport> for NewActivity {
             status,
             notes: import.comment,
             fx_rate: import.fx_rate,
-            metadata: None,
+            metadata,
             needs_review: None,
             source_system: Some("CSV".to_string()),
             source_record_id: None,

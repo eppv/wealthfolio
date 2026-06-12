@@ -3,13 +3,15 @@ import { buyFormSchema } from "../buy-form";
 import { sellFormSchema } from "../sell-form";
 import { depositFormSchema } from "../deposit-form";
 import { withdrawalFormSchema } from "../withdrawal-form";
-import { dividendFormSchema } from "../dividend-form";
+import { dividendFormSchema, type DividendFormValues } from "../dividend-form";
 import { transferFormSchema } from "../transfer-form";
 import { splitFormSchema } from "../split-form";
 import { feeFormSchema } from "../fee-form";
-import { interestFormSchema } from "../interest-form";
+import { interestFormSchema, type InterestFormValues } from "../interest-form";
 import { taxFormSchema } from "../tax-form";
+import { newActivitySchema } from "../schemas";
 import { ACTIVITY_FORM_CONFIG } from "../../../config/activity-form-config";
+import { ACTIVITY_SUBTYPES, ActivityType } from "@/lib/constants";
 
 describe("Form Schemas Validation", () => {
   describe("buyFormSchema", () => {
@@ -834,6 +836,61 @@ describe("Form Schemas Validation", () => {
   });
 
   describe("TRANSFER toPayload", () => {
+    it("initializes cash transfers as cash even when they have a generated cash asset id", () => {
+      const defaults = ACTIVITY_FORM_CONFIG.TRANSFER.getDefaults(
+        {
+          activityType: ActivityType.TRANSFER_IN,
+          accountId: "acc-123",
+          date: new Date(),
+          amount: "1000",
+          currency: "USD",
+          assetId: "CASH:USD",
+          assetSymbol: "CASH",
+        },
+        [],
+      ) as any;
+
+      expect(defaults.transferMode).toBe("cash");
+      expect(defaults.assetId).toBeNull();
+    });
+
+    it("does not infer external mode for unpaired existing transfers", () => {
+      const defaults = ACTIVITY_FORM_CONFIG.TRANSFER.getDefaults(
+        {
+          id: "transfer-in-1",
+          activityType: ActivityType.TRANSFER_IN,
+          accountId: "acc-123",
+          date: new Date(),
+          amount: "1000",
+          currency: "USD",
+        },
+        [],
+      ) as any;
+
+      expect(defaults.isExternal).toBe(false);
+      expect(defaults.accountId).toBe("");
+      expect(defaults.toAccountId).toBe("acc-123");
+    });
+
+    it("uses persisted external metadata for existing transfers", () => {
+      const defaults = ACTIVITY_FORM_CONFIG.TRANSFER.getDefaults(
+        {
+          id: "transfer-in-1",
+          activityType: ActivityType.TRANSFER_IN,
+          accountId: "acc-123",
+          date: new Date(),
+          amount: "1000",
+          currency: "USD",
+          metadata: { flow: { is_external: true } },
+        },
+        [],
+      ) as any;
+
+      expect(defaults.isExternal).toBe(true);
+      expect(defaults.accountId).toBe("acc-123");
+      expect(defaults.toAccountId).toBe("");
+    });
+
     it("includes unitPrice in payload for external securities transfer-in", () => {
       const formData = {
         isExternal: true,
@@ -851,6 +908,23 @@ describe("Form Schemas Validation", () => {
       expect(payload).toHaveProperty("unitPrice", 150.5);
     });
 
+    it("omits selected existing asset id when securities symbol is cleared", () => {
+      const formData = {
+        isExternal: false,
+        fromAccountId: "acc-123",
+        toAccountId: "acc-456",
+        activityDate: new Date(),
+        transferMode: "cash" as const,
+        amount: 1000,
+        assetId: null,
+        existingAssetId: "asset-stale",
+        currency: "USD",
+      };
+
+      const payload = ACTIVITY_FORM_CONFIG.TRANSFER.toPayload(formData as any);
+      expect(payload).not.toHaveProperty("existingAssetId");
+    });
+
     it("omits unitPrice when not provided", () => {
       const formData = {
         isExternal: false,
@@ -863,6 +937,152 @@ describe("Form Schemas Validation", () => {
 
       const payload = ACTIVITY_FORM_CONFIG.TRANSFER.toPayload(formData as any) as any;
       expect(payload.unitPrice).toBeUndefined();
+    });
+  });
+
+  describe("income toPayload", () => {
+    it("clears stale asset-backed dividend values when switching back to cash", () => {
+      const formData = {
+        accountId: "acc-123",
+        activityDate: new Date(),
+        symbol: "AAPL",
+        amount: 12,
+        quantity: 2,
+        unitPrice: 6,
+        subtype: null,
+        currency: "USD",
+      } satisfies DividendFormValues;
+
+      const payload = ACTIVITY_FORM_CONFIG.DIVIDEND.toPayload(formData);
+
+      expect(payload).toMatchObject({ subtype: null, quantity: null, unitPrice: null });
+    });
+
+    it("keeps asset-backed values for dividend in kind", () => {
+      const formData = {
+        accountId: "acc-123",
+        activityDate: new Date(),
+        symbol: "AAPL",
+        amount: 12,
+        quantity: 2,
+        unitPrice: 6,
+        subtype: ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND,
+        currency: "USD",
+      } satisfies DividendFormValues;
+
+      const payload = ACTIVITY_FORM_CONFIG.DIVIDEND.toPayload(formData);
+
+      expect(payload).toMatchObject({
+        subtype: ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND,
+        quantity: 2,
+        unitPrice: 6,
+      });
+    });
+
+    it("clears stale staking values when switching interest back to cash", () => {
+      const formData = {
+        accountId: "acc-123",
+        activityDate: new Date(),
+        symbol: "ETH",
+        amount: 12,
+        quantity: 2,
+        unitPrice: 6,
+        subtype: null,
+        currency: "USD",
+      } satisfies InterestFormValues;
+
+      const payload = ACTIVITY_FORM_CONFIG.INTEREST.toPayload(formData);
+
+      expect(payload).toMatchObject({ subtype: null, quantity: null, unitPrice: null });
+    });
+
+    it("keeps asset-backed values for staking rewards", () => {
+      const formData = {
+        accountId: "acc-123",
+        activityDate: new Date(),
+        symbol: "ETH",
+        amount: 12,
+        quantity: 2,
+        unitPrice: 6,
+        subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+        currency: "USD",
+      } satisfies InterestFormValues;
+
+      const payload = ACTIVITY_FORM_CONFIG.INTEREST.toPayload(formData);
+
+      expect(payload).toMatchObject({
+        subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+        quantity: 2,
+        unitPrice: 6,
+      });
+    });
+  });
+
+  describe("asset identity payloads", () => {
+    it("omits stale selected asset id for option payloads", () => {
+      const payload = ACTIVITY_FORM_CONFIG.BUY.toPayload({
+        accountId: "acc-123",
+        activityDate: new Date(),
+        assetId: "AAPL260116C00250000",
+        existingAssetId: "asset-aapl-stock",
+        symbolInstrumentType: "OPTION",
+        quantity: 1,
+        unitPrice: 10,
+        fee: 0,
+        currency: "USD",
+      } as any);
+
+      expect(payload).not.toHaveProperty("existingAssetId");
+    });
+  });
+
+  describe("newActivitySchema extended mobile edit types", () => {
+    it("accepts credit activities", () => {
+      const result = newActivitySchema.safeParse({
+        accountId: "acc-123",
+        activityType: "CREDIT",
+        activityDate: new Date(),
+        amount: 25,
+        currency: "USD",
+        exchangeMic: null,
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts cash interest after asset-backed fields are cleared", () => {
+      const result = newActivitySchema.safeParse({
+        accountId: "acc-123",
+        activityType: "INTEREST",
+        activityDate: new Date(),
+        subtype: null,
+        amount: 25,
+        quantity: undefined,
+        unitPrice: undefined,
+        currency: "USD",
+        exchangeMic: null,
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts adjustment activities with zero unit price", () => {
+      const result = newActivitySchema.safeParse({
+        accountId: "acc-123",
+        activityType: "ADJUSTMENT",
+        activityDate: new Date(),
+        assetId: "AAPL",
+        quantity: 1,
+        unitPrice: 0,
+        currency: "USD",
+        assetMetadata: {
+          name: null,
+          kind: null,
+          exchangeMic: null,
+        },
+      });
+
+      expect(result.success).toBe(true);
     });
   });
 });

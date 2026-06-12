@@ -3,9 +3,10 @@ use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{async_runtime::spawn, AppHandle, Emitter, Listener, Manager};
-use wealthfolio_core::constants::PORTFOLIO_TOTAL_ACCOUNT_ID;
 use wealthfolio_core::health::HealthServiceTrait;
-use wealthfolio_core::portfolio::snapshot::SnapshotRecalcMode;
+use wealthfolio_core::portfolio::snapshot::{
+    reconcile_quote_sync_from_latest_account_snapshots, SnapshotRecalcMode,
+};
 use wealthfolio_core::portfolio::valuation::ValuationRecalcMode;
 use wealthfolio_core::quotes::MarketSyncMode;
 
@@ -32,6 +33,22 @@ pub fn setup_event_listeners(handle: AppHandle) {
     });
 }
 
+fn resolve_listener_account_ids(
+    context: &Arc<ServiceContext>,
+    account_ids: Option<&Vec<String>>,
+) -> Result<Vec<String>, wealthfolio_core::Error> {
+    if let Some(target_ids) = account_ids {
+        return Ok(target_ids.clone());
+    }
+
+    Ok(context
+        .account_service()
+        .get_non_archived_accounts()?
+        .into_iter()
+        .map(|account| account.id)
+        .collect())
+}
+
 /// Handles the common logic for both portfolio update and recalculation requests.
 fn handle_portfolio_request(handle: AppHandle, payload_str: &str, force_recalc: bool) {
     let event_name = if force_recalc {
@@ -54,6 +71,28 @@ fn handle_portfolio_request(handle: AppHandle, payload_str: &str, force_recalc: 
                     // Only perform market sync if the mode requires it
                     if market_sync_mode.requires_sync() {
                         let market_data_service = context.quote_service();
+                        let snapshot_service = context.snapshot_service();
+                        let account_ids_for_sync = resolve_listener_account_ids(&context, None)
+                            .unwrap_or_else(|err| {
+                                warn!(
+                                    "Failed to resolve accounts for quote sync reconciliation: {}",
+                                    err
+                                );
+                                Vec::new()
+                            });
+
+                        if let Err(e) = reconcile_quote_sync_from_latest_account_snapshots(
+                            snapshot_service.as_ref(),
+                            market_data_service.as_ref(),
+                            &account_ids_for_sync,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Failed to reconcile quote sync state from latest holdings: {}. Quote sync planning may be affected.",
+                                e
+                            );
+                        }
 
                         // Emit sync start event
                         if let Err(e) = handle_clone.emit(MARKET_SYNC_START, &()) {
@@ -82,6 +121,11 @@ fn handle_portfolio_request(handle: AppHandle, payload_str: &str, force_recalc: 
                             Ok(result) => {
                                 // Convert SyncResult to legacy format for backwards compatibility
                                 let failed_syncs = result.failures;
+                                let skipped_reasons = result
+                                    .skipped_reasons
+                                    .into_iter()
+                                    .map(|(asset_id, reason)| (asset_id, reason.to_string()))
+                                    .collect();
 
                                 let health_service = context.health_service();
                                 let health_clone = health_service.clone();
@@ -89,7 +133,10 @@ fn handle_portfolio_request(handle: AppHandle, payload_str: &str, force_recalc: 
                                     health_clone.clear_cache().await;
                                 });
 
-                                let result_payload = MarketSyncResult { failed_syncs };
+                                let result_payload = MarketSyncResult {
+                                    failed_syncs,
+                                    skipped_reasons,
+                                };
                                 if let Err(e) =
                                     handle_clone.emit(MARKET_SYNC_COMPLETE, &result_payload)
                                 {
@@ -210,14 +257,15 @@ fn handle_portfolio_calculation(
         let snapshot_service = context.snapshot_service();
         let valuation_service = context.valuation_service();
 
-        // Step 0: Resolve initially targeted active accounts for individual calculations.
-        // This list might be empty if account_ids_input is None and no accounts are active,
-        // or if account_ids_input specified accounts that are now all inactive.
-        let initially_targeted_active_accounts: Vec<String> =
-            match account_service.list_accounts(Some(true), None, account_ids_input.as_deref()) {
-                Ok(accounts) => accounts.iter().map(|a| a.id.clone()).collect(),
+        // Step 0: Resolve account scope. Specific requests are processed as-is;
+        // full recalculations rebuild every non-archived account, including closed accounts.
+        let account_ids: Vec<String> = if let Some(target_ids) = account_ids_input {
+            target_ids
+        } else {
+            match account_service.get_non_archived_accounts() {
+                Ok(accounts) => accounts.into_iter().map(|a| a.id).collect(),
                 Err(e) => {
-                    let err_msg = format!("Failed to list active accounts: {}", e);
+                    let err_msg = format!("Failed to list non-archived accounts: {}", e);
                     error!("{}", err_msg);
                     if let Err(e_emit) = app_handle.emit(PORTFOLIO_UPDATE_ERROR, &err_msg) {
                         error!(
@@ -227,15 +275,13 @@ fn handle_portfolio_calculation(
                     }
                     return;
                 }
-            };
+            }
+        };
 
-        // --- Step 1: Calculate Account-Specific Snapshots (only if there are specific active accounts to process) ---
-        if !initially_targeted_active_accounts.is_empty() {
+        // --- Step 1: Calculate Account-Specific Snapshots ---
+        if !account_ids.is_empty() {
             let account_snapshot_result = snapshot_service
-                .recalculate_holdings_snapshots(
-                    Some(initially_targeted_active_accounts.as_slice()),
-                    snapshot_mode.clone(),
-                )
+                .recalculate_holdings_snapshots(Some(account_ids.as_slice()), snapshot_mode.clone())
                 .await;
 
             if let Err(e) = account_snapshot_result {
@@ -253,53 +299,31 @@ fn handle_portfolio_calculation(
             }
         }
 
-        // --- Step 2: Calculate TOTAL portfolio snapshot ---
-        let total_result = snapshot_service
-            .recalculate_total_portfolio_snapshots(snapshot_mode)
-            .await;
-        if let Err(e) = total_result {
-            let err_msg = format!("Failed to calculate TOTAL portfolio snapshot: {}", e);
-            error!("{}", err_msg);
-            if let Err(e_emit) = app_handle.emit(PORTFOLIO_UPDATE_ERROR, &err_msg) {
-                error!(
-                    "Failed to emit {} event: {}",
-                    PORTFOLIO_UPDATE_ERROR, e_emit
-                );
-            }
-            return;
-        }
-
-        // --- Step 2.5: Update position status from TOTAL snapshot ---
-        // This derives open/closed position transitions for quote sync planning
-        if let Ok(Some(total_snapshot)) =
-            snapshot_service.get_latest_holdings_snapshot(PORTFOLIO_TOTAL_ACCOUNT_ID)
-        {
-            let quote_service = context.quote_service();
-
-            // Extract asset quantities from the TOTAL snapshot
-            let current_holdings: std::collections::HashMap<String, rust_decimal::Decimal> =
-                total_snapshot
-                    .positions
-                    .iter()
-                    .map(|(asset_id, position)| (asset_id.clone(), position.quantity))
-                    .collect();
-
-            if let Err(e) = quote_service
-                .update_position_status_from_holdings(&current_holdings)
-                .await
-            {
+        // --- Step 2: Update position status from latest real-account snapshots ---
+        let quote_service = context.quote_service();
+        let quote_reconciliation_account_ids = resolve_listener_account_ids(&context, None)
+            .unwrap_or_else(|err| {
                 warn!(
-                    "Failed to update position status from holdings: {}. Quote sync planning may be affected.",
-                    e
+                    "Failed to resolve accounts for quote sync reconciliation: {}",
+                    err
                 );
-            }
+                Vec::new()
+            });
+        if let Err(e) = reconcile_quote_sync_from_latest_account_snapshots(
+            snapshot_service.as_ref(),
+            quote_service.as_ref(),
+            &quote_reconciliation_account_ids,
+        )
+        .await
+        {
+            warn!(
+                "Failed to update position status from holdings: {}. Quote sync planning may be affected.",
+                e
+            );
         }
 
         // --- Step 3: Calculate Valuation History ---
-        let mut accounts_for_valuation = initially_targeted_active_accounts;
-        if !accounts_for_valuation.contains(&PORTFOLIO_TOTAL_ACCOUNT_ID.to_string()) {
-            accounts_for_valuation.push(PORTFOLIO_TOTAL_ACCOUNT_ID.to_string());
-        }
+        let accounts_for_valuation = account_ids;
 
         if !accounts_for_valuation.is_empty() {
             let history_futures = accounts_for_valuation.iter().map(|account_id| {

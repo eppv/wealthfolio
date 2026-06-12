@@ -1,8 +1,10 @@
-import { debounce } from "lodash";
 import { useEffect, useMemo, useState } from "react";
+import type { DateRange } from "react-day-picker";
 
+import { DateRangeFilter } from "@/features/spending/components/date-range-filter";
 import { ActivityType, ActivityTypeNames, INSTRUMENT_TYPE_OPTIONS } from "@/lib/constants";
-import { Account } from "@/lib/types";
+import { debounce } from "@/lib/debounce";
+import type { Account, AccountScope, PortfolioWithAccounts } from "@/lib/types";
 import {
   AnimatedToggleGroup,
   Button,
@@ -16,16 +18,19 @@ export type ActivityViewMode = "table" | "datagrid";
 
 interface ActivityViewControlsProps {
   accounts: Account[];
+  portfolios: PortfolioWithAccounts[];
   searchQuery: string;
   onSearchQueryChange: (value: string) => void;
-  selectedAccountIds: string[];
-  onAccountIdsChange: (ids: string[]) => void;
+  accountScope: AccountScope;
+  onAccountScopeChange: (scope: AccountScope) => void;
   selectedActivityTypes: ActivityType[];
   onActivityTypesChange: (types: ActivityType[]) => void;
   selectedInstrumentTypes: string[];
   onInstrumentTypesChange: (types: string[]) => void;
   statusFilter: ActivityStatusFilter;
   onStatusFilterChange: (status: ActivityStatusFilter) => void;
+  dateRange: DateRange | undefined;
+  onDateRangeChange: (range: DateRange | undefined) => void;
   viewMode: ActivityViewMode;
   onViewModeChange: (mode: ActivityViewMode) => void;
   /** Shown only in table view - number of activities fetched so far */
@@ -35,18 +40,36 @@ interface ActivityViewControlsProps {
   isFetching: boolean;
 }
 
+function accountIdsForScope(scope: AccountScope, portfolios: PortfolioWithAccounts[]): string[] {
+  if (scope.type === "account") return [scope.accountId];
+  if (scope.type === "accounts") return scope.accountIds;
+  if (scope.type === "portfolio") {
+    return portfolios.find((portfolio) => portfolio.id === scope.portfolioId)?.accountIds ?? [];
+  }
+  return [];
+}
+
+function scopeFromAccountIds(accountIds: string[]): AccountScope {
+  if (accountIds.length === 0) return { type: "all" };
+  if (accountIds.length === 1) return { type: "account", accountId: accountIds[0] };
+  return { type: "accounts", accountIds };
+}
+
 export function ActivityViewControls({
   accounts,
+  portfolios,
   searchQuery,
   onSearchQueryChange,
-  selectedAccountIds,
-  onAccountIdsChange,
+  accountScope,
+  onAccountScopeChange,
   selectedActivityTypes,
   onActivityTypesChange,
   selectedInstrumentTypes,
   onInstrumentTypesChange,
   statusFilter,
   onStatusFilterChange,
+  dateRange,
+  onDateRangeChange,
   viewMode,
   onViewModeChange,
   totalFetched,
@@ -82,6 +105,21 @@ export function ActivityViewControls({
     [accounts],
   );
 
+  const selectableAccountIds = useMemo(
+    () => new Set(accountOptions.map((option) => option.value)),
+    [accountOptions],
+  );
+
+  const selectedAccountIds = useMemo(
+    () =>
+      new Set(
+        accountIdsForScope(accountScope, portfolios).filter((accountId) =>
+          selectableAccountIds.has(accountId),
+        ),
+      ),
+    [accountScope, portfolios, selectableAccountIds],
+  );
+
   const activityOptions = useMemo(
     () =>
       (Object.entries(ActivityTypeNames) as [ActivityType, string][]).map(([value, label]) => ({
@@ -107,10 +145,12 @@ export function ActivityViewControls({
 
   const hasActiveFilters =
     searchQuery.trim().length > 0 ||
-    selectedAccountIds.length > 0 ||
+    accountScope.type !== "all" ||
     selectedActivityTypes.length > 0 ||
     selectedInstrumentTypes.length > 0 ||
-    statusFilter !== "all";
+    statusFilter !== "all" ||
+    !!dateRange?.from ||
+    !!dateRange?.to;
 
   return (
     <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -125,10 +165,27 @@ export function ActivityViewControls({
         />
 
         <FacetedFilter
+          title="Status"
+          options={statusOptions}
+          selectedValues={new Set(statusFilter === "all" ? [] : [statusFilter])}
+          onFilterChange={(values: Set<string>) => {
+            const selected = Array.from(values);
+            onStatusFilterChange(
+              selected.length === 0 ? "all" : (selected[0] as ActivityStatusFilter),
+            );
+          }}
+        />
+
+        <DateRangeFilter value={dateRange} onChange={onDateRangeChange} />
+
+        <FacetedFilter
           title="Account"
+          contentClassName="w-72"
           options={accountOptions}
-          selectedValues={new Set(selectedAccountIds)}
-          onFilterChange={(values: Set<string>) => onAccountIdsChange(Array.from(values))}
+          selectedValues={selectedAccountIds}
+          onFilterChange={(values: Set<string>) =>
+            onAccountScopeChange(scopeFromAccountIds(Array.from(values)))
+          }
         />
 
         <FacetedFilter
@@ -147,18 +204,6 @@ export function ActivityViewControls({
           onFilterChange={(values: Set<string>) => onInstrumentTypesChange(Array.from(values))}
         />
 
-        <FacetedFilter
-          title="Status"
-          options={statusOptions}
-          selectedValues={new Set(statusFilter === "all" ? [] : [statusFilter])}
-          onFilterChange={(values: Set<string>) => {
-            const selected = Array.from(values);
-            onStatusFilterChange(
-              selected.length === 0 ? "all" : (selected[0] as ActivityStatusFilter),
-            );
-          }}
-        />
-
         {hasActiveFilters ? (
           <Button
             variant="ghost"
@@ -167,10 +212,11 @@ export function ActivityViewControls({
             onClick={() => {
               setLocalSearch("");
               onSearchQueryChange("");
-              onAccountIdsChange([]);
+              onAccountScopeChange({ type: "all" });
               onActivityTypesChange([]);
               onInstrumentTypesChange([]);
               onStatusFilterChange("all");
+              onDateRangeChange(undefined);
             }}
           >
             Reset

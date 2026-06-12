@@ -26,6 +26,7 @@ export type {
   BackendSyncReconcileReadyResult,
   BackendSyncSnapshotUploadResult,
   BackendSyncStateResult,
+  DataExportResult,
   EphemeralKeyPair,
   EventCallback,
   ExtractedAddon,
@@ -69,6 +70,14 @@ export const RUN_ENV: RunEnv = RunEnvs.WEB;
 // Shared domain modules (identical logic for both platforms)
 // ============================================================================
 
+// Portfolio Commands
+export {
+  createPortfolio,
+  deletePortfolio,
+  getPortfolios,
+  updatePortfolioEntry,
+} from "../shared/portfolios";
+
 // Account Commands
 export { createAccount, deleteAccount, getAccounts, updateAccount } from "../shared/accounts";
 
@@ -80,14 +89,21 @@ export {
   deleteImportTemplate,
   deleteActivity,
   getImportTemplate,
+  getBrokerSyncProfile,
+  findTransferMatchCandidates,
+  getTransferPairForActivity,
   getAccountImportMapping,
   linkAccountTemplate,
+  linkTransferActivities,
+  unlinkTransferActivities,
   getActivities,
   importActivities,
   listImportTemplates,
   previewImportAssets,
   saveAccountImportMapping,
+  saveBrokerSyncProfileRules,
   saveImportTemplate,
+  saveInternalTransferPair,
   saveActivities,
   searchActivities,
   updateActivity,
@@ -98,10 +114,19 @@ export { parseCsv } from "./activities";
 export {
   createGoal,
   deleteGoal,
+  deleteGoalPlan,
+  getGoal,
+  getGoalFunding,
+  getGoalPlan,
   getGoals,
-  getGoalsAllocation,
+  getRetirementOverview,
+  getSaveUpOverview,
+  previewSaveUpOverview,
+  refreshAllGoalSummaries,
+  refreshGoalSummary,
+  saveGoalFunding,
+  saveGoalPlan,
   updateGoal,
-  updateGoalsAllocations,
 } from "../shared/goals";
 
 // Secrets Commands
@@ -122,6 +147,7 @@ export {
   importTaxonomyJson,
   migrateLegacyClassifications,
   moveCategory,
+  replaceAssetTaxonomyAssignments,
   removeAssetTaxonomyAssignment,
   updateCategory,
   updateTaxonomy,
@@ -132,9 +158,11 @@ export {
   calculateAccountsSimplePerformance,
   calculatePerformanceHistory,
   calculatePerformanceSummary,
+  calculatePerformanceSummaries,
   checkHoldingsImport,
   deleteSnapshot,
   getAssetHoldings,
+  getAssetLots,
   getHistoricalValuations,
   getHolding,
   getHoldings,
@@ -145,6 +173,7 @@ export {
   getSnapshotByDate,
   getSnapshots,
   importHoldingsCsv,
+  performanceSummaryScopeKey,
   recalculatePortfolio,
   saveManualHoldings,
   updatePortfolio,
@@ -156,7 +185,7 @@ export {
   createAsset,
   deleteAsset,
   deleteQuote,
-  fetchYahooDividends,
+  fetchDividends,
   getAssetProfile,
   getAssets,
   getExchanges,
@@ -298,6 +327,24 @@ export {
   updateHealthConfig,
 } from "../shared/health";
 
+// Allocation Target Commands
+export {
+  archiveAllocationTarget,
+  calculateRebalancePlan,
+  createAllocationTarget,
+  deleteAllocationTarget,
+  getAllocationTargetDrift,
+  getAllocationTarget,
+  listAllocationTargetWeights,
+  listAllocationTargets,
+  saveAllocationTargetWeights,
+  saveAllocationTargetWithWeights,
+  updateAllocationTarget,
+} from "../shared/allocation-targets";
+
+// Data Export Commands
+export { exportDataFile } from "./exports";
+
 // ============================================================================
 // Platform-specific modules (different implementations for web vs desktop)
 // ============================================================================
@@ -330,22 +377,28 @@ export {
   openDatabaseFileDialog,
   openFileSaveDialog,
   openFolderDialog,
+  saveAppDataFileViaPicker,
   openUrlInBrowser,
 } from "./files";
 
 // Settings Commands (web-specific API for backups and updates)
 export {
   backupDatabase,
+  backupDatabaseToPendingExport,
   backupDatabaseToPath,
   checkForUpdates,
+  deleteDatabaseBackup,
   getAppInfo,
+  getDatabaseBackupDownloadUrl,
   getPlatform,
   getSettings,
   installUpdate,
   isAutoUpdateCheckEnabled,
+  listDatabaseBackups,
   restoreDatabase,
   updateSettings,
 } from "./settings";
+export type { DatabaseBackup } from "./settings";
 
 // Addon Commands (web-specific implementations)
 export {
@@ -375,14 +428,12 @@ export {
 
 // FIRE Planner (desktop-only — stubs throw at runtime)
 export {
-  getFireSettings,
-  saveFireSettings,
-  calculateFireProjection,
-  runFireMonteCarlo,
-  runFireScenarioAnalysis,
-  runFireSorr,
-  runFireSensitivity,
-  runFireStrategyComparison,
+  calculateRetirementProjection,
+  runRetirementDecisionSensitivityMap,
+  runRetirementMonteCarlo,
+  runRetirementScenarioAnalysis,
+  runRetirementSorr,
+  runRetirementStressTests,
 } from "./fire-planner";
 
 // Crypto Commands (web stubs - not available in web mode)

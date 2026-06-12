@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::r2d2::{self, Pool};
+use diesel::sql_types::{BigInt, Text};
 use diesel::SqliteConnection;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -20,11 +21,19 @@ use super::model::{
 use super::sync;
 use crate::db::{get_connection, WriteHandle};
 use crate::errors::StorageError;
-use crate::schema::{asset_taxonomy_assignments, taxonomies, taxonomy_categories};
+use crate::schema::{
+    allocation_target_weights, asset_taxonomy_assignments, taxonomies, taxonomy_categories,
+};
 
 pub struct TaxonomyRepository {
     pool: Arc<Pool<r2d2::ConnectionManager<SqliteConnection>>>,
     writer: WriteHandle,
+}
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
 }
 
 impl TaxonomyRepository {
@@ -100,6 +109,7 @@ impl TaxonomyRepositoryTrait for TaxonomyRepository {
                         .format("%Y-%m-%dT%H:%M:%S%.fZ")
                         .to_string(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
+                    scope: taxonomy.scope,
                 };
 
                 diesel::update(taxonomies::table.find(&id))
@@ -166,6 +176,51 @@ impl TaxonomyRepositoryTrait for TaxonomyRepository {
         Ok(result.map(Category::from))
     }
 
+    fn get_category_spending_reference_count(
+        &self,
+        taxonomy_id: &str,
+        category_id: &str,
+    ) -> Result<usize> {
+        let mut conn = get_connection(&self.pool)?;
+        let row = diesel::sql_query(
+            "SELECT (
+                (SELECT COUNT(*) FROM activity_taxonomy_assignments WHERE taxonomy_id = ? AND category_id = ?) +
+                (SELECT COUNT(*) FROM budget_group_assignments WHERE taxonomy_id = ? AND category_id = ?) +
+                (SELECT COUNT(*) FROM budget_targets WHERE taxonomy_id = ? AND category_id = ?) +
+                (SELECT COUNT(*) FROM budget_rollover_settings WHERE taxonomy_id = ? AND category_id = ?) +
+                (SELECT COUNT(*) FROM spending_categorization_rules WHERE taxonomy_id = ? AND category_id = ?)
+            ) AS count",
+        )
+        .bind::<Text, _>(taxonomy_id)
+        .bind::<Text, _>(category_id)
+        .bind::<Text, _>(taxonomy_id)
+        .bind::<Text, _>(category_id)
+        .bind::<Text, _>(taxonomy_id)
+        .bind::<Text, _>(category_id)
+        .bind::<Text, _>(taxonomy_id)
+        .bind::<Text, _>(category_id)
+        .bind::<Text, _>(taxonomy_id)
+        .bind::<Text, _>(category_id)
+        .get_result::<CountRow>(&mut conn)
+        .map_err(StorageError::from)?;
+        Ok(row.count.max(0) as usize)
+    }
+
+    fn get_category_allocation_target_weight_count(
+        &self,
+        taxonomy_id: &str,
+        category_id: &str,
+    ) -> Result<usize> {
+        let mut conn = get_connection(&self.pool)?;
+        let count = allocation_target_weights::table
+            .filter(allocation_target_weights::taxonomy_id.eq(taxonomy_id))
+            .filter(allocation_target_weights::category_id.eq(category_id))
+            .count()
+            .get_result::<i64>(&mut conn)
+            .map_err(StorageError::from)?;
+        Ok(count.max(0) as usize)
+    }
+
     async fn create_category(&self, category: NewCategory) -> Result<Category> {
         self.writer
             .exec_projected(move |conn, projection| -> Result<Category> {
@@ -212,6 +267,7 @@ impl TaxonomyRepositoryTrait for TaxonomyRepository {
                         .format("%Y-%m-%dT%H:%M:%S%.fZ")
                         .to_string(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
+                    icon: category.icon,
                 };
 
                 diesel::update(
@@ -314,6 +370,37 @@ impl TaxonomyRepositoryTrait for TaxonomyRepository {
         let mut conn = get_connection(&self.pool)?;
         let results = asset_taxonomy_assignments::table
             .filter(asset_taxonomy_assignments::asset_id.eq(asset_id))
+            .order((
+                asset_taxonomy_assignments::asset_id.asc(),
+                asset_taxonomy_assignments::taxonomy_id.asc(),
+                asset_taxonomy_assignments::category_id.asc(),
+                asset_taxonomy_assignments::id.asc(),
+            ))
+            .load::<AssetTaxonomyAssignmentDB>(&mut conn)
+            .map_err(StorageError::from)?;
+        Ok(results
+            .into_iter()
+            .map(AssetTaxonomyAssignment::from)
+            .collect())
+    }
+
+    fn get_asset_assignments_for_assets(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<Vec<AssetTaxonomyAssignment>> {
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let results = asset_taxonomy_assignments::table
+            .filter(asset_taxonomy_assignments::asset_id.eq_any(asset_ids))
+            .order((
+                asset_taxonomy_assignments::asset_id.asc(),
+                asset_taxonomy_assignments::taxonomy_id.asc(),
+                asset_taxonomy_assignments::category_id.asc(),
+                asset_taxonomy_assignments::id.asc(),
+            ))
             .load::<AssetTaxonomyAssignmentDB>(&mut conn)
             .map_err(StorageError::from)?;
         Ok(results
@@ -367,6 +454,55 @@ impl TaxonomyRepositoryTrait for TaxonomyRepository {
                 tx.update(&result)?;
 
                 Ok(AssetTaxonomyAssignment::from(result))
+            })
+            .await
+    }
+
+    async fn replace_asset_assignments(
+        &self,
+        asset_id: &str,
+        taxonomy_id: &str,
+        assignments: Vec<NewAssetTaxonomyAssignment>,
+    ) -> Result<Vec<AssetTaxonomyAssignment>> {
+        let asset_id = asset_id.to_string();
+        let taxonomy_id = taxonomy_id.to_string();
+        self.writer
+            .exec_tx(move |tx| -> Result<Vec<AssetTaxonomyAssignment>> {
+                let existing_ids = asset_taxonomy_assignments::table
+                    .filter(asset_taxonomy_assignments::asset_id.eq(&asset_id))
+                    .filter(asset_taxonomy_assignments::taxonomy_id.eq(&taxonomy_id))
+                    .select(asset_taxonomy_assignments::id)
+                    .load::<String>(tx.conn())
+                    .map_err(StorageError::from)?;
+
+                diesel::delete(
+                    asset_taxonomy_assignments::table
+                        .filter(asset_taxonomy_assignments::asset_id.eq(&asset_id))
+                        .filter(asset_taxonomy_assignments::taxonomy_id.eq(&taxonomy_id)),
+                )
+                .execute(tx.conn())
+                .map_err(StorageError::from)?;
+
+                for assignment_id in existing_ids {
+                    tx.delete::<AssetTaxonomyAssignmentDB>(assignment_id);
+                }
+
+                let mut replaced = Vec::with_capacity(assignments.len());
+                for assignment in assignments {
+                    let mut db: NewAssetTaxonomyAssignmentDB = assignment.into();
+                    db.id = Some(db.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
+
+                    let result = diesel::insert_into(asset_taxonomy_assignments::table)
+                        .values(&db)
+                        .returning(AssetTaxonomyAssignmentDB::as_returning())
+                        .get_result(tx.conn())
+                        .map_err(StorageError::from)?;
+
+                    tx.update(&result)?;
+                    replaced.push(AssetTaxonomyAssignment::from(result));
+                }
+
+                Ok(replaced)
             })
             .await
     }

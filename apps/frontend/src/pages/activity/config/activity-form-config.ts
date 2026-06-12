@@ -1,10 +1,12 @@
 import type { ComponentType } from "react";
 import {
+  ACTIVITY_SUBTYPES,
   ActivityType,
   InstrumentType,
   METADATA_CONTRACT_MULTIPLIER,
   QuoteMode,
 } from "@/lib/constants";
+import { isSecuritiesTransfer } from "@/lib/activity-utils";
 import { parseOccSymbol } from "@/lib/occ-symbol";
 import type { ActivityDetails } from "@/lib/types";
 import { BuyForm, type BuyFormValues } from "../components/forms/buy-form";
@@ -22,16 +24,16 @@ import type { NewActivityFormValues } from "../components/forms/schemas";
 
 // Picker activity types (TRANSFER_IN/OUT merged into TRANSFER)
 export type PickerActivityType =
-  | "BUY"
-  | "SELL"
-  | "DEPOSIT"
-  | "WITHDRAWAL"
-  | "DIVIDEND"
+  | typeof ActivityType.BUY
+  | typeof ActivityType.SELL
+  | typeof ActivityType.DEPOSIT
+  | typeof ActivityType.WITHDRAWAL
+  | typeof ActivityType.DIVIDEND
   | "TRANSFER"
-  | "SPLIT"
-  | "FEE"
-  | "INTEREST"
-  | "TAX";
+  | typeof ActivityType.SPLIT
+  | typeof ActivityType.FEE
+  | typeof ActivityType.INTEREST
+  | typeof ActivityType.TAX;
 
 // Form values union type
 export type ActivityFormValues =
@@ -86,6 +88,18 @@ function getBaseDefaults(
   };
 }
 
+function selectedExistingAsset(
+  assetSymbol: string | null | undefined,
+  existingAssetId: string | null | undefined,
+  instrumentType?: string | null,
+) {
+  if (!assetSymbol?.trim()) return {};
+  if (instrumentType?.trim().toUpperCase() === InstrumentType.OPTION) return {};
+
+  const id = existingAssetId?.trim();
+  return id ? { existingAssetId: id } : {};
+}
+
 // Configuration for each activity type
 export const ACTIVITY_FORM_CONFIG: Record<
   PickerActivityType,
@@ -102,7 +116,8 @@ export const ACTIVITY_FORM_CONFIG: Record<
         unitPrice: absNum(activity?.unitPrice),
         amount: absNum(activity?.amount),
         fee: absNum(activity?.fee) ?? 0,
-        quoteMode: activity?.assetQuoteMode === "MANUAL" ? QuoteMode.MANUAL : QuoteMode.MARKET,
+        quoteMode:
+          activity?.assetQuoteMode === QuoteMode.MANUAL ? QuoteMode.MANUAL : QuoteMode.MARKET,
         // Advanced options
         currency: activity?.currency,
         fxRate: activity?.fxRate ?? undefined,
@@ -110,13 +125,13 @@ export const ACTIVITY_FORM_CONFIG: Record<
       };
 
       // Populate option-specific fields from OCC symbol when editing
-      if (activity?.instrumentType === "OPTION") {
+      if (activity?.instrumentType === InstrumentType.OPTION) {
         const parsed = parseOccSymbol(activity.assetSymbol ?? "");
         return {
           ...base,
           assetType: "option" as const,
-          assetKind: "OPTION",
-          symbolInstrumentType: "OPTION",
+          assetKind: InstrumentType.OPTION,
+          symbolInstrumentType: InstrumentType.OPTION,
           symbolQuoteCcy: activity?.currency ?? undefined,
           underlyingSymbol: parsed?.underlying ?? "",
           strikePrice: parsed?.strikePrice,
@@ -127,12 +142,12 @@ export const ACTIVITY_FORM_CONFIG: Record<
       }
 
       // Populate bond-specific fields when editing
-      if (activity?.instrumentType === "BOND") {
+      if (activity?.instrumentType === InstrumentType.BOND) {
         return {
           ...base,
           assetType: "bond" as const,
-          assetKind: "BOND",
-          symbolInstrumentType: "BOND",
+          assetKind: InstrumentType.BOND,
+          symbolInstrumentType: InstrumentType.BOND,
           symbolQuoteCcy: activity?.currency ?? undefined,
         };
       }
@@ -145,6 +160,7 @@ export const ACTIVITY_FORM_CONFIG: Record<
         accountId: d.accountId,
         activityDate: d.activityDate,
         assetId: d.assetId,
+        ...selectedExistingAsset(d.assetId, d.existingAssetId, d.symbolInstrumentType),
         quantity: d.quantity,
         unitPrice: d.unitPrice,
         fee: d.fee,
@@ -161,6 +177,8 @@ export const ACTIVITY_FORM_CONFIG: Record<
               name: d.assetMetadata.name ?? undefined,
               kind: d.assetMetadata.kind ?? undefined,
               exchangeMic: d.assetMetadata.exchangeMic ?? undefined,
+              providerId: d.assetMetadata.providerId ?? undefined,
+              providerSymbol: d.assetMetadata.providerSymbol ?? undefined,
             }
           : undefined,
         ...(d.symbolInstrumentType === InstrumentType.OPTION &&
@@ -183,7 +201,8 @@ export const ACTIVITY_FORM_CONFIG: Record<
         unitPrice: absNum(activity?.unitPrice),
         amount: absNum(activity?.amount),
         fee: absNum(activity?.fee) ?? 0,
-        quoteMode: activity?.assetQuoteMode === "MANUAL" ? QuoteMode.MANUAL : QuoteMode.MARKET,
+        quoteMode:
+          activity?.assetQuoteMode === QuoteMode.MANUAL ? QuoteMode.MANUAL : QuoteMode.MARKET,
         // Advanced options
         currency: activity?.currency,
         fxRate: activity?.fxRate ?? undefined,
@@ -191,13 +210,13 @@ export const ACTIVITY_FORM_CONFIG: Record<
       };
 
       // Populate option-specific fields from OCC symbol when editing
-      if (activity?.instrumentType === "OPTION") {
+      if (activity?.instrumentType === InstrumentType.OPTION) {
         const parsed = parseOccSymbol(activity.assetSymbol ?? "");
         return {
           ...base,
           assetType: "option" as const,
-          assetKind: "OPTION",
-          symbolInstrumentType: "OPTION",
+          assetKind: InstrumentType.OPTION,
+          symbolInstrumentType: InstrumentType.OPTION,
           symbolQuoteCcy: activity?.currency ?? undefined,
           underlyingSymbol: parsed?.underlying ?? "",
           strikePrice: parsed?.strikePrice,
@@ -208,12 +227,12 @@ export const ACTIVITY_FORM_CONFIG: Record<
       }
 
       // Populate bond-specific fields when editing
-      if (activity?.instrumentType === "BOND") {
+      if (activity?.instrumentType === InstrumentType.BOND) {
         return {
           ...base,
           assetType: "bond" as const,
-          assetKind: "BOND",
-          symbolInstrumentType: "BOND",
+          assetKind: InstrumentType.BOND,
+          symbolInstrumentType: InstrumentType.BOND,
           symbolQuoteCcy: activity?.currency ?? undefined,
         };
       }
@@ -226,6 +245,7 @@ export const ACTIVITY_FORM_CONFIG: Record<
         accountId: d.accountId,
         activityDate: d.activityDate,
         assetId: d.assetId,
+        ...selectedExistingAsset(d.assetId, d.existingAssetId, d.symbolInstrumentType),
         quantity: d.quantity,
         unitPrice: d.unitPrice,
         fee: d.fee,
@@ -242,6 +262,8 @@ export const ACTIVITY_FORM_CONFIG: Record<
               name: d.assetMetadata.name ?? undefined,
               kind: d.assetMetadata.kind ?? undefined,
               exchangeMic: d.assetMetadata.exchangeMic ?? undefined,
+              providerId: d.assetMetadata.providerId ?? undefined,
+              providerSymbol: d.assetMetadata.providerSymbol ?? undefined,
             }
           : undefined,
         ...(d.symbolInstrumentType === InstrumentType.OPTION &&
@@ -316,15 +338,18 @@ export const ACTIVITY_FORM_CONFIG: Record<
     }),
     toPayload: (data) => {
       const d = data as DividendFormValues;
+      const isAssetBackedDividend =
+        d.subtype === ACTIVITY_SUBTYPES.DRIP || d.subtype === ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND;
       return {
         accountId: d.accountId,
         activityDate: d.activityDate,
         assetId: d.symbol,
+        ...selectedExistingAsset(d.symbol, d.existingAssetId, d.symbolInstrumentType),
         amount: d.amount,
-        unitPrice: d.unitPrice,
-        quantity: d.quantity,
+        unitPrice: isAssetBackedDividend ? d.unitPrice : null,
+        quantity: isAssetBackedDividend ? d.quantity : null,
         comment: d.comment,
-        subtype: d.subtype ?? undefined,
+        subtype: d.subtype ?? null,
         currency: d.currency,
         fxRate: d.fxRate,
         exchangeMic: d.exchangeMic ?? undefined,
@@ -339,30 +364,62 @@ export const ACTIVITY_FORM_CONFIG: Record<
     activityType: ActivityType.TRANSFER_OUT,
     getDefaults: (activity, _accounts) => {
       // Derive transferMode from existing activity data
-      const hasSecurityData = !!(activity?.assetSymbol || activity?.assetId);
-      const transferMode = hasSecurityData ? "securities" : "cash";
-      // Derive isExternal from metadata (if flow.is_external is true)
+      const transferIsSecurity = isSecuritiesTransfer(
+        activity?.activityType ?? "",
+        activity?.assetSymbol,
+        activity?.assetId,
+      );
+      const transferMode = transferIsSecurity ? "securities" : "cash";
+      // Reflect only the persisted external flag. Unpaired transfers stay unchecked
+      // until the user explicitly marks them external.
       const flowMetadata = activity?.metadata?.flow as { is_external?: boolean } | undefined;
       const isExternal = flowMetadata?.is_external === true;
       // Derive direction from activity type
       const direction = activity?.activityType === ActivityType.TRANSFER_IN ? "in" : "out";
+      const editingTransferIn = activity?.activityType === ActivityType.TRANSFER_IN;
+      const sourceAmount = editingTransferIn
+        ? (absNum(activity?.counterpartAmount) ?? absNum(activity?.amount))
+        : absNum(activity?.amount);
+      const destinationAmount = editingTransferIn
+        ? absNum(activity?.amount)
+        : (absNum(activity?.counterpartAmount) ?? absNum(activity?.amount));
+      const sourceCurrency = editingTransferIn
+        ? (activity?.counterpartCurrency ?? activity?.currency)
+        : activity?.currency;
+      const destinationCurrency = editingTransferIn
+        ? activity?.currency
+        : (activity?.counterpartCurrency ?? activity?.currency);
       return {
         isExternal,
         direction,
         accountId: isExternal ? (activity?.accountId ?? "") : "",
-        fromAccountId: !isExternal ? (activity?.accountId ?? "") : "",
-        toAccountId: "",
+        fromAccountId: !isExternal
+          ? editingTransferIn
+            ? (activity?.counterpartAccountId ?? "")
+            : (activity?.accountId ?? "")
+          : "",
+        toAccountId: !isExternal
+          ? editingTransferIn
+            ? (activity?.accountId ?? "")
+            : (activity?.counterpartAccountId ?? "")
+          : "",
         activityDate: activity?.date ? new Date(activity.date) : new Date(),
         transferMode,
         amount: absNum(activity?.amount),
-        assetId: activity?.assetSymbol ?? activity?.assetId ?? null,
-        quantity: absNum(activity?.quantity) ?? null,
+        sourceAmount,
+        destinationAmount,
+        sourceCurrency,
+        destinationCurrency,
+        assetId: transferIsSecurity ? (activity?.assetSymbol ?? activity?.assetId ?? null) : null,
+        quantity: transferIsSecurity ? (absNum(activity?.quantity) ?? null) : null,
+        unitPrice: transferIsSecurity ? (absNum(activity?.unitPrice) ?? null) : null,
         comment: activity?.comment ?? null,
         // Advanced options
         currency: activity?.currency,
-        fxRate: activity?.fxRate ?? undefined,
+        fxRate: absNum(activity?.fxRate ?? activity?.counterpartFxRate) ?? undefined,
         subtype: activity?.subtype ?? null,
-        quoteMode: activity?.assetQuoteMode === "MANUAL" ? QuoteMode.MANUAL : QuoteMode.MARKET,
+        quoteMode:
+          activity?.assetQuoteMode === QuoteMode.MANUAL ? QuoteMode.MANUAL : QuoteMode.MARKET,
         exchangeMic: activity?.exchangeMic,
       };
     },
@@ -373,11 +430,16 @@ export const ACTIVITY_FORM_CONFIG: Record<
         accountId,
         activityDate: d.activityDate,
         amount: d.amount ?? undefined,
+        sourceAmount: d.sourceAmount ?? d.amount ?? undefined,
+        destinationAmount: d.destinationAmount ?? d.sourceAmount ?? d.amount ?? undefined,
+        sourceCurrency: d.sourceCurrency,
+        destinationCurrency: d.destinationCurrency,
         assetId: d.assetId ?? undefined,
+        ...selectedExistingAsset(d.assetId, d.existingAssetId, d.symbolInstrumentType),
         quantity: d.quantity ?? undefined,
         unitPrice: d.unitPrice ?? undefined,
         comment: d.comment ?? undefined,
-        subtype: d.subtype ?? undefined,
+        subtype: d.subtype ?? null,
         currency: d.currency,
         fxRate: d.fxRate,
         quoteMode: d.quoteMode,
@@ -389,6 +451,8 @@ export const ACTIVITY_FORM_CONFIG: Record<
               name: d.assetMetadata.name ?? undefined,
               kind: d.assetMetadata.kind ?? undefined,
               exchangeMic: d.assetMetadata.exchangeMic ?? undefined,
+              providerId: d.assetMetadata.providerId ?? undefined,
+              providerSymbol: d.assetMetadata.providerSymbol ?? undefined,
             }
           : undefined,
         ...(d.isExternal && { metadata: { flow: { is_external: true } } }),
@@ -414,9 +478,10 @@ export const ACTIVITY_FORM_CONFIG: Record<
         accountId: d.accountId,
         activityDate: d.activityDate,
         assetId: d.symbol,
+        ...selectedExistingAsset(d.symbol, d.existingAssetId, d.symbolInstrumentType),
         amount: d.splitRatio,
         comment: d.comment,
-        subtype: d.subtype ?? undefined,
+        subtype: d.subtype ?? null,
         currency: d.currency,
         exchangeMic: d.exchangeMic ?? undefined,
         symbolQuoteCcy: d.symbolQuoteCcy ?? undefined,
@@ -455,6 +520,8 @@ export const ACTIVITY_FORM_CONFIG: Record<
       ...getBaseDefaults(activity, accounts),
       symbol: activity?.assetSymbol ?? activity?.assetId ?? null,
       amount: absNum(activity?.amount),
+      unitPrice: absNum(activity?.unitPrice),
+      quantity: absNum(activity?.quantity),
       // Advanced options
       currency: activity?.currency,
       fxRate: (activity?.fxRate ?? undefined) as unknown as number | undefined,
@@ -463,11 +530,15 @@ export const ACTIVITY_FORM_CONFIG: Record<
     }),
     toPayload: (data) => {
       const d = data as InterestFormValues;
+      const isStakingReward = d.subtype === ACTIVITY_SUBTYPES.STAKING_REWARD;
       return {
         accountId: d.accountId,
         activityDate: d.activityDate,
         assetId: d.symbol?.trim() || undefined,
+        ...selectedExistingAsset(d.symbol, d.existingAssetId, d.symbolInstrumentType),
         amount: d.amount,
+        unitPrice: isStakingReward ? d.unitPrice : null,
+        quantity: isStakingReward ? d.quantity : null,
         comment: d.comment,
         subtype: d.subtype,
         currency: d.currency,

@@ -19,6 +19,9 @@ use crate::errors::StorageError;
 
 // Keep this invocation in sync with the on-disk migrations directory.
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+const BACKUP_FILENAME_PREFIX: &str = "wealthfolio_backup_";
+const BACKUP_FILENAME_SUFFIX: &str = ".db";
+const BACKUP_FILENAME_TIMESTAMP_FORMAT: &str = "%Y%m%d_%H%M%S";
 
 pub type DbPool = r2d2::Pool<ConnectionManager<SqliteConnection>>;
 pub type DbConnection = PooledConnection<ConnectionManager<SqliteConnection>>;
@@ -153,6 +156,184 @@ pub fn get_db_path(input: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use diesel::prelude::*;
+    use diesel::sql_types::BigInt;
+
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    fn count(conn: &mut SqliteConnection, sql: &str) -> i64 {
+        diesel::sql_query(sql)
+            .get_result::<CountRow>(conn)
+            .unwrap()
+            .count
+    }
+
+    #[test]
+    fn lot_disposals_migration_clears_generated_data() {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(
+            "
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE accounts (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL
+            );
+
+            CREATE TABLE assets (
+                id TEXT PRIMARY KEY NOT NULL
+            );
+
+            CREATE TABLE activities (
+                id TEXT PRIMARY KEY NOT NULL,
+                account_id TEXT,
+                activity_date TEXT,
+                status TEXT,
+                activity_type TEXT,
+                activity_type_override TEXT,
+                source_group_id TEXT
+            );
+
+            CREATE TABLE lots (
+                id TEXT PRIMARY KEY NOT NULL,
+                account_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                open_date TEXT NOT NULL,
+                open_activity_id TEXT NULL,
+                original_quantity TEXT NOT NULL,
+                cost_per_unit TEXT NOT NULL,
+                original_cost_basis TEXT NOT NULL,
+                remaining_cost_basis TEXT NOT NULL,
+                fee_allocated TEXT NOT NULL,
+                remaining_quantity TEXT NOT NULL,
+                split_ratio TEXT NOT NULL,
+                is_closed INTEGER NOT NULL,
+                close_date TEXT NULL,
+                close_activity_id TEXT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE daily_account_valuation (
+                id TEXT PRIMARY KEY NOT NULL
+            );
+
+            CREATE TABLE holdings_snapshots (
+                id TEXT PRIMARY KEY NOT NULL,
+                source TEXT NOT NULL
+            );
+
+            INSERT INTO accounts (id, name) VALUES ('acc1', 'Account');
+            INSERT INTO assets (id) VALUES ('asset1');
+            INSERT INTO activities (id) VALUES ('activity1');
+            INSERT INTO lots (
+                id, account_id, asset_id, open_date, original_quantity,
+                cost_per_unit, original_cost_basis, remaining_cost_basis,
+                fee_allocated, remaining_quantity, split_ratio, is_closed,
+                created_at, updated_at
+            ) VALUES (
+                'lot1', 'acc1', 'asset1', '2026-01-01', '1',
+                '10', '10', '10', '0', '1', '1', 0,
+                '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+            );
+            INSERT INTO daily_account_valuation (id) VALUES ('valuation1');
+            INSERT INTO holdings_snapshots (id, source) VALUES ('snapshot1', 'CALCULATED');
+            INSERT INTO holdings_snapshots (id, source) VALUES ('snapshot2', 'MANUAL_ENTRY');
+            ",
+        )
+        .unwrap();
+
+        conn.batch_execute(include_str!(
+            "../../migrations/2026-05-26-000001_lot_disposals/up.sql"
+        ))
+        .unwrap();
+
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('lots')
+                 WHERE name = 'cost_basis_method'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('lot_disposals')
+                 WHERE name = 'cost_basis_method' AND dflt_value = '''FIFO'''"
+            ),
+            1
+        );
+        assert_eq!(count(&mut conn, "SELECT COUNT(*) AS count FROM lots"), 0);
+        assert_eq!(
+            count(&mut conn, "SELECT COUNT(*) AS count FROM lot_disposals"),
+            0
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) AS count FROM daily_account_valuation"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) AS count FROM holdings_snapshots WHERE source = 'CALCULATED'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) AS count FROM holdings_snapshots"
+            ),
+            1
+        );
+    }
+}
+
+fn create_backup_filename(timestamp: chrono::DateTime<Local>) -> String {
+    format!(
+        "{}{}{}",
+        BACKUP_FILENAME_PREFIX,
+        timestamp.format(BACKUP_FILENAME_TIMESTAMP_FORMAT),
+        BACKUP_FILENAME_SUFFIX
+    )
+}
+
+pub fn is_valid_backup_filename(filename: &str) -> bool {
+    const EXPECTED_LEN: usize =
+        BACKUP_FILENAME_PREFIX.len() + "YYYYMMDD_HHMMSS".len() + BACKUP_FILENAME_SUFFIX.len();
+
+    if filename.len() != EXPECTED_LEN
+        || !filename.starts_with(BACKUP_FILENAME_PREFIX)
+        || !filename.ends_with(BACKUP_FILENAME_SUFFIX)
+    {
+        return false;
+    }
+
+    let timestamp =
+        &filename[BACKUP_FILENAME_PREFIX.len()..filename.len() - BACKUP_FILENAME_SUFFIX.len()];
+    if timestamp.as_bytes().get(8) != Some(&b'_') {
+        return false;
+    }
+
+    let compact = timestamp.replace('_', "");
+    if compact.len() != 14 || !compact.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+
+    chrono::NaiveDateTime::parse_from_str(timestamp, BACKUP_FILENAME_TIMESTAMP_FORMAT).is_ok()
+}
+
 pub fn create_backup_path(app_data_dir: &str) -> Result<String> {
     let backup_dir = Path::new(app_data_dir).join("backups");
     fs::create_dir_all(&backup_dir).map_err(|e| {
@@ -160,8 +341,7 @@ pub fn create_backup_path(app_data_dir: &str) -> Result<String> {
         Error::Database(DatabaseError::BackupFailed(e.to_string()))
     })?;
 
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let backup_file = format!("wealthfolio_backup_{}.db", timestamp);
+    let backup_file = create_backup_filename(Local::now());
     let backup_path = backup_dir.join(backup_file);
 
     Ok(backup_path.to_str().unwrap().to_string())
@@ -506,5 +686,61 @@ impl DbTransactionExecutor for Arc<DbPool> {
         E: Into<Error>,
     {
         (**self).execute(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use tempfile::tempdir;
+
+    #[test]
+    fn validates_backup_filename_contract() {
+        assert!(is_valid_backup_filename(
+            "wealthfolio_backup_20260514_150409.db"
+        ));
+
+        for filename in [
+            "../wealthfolio_backup_20260514_150409.db",
+            "wealthfolio_backup_20260514_150409.db\0",
+            "wealthfolio_backup_20260514_150409.sqlite",
+            "wealthfolio_backup_20260514_150409_123.db",
+            "wealthfolio_backup_20260514150409.db",
+            "wealthfolio_backup_20260514_15040x.db",
+            "wealthfolio_backup_20260231_150409.db",
+            "other_backup_20260514_150409.db",
+        ] {
+            assert!(
+                !is_valid_backup_filename(filename),
+                "expected {filename} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_backup_filename_matches_validator() {
+        let timestamp = Local
+            .with_ymd_and_hms(2026, 5, 14, 15, 4, 9)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            create_backup_filename(timestamp),
+            "wealthfolio_backup_20260514_150409.db"
+        );
+        assert!(is_valid_backup_filename(&create_backup_filename(timestamp)));
+    }
+
+    #[test]
+    fn create_backup_path_uses_valid_backup_filename() {
+        let app_data = tempdir().unwrap();
+        let backup_path = create_backup_path(app_data.path().to_str().unwrap()).unwrap();
+        let filename = Path::new(&backup_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+
+        assert!(is_valid_backup_filename(filename));
     }
 }

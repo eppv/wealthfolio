@@ -1,5 +1,5 @@
+import { DashboardCard } from "@/components/dashboard-card";
 import { TickerAvatar } from "@/components/ticker-avatar";
-import { Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/ui/components/ui/card";
 import { Skeleton } from "@wealthfolio/ui/components/ui/skeleton";
 import { HoldingType, isAlternativeAssetKind, type AssetKind } from "@/lib/constants";
 import { parseOccSymbol } from "@/lib/occ-symbol";
@@ -18,8 +18,10 @@ import { useMemo } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
 
-const MAX_DISPLAYED_HOLDINGS = 5;
+const MAX_DISPLAYED_HOLDINGS = 7;
 const MAX_STACKED_AVATARS = 5;
+const PERFORMANCE_MODE_KEY = "dashboard-holdings-widget-performance-mode";
+type PerformanceMode = "daily" | "pnl" | "return";
 
 interface TopHoldingsProps {
   holdings: Holding[];
@@ -31,7 +33,8 @@ interface HoldingRowProps {
   holding: Holding;
   baseCurrency: string;
   isHidden?: boolean;
-  showTotalReturn: boolean;
+  performanceMode: PerformanceMode;
+  showName: boolean;
   onClick?: () => void;
 }
 
@@ -39,40 +42,49 @@ function HoldingRow({
   holding,
   baseCurrency,
   isHidden,
-  showTotalReturn,
+  performanceMode,
+  showName,
   onClick,
 }: HoldingRowProps) {
   const symbol = holding.instrument?.symbol ?? holding.id;
   const parsedOption = parseOccSymbol(symbol);
-  const displayName = parsedOption ? parsedOption.underlying : symbol.split(".")[0];
+  const symbolLabel = parsedOption ? parsedOption.underlying : symbol.split(".")[0];
+  const nameLabel = holding.instrument?.name?.trim() || symbolLabel;
+  const title = showName ? nameLabel : symbolLabel;
   const subtitle = parsedOption
     ? `${new Date(parsedOption.expiration + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" })} $${parsedOption.strikePrice} ${parsedOption.optionType}`
     : `${(holding.quantity ?? 0).toLocaleString(undefined, { maximumFractionDigits: 3 })} shares`;
   const avatarSymbol = parsedOption ? parsedOption.underlying : symbol;
   const marketValue = holding.marketValue?.base ?? 0;
-  const gainAmount = showTotalReturn
-    ? (holding.unrealizedGain?.base ?? 0)
-    : (holding.dayChange?.base ?? 0);
-  const gainPercent = showTotalReturn
-    ? (holding.unrealizedGainPct ?? 0)
-    : (holding.dayChangePct ?? 0);
+  const gainAmount =
+    performanceMode === "return"
+      ? (holding.totalReturn?.base ?? holding.totalGain?.base ?? 0)
+      : performanceMode === "pnl"
+        ? (holding.totalGain?.base ?? holding.unrealizedGain?.base ?? 0)
+        : (holding.dayChange?.base ?? 0);
+  const gainPercent =
+    performanceMode === "return"
+      ? (holding.totalReturnPct ?? holding.totalGainPct ?? 0)
+      : performanceMode === "pnl"
+        ? (holding.totalGainPct ?? holding.unrealizedGainPct ?? 0)
+        : (holding.dayChangePct ?? 0);
 
   return (
     <div
-      className="border-border hover:bg-muted/30 group flex cursor-pointer items-center justify-between border-b py-3 transition-colors last:border-0"
+      className="border-border hover:bg-muted/30 group flex cursor-pointer items-center justify-between gap-3 border-b py-3 transition-colors last:border-0"
       onClick={onClick}
       role="button"
       tabIndex={0}
       onKeyDown={(e) => e.key === "Enter" && onClick?.()}
     >
-      <div className="flex items-center gap-3">
-        <TickerAvatar symbol={avatarSymbol} className="size-9" />
-        <div className="flex flex-col">
-          <span className="text-sm font-semibold">{displayName}</span>
+      <div className="flex min-w-0 flex-1 items-center gap-3">
+        <TickerAvatar symbol={avatarSymbol} className="size-9 shrink-0" />
+        <div className="flex min-w-0 flex-col">
+          <span className="truncate text-sm font-semibold">{title}</span>
           <span className="text-muted-foreground text-xs">{subtitle}</span>
         </div>
       </div>
-      <div className="flex flex-col items-end gap-1">
+      <div className="flex shrink-0 flex-col items-end gap-1">
         <AmountDisplay
           value={marketValue}
           currency={baseCurrency}
@@ -141,76 +153,62 @@ function StackedAvatars({ holdings, totalRemaining, onClick }: StackedAvatarsPro
 
 function TopHoldingsSkeleton() {
   return (
-    <Card className="w-full border-0 bg-transparent shadow-none">
-      <CardHeader className="py-2">
-        <CardTitle className="text-md">Top Holdings</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <Card className="shadow-xs w-full">
-          <CardContent className="px-4 pb-2 pt-4">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <div key={i} className="border-border border-b py-3 last:border-0">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <Skeleton className="h-9 w-9 rounded-full" />
-                    <div className="flex flex-col gap-1.5">
-                      <Skeleton className="h-3.5 w-12" />
-                      <Skeleton className="h-3 w-16" />
-                    </div>
-                  </div>
-                  <div className="flex flex-col items-end gap-1.5">
-                    <Skeleton className="h-3.5 w-24" />
-                    <div className="flex items-center gap-2">
-                      <Skeleton className="h-3 w-16" />
-                      <Skeleton className="h-5 w-[60px] rounded-md" />
-                    </div>
-                  </div>
-                </div>
+    <DashboardCard title="Holdings" elevated>
+      {Array.from({ length: 5 }).map((_, i) => (
+        <div key={i} className="border-border border-b py-3 last:border-0">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Skeleton className="h-9 w-9 rounded-full" />
+              <div className="flex flex-col gap-1.5">
+                <Skeleton className="h-3.5 w-12" />
+                <Skeleton className="h-3 w-16" />
               </div>
-            ))}
-          </CardContent>
-        </Card>
-      </CardContent>
-    </Card>
+            </div>
+            <div className="flex flex-col items-end gap-1.5">
+              <Skeleton className="h-3.5 w-24" />
+              <div className="flex items-center gap-2">
+                <Skeleton className="h-3 w-16" />
+                <Skeleton className="h-5 w-[60px] rounded-md" />
+              </div>
+            </div>
+          </div>
+        </div>
+      ))}
+    </DashboardCard>
   );
 }
 
 function TopHoldingsEmptyState() {
   return (
-    <Card className="w-full border-0 bg-transparent p-0 shadow-none">
-      <CardHeader className="px-0 py-2">
-        <CardTitle className="text-md">Top Holdings</CardTitle>
-      </CardHeader>
-      <CardContent className="p-0">
-        <Card className="border-border/50 bg-success/10 shadow-xs w-full">
-          <CardContent className="px-4 py-6">
-            <div className="text-center">
-              <p className="text-sm">No holdings yet.</p>
-              <Link
-                to="/activities/manage"
-                className="text-muted-foreground hover:text-foreground mt-2 inline-flex items-center gap-1 text-xs underline-offset-4 hover:underline"
-              >
-                Add your first transaction
-                <Icons.ChevronRight className="h-3 w-3" />
-              </Link>
-            </div>
-          </CardContent>
-        </Card>
-      </CardContent>
-    </Card>
+    <DashboardCard title="Holdings" elevated>
+      <div className="py-2 text-center">
+        <p className="text-sm">No holdings yet.</p>
+        <Link
+          to="/activities/manage"
+          className="text-muted-foreground hover:text-foreground mt-2 inline-flex items-center gap-1 text-xs underline-offset-4 hover:underline"
+        >
+          Add your first transaction
+          <Icons.ChevronRight className="h-3 w-3" />
+        </Link>
+      </div>
+    </DashboardCard>
   );
 }
 
 export function TopHoldings({ holdings, isLoading, baseCurrency }: TopHoldingsProps) {
   const navigate = useNavigate();
   const { isBalanceHidden } = useBalancePrivacy();
-  const [showTotalReturn, setShowTotalReturn] = usePersistentState<boolean>(
-    "holdings-show-total-return",
-    true,
+  const [performanceMode, setPerformanceMode] = usePersistentState<PerformanceMode>(
+    PERFORMANCE_MODE_KEY,
+    "pnl",
   );
   const [sortBy, setSortBy] = usePersistentState<"value" | "gain">(
     "holdings-widget-sort-by",
     "value",
+  );
+  const [displayMode, setDisplayMode] = usePersistentState<"symbol" | "name">(
+    "holdings-widget-display-mode",
+    "symbol",
   );
 
   // Filter out cash holdings and alternative assets, then sort by market value
@@ -226,13 +224,23 @@ export function TopHoldings({ holdings, isLoading, baseCurrency }: TopHoldingsPr
       })
       .sort((a, b) => {
         if (sortBy === "gain") {
-          const gainA = showTotalReturn ? (a.unrealizedGain?.base ?? 0) : (a.dayChange?.base ?? 0);
-          const gainB = showTotalReturn ? (b.unrealizedGain?.base ?? 0) : (b.dayChange?.base ?? 0);
+          const gainA =
+            performanceMode === "return"
+              ? (a.totalReturn?.base ?? a.totalGain?.base ?? 0)
+              : performanceMode === "pnl"
+                ? (a.totalGain?.base ?? a.unrealizedGain?.base ?? 0)
+                : (a.dayChange?.base ?? 0);
+          const gainB =
+            performanceMode === "return"
+              ? (b.totalReturn?.base ?? b.totalGain?.base ?? 0)
+              : performanceMode === "pnl"
+                ? (b.totalGain?.base ?? b.unrealizedGain?.base ?? 0)
+                : (b.dayChange?.base ?? 0);
           return gainB - gainA;
         }
         return (b.marketValue?.base ?? 0) - (a.marketValue?.base ?? 0);
       });
-  }, [holdings, sortBy, showTotalReturn]);
+  }, [holdings, sortBy, performanceMode]);
 
   // Show one extra holding directly rather than displaying "+1 more"
   const displayCount =
@@ -252,9 +260,10 @@ export function TopHoldings({ holdings, isLoading, baseCurrency }: TopHoldingsPr
   }
 
   return (
-    <Card className="w-full border-0 bg-transparent p-0 shadow-none">
-      <CardHeader className="flex flex-row items-center justify-between px-0 py-2">
-        <CardTitle className="text-md">Holdings</CardTitle>
+    <DashboardCard
+      title="Holdings"
+      elevated
+      action={
         <div className="flex items-center gap-1">
           <Popover>
             <PopoverTrigger asChild>
@@ -273,22 +282,22 @@ export function TopHoldings({ holdings, isLoading, baseCurrency }: TopHoldingsPr
               <p className="text-muted-foreground px-2 py-1.5 text-xs font-medium uppercase tracking-wider">
                 Show
               </p>
-              {(["total", "daily"] as const).map((v) => (
+              {(["daily", "pnl", "return"] as const).map((v) => (
                 <button
                   key={v}
                   className="hover:bg-accent flex w-full items-center justify-between rounded-xl px-3 py-3 text-sm font-medium transition-colors"
-                  onClick={() => setShowTotalReturn(v === "total")}
+                  onClick={() => setPerformanceMode(v)}
                 >
-                  {v === "total" ? "Total Return" : "Daily Change"}
+                  {v === "daily" ? "Daily Change" : v === "pnl" ? "Total P&L" : "Total Return"}
                   <span
                     className={cn(
                       "flex h-4 w-4 items-center justify-center rounded-full border-2",
-                      (v === "total") === showTotalReturn
+                      performanceMode === v
                         ? "border-primary bg-primary"
                         : "border-muted-foreground",
                     )}
                   >
-                    {(v === "total") === showTotalReturn && (
+                    {performanceMode === v && (
                       <span className="bg-primary-foreground h-1.5 w-1.5 rounded-full" />
                     )}
                   </span>
@@ -317,6 +326,29 @@ export function TopHoldings({ holdings, isLoading, baseCurrency }: TopHoldingsPr
                   </span>
                 </button>
               ))}
+              <div className="bg-border/70 mx-2 my-1.5 h-px" />
+              <p className="text-muted-foreground px-2 py-1.5 text-xs font-medium uppercase tracking-wider">
+                Display
+              </p>
+              {(["symbol", "name"] as const).map((v) => (
+                <button
+                  key={v}
+                  className="hover:bg-accent flex w-full items-center justify-between rounded-xl px-3 py-3 text-sm font-medium transition-colors"
+                  onClick={() => setDisplayMode(v)}
+                >
+                  {v === "symbol" ? "Symbol" : "Name"}
+                  <span
+                    className={cn(
+                      "flex h-4 w-4 items-center justify-center rounded-full border-2",
+                      displayMode === v ? "border-primary bg-primary" : "border-muted-foreground",
+                    )}
+                  >
+                    {displayMode === v && (
+                      <span className="bg-primary-foreground h-1.5 w-1.5 rounded-full" />
+                    )}
+                  </span>
+                </button>
+              ))}
             </PopoverContent>
           </Popover>
           <Button
@@ -329,34 +361,30 @@ export function TopHoldings({ holdings, isLoading, baseCurrency }: TopHoldingsPr
             <Icons.ChevronRight className="ml-1 h-3 w-3" />
           </Button>
         </div>
-      </CardHeader>
-      <CardContent className="p-0">
-        <Card className="shadow-xs w-full">
-          <CardContent className="px-4 pb-2 pt-4">
-            {topHoldings.map((holding) => {
-              const assetId = holding.instrument?.id ?? holding.id;
-              return (
-                <HoldingRow
-                  key={holding.id}
-                  holding={holding}
-                  baseCurrency={baseCurrency}
-                  isHidden={isBalanceHidden}
-                  showTotalReturn={showTotalReturn}
-                  onClick={() => navigate(`/holdings/${encodeURIComponent(assetId)}`)}
-                />
-              );
-            })}
-            {hasRemainingHoldings && (
-              <StackedAvatars
-                holdings={remainingHoldings}
-                totalRemaining={remainingHoldings.length}
-                onClick={() => navigate("/holdings")}
-              />
-            )}
-          </CardContent>
-        </Card>
-      </CardContent>
-    </Card>
+      }
+    >
+      {topHoldings.map((holding) => {
+        const assetId = holding.instrument?.id ?? holding.id;
+        return (
+          <HoldingRow
+            key={holding.id}
+            holding={holding}
+            baseCurrency={baseCurrency}
+            isHidden={isBalanceHidden}
+            performanceMode={performanceMode}
+            showName={displayMode === "name"}
+            onClick={() => navigate(`/holdings/${encodeURIComponent(assetId)}`)}
+          />
+        );
+      })}
+      {hasRemainingHoldings && (
+        <StackedAvatars
+          holdings={remainingHoldings}
+          totalRemaining={remainingHoldings.length}
+          onClick={() => navigate("/holdings")}
+        />
+      )}
+    </DashboardCard>
   );
 }
 

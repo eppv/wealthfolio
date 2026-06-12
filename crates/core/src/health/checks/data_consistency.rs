@@ -3,9 +3,13 @@
 //! Detects orphan references, negative positions, and legacy data needing migration.
 
 use async_trait::async_trait;
+use chrono::NaiveDate;
+use rust_decimal::Decimal;
 
 use crate::errors::Result;
-use crate::health::model::{FixAction, HealthCategory, HealthIssue, NavigateAction, Severity};
+use crate::health::model::{
+    AffectedItem, FixAction, HealthCategory, HealthIssue, NavigateAction, Severity,
+};
 use crate::health::traits::{HealthCheck, HealthContext};
 
 /// Types of data consistency issues.
@@ -21,6 +25,10 @@ pub enum ConsistencyIssueType {
     LegacyClassification,
     /// Account has negative total portfolio value in its history
     NegativeAccountBalance,
+    /// Cash account had a negative balance at some point (may be a bank overdraft)
+    NegativeCashBalance,
+    /// A sell activity has no matching lot disposal row for realized P&L attribution
+    MissingLotDisposalForSell,
 }
 
 /// Data about a consistency issue.
@@ -30,12 +38,30 @@ pub struct ConsistencyIssueInfo {
     pub issue_type: ConsistencyIssueType,
     /// ID of the affected record (activity_id, asset_id, etc.)
     pub record_id: String,
-    /// Human-readable description
+    /// Human-readable description (used as display name for affected items)
     pub description: String,
     /// Related account ID (if applicable)
     pub account_id: Option<String>,
     /// Related asset ID (if applicable)
     pub asset_id: Option<String>,
+    /// First date the balance went negative (NegativeAccountBalance only)
+    pub first_negative_date: Option<NaiveDate>,
+    /// Cash balance on first_negative_date, in account currency (NegativeAccountBalance only)
+    pub cash_balance: Option<Decimal>,
+    /// Total portfolio value on first_negative_date, in account currency (NegativeAccountBalance only)
+    pub total_value_at_date: Option<Decimal>,
+    /// Account currency (NegativeAccountBalance only)
+    pub account_currency: Option<String>,
+    /// Activity date for activity-specific issues
+    pub activity_date: Option<NaiveDate>,
+    /// Asset display symbol for activity-specific issues
+    pub asset_symbol: Option<String>,
+    /// Asset display name for activity-specific issues
+    pub asset_name: Option<String>,
+    /// Activity quantity for activity-specific issues
+    pub quantity: Option<Decimal>,
+    /// Activity proceeds for activity-specific issues
+    pub proceeds: Option<Decimal>,
 }
 
 /// Health check that detects data consistency problems.
@@ -200,25 +226,210 @@ impl DataConsistencyCheck {
                 .map(|i| i.record_id.clone())
                 .collect();
             let data_hash = compute_data_hash(&account_ids);
+            let affected_items: Vec<AffectedItem> = negative_balance_issues
+                .iter()
+                .map(|i| AffectedItem::account(i.record_id.clone(), i.description.clone()))
+                .collect();
 
-            health_issues.push(
-                HealthIssue::builder()
-                    .id(format!("negative_account_balance:{}", data_hash))
-                    .severity(Severity::Warning)
-                    .category(HealthCategory::DataConsistency)
-                    .title(if count == 1 {
-                        "Account has negative portfolio balance".to_string()
+            // Details: one entry per account with date, breakdown, and likely cause
+            let details: String = negative_balance_issues
+                .iter()
+                .filter_map(|i| {
+                    let ccy = i.account_currency.as_deref()?;
+                    let cash = i.cash_balance?;
+                    let total = i.total_value_at_date?;
+                    let investments = total - cash;
+                    let date_line = i
+                        .first_negative_date
+                        .map(|d| format!("First went negative on {}.", d.format("%Y-%m-%d")))
+                        .unwrap_or_default();
+                    let breakdown = format!(
+                        "Cash: {} {} | Investments: {} {}",
+                        cash.round_dp(2),
+                        ccy,
+                        investments.round_dp(2),
+                        ccy,
+                    );
+                    let likely_cause = if cash < Decimal::ZERO && investments >= Decimal::ZERO {
+                        "→ Likely missing Transfer In or deposit before a buy transaction."
+                    } else if cash >= Decimal::ZERO && investments < Decimal::ZERO {
+                        "→ Likely missing Buy transaction before a Sell."
                     } else {
-                        format!("{} accounts have negative portfolio balance", count)
-                    })
-                    .message(
-                        "One or more accounts show a negative total value in their history. This is usually caused by missing buy transactions. Review your activities to fix this.",
+                        "→ Multiple data issues — check activities around this date."
+                    };
+                    Some(format!(
+                        "{}\n{}\n{}\n{}",
+                        i.description, date_line, breakdown, likely_cause
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            let mut builder = HealthIssue::builder()
+                .id(format!("negative_account_balance:{}", data_hash))
+                .severity(Severity::Warning)
+                .category(HealthCategory::DataConsistency)
+                .title(if count == 1 {
+                    "Account has negative portfolio balance".to_string()
+                } else {
+                    format!("{} accounts have negative portfolio balance", count)
+                })
+                .message(
+                    "One or more accounts show a negative total value in their history. This is usually caused by missing buy transactions. Review your activities to fix this.",
+                )
+                .affected_count(count as u32)
+                .affected_items(affected_items)
+                .navigate_action(NavigateAction::to_activities(None))
+                .data_hash(data_hash);
+            if !details.is_empty() {
+                builder = builder.details(details);
+            }
+            health_issues.push(builder.build());
+        }
+
+        // Emit info issue for cash accounts with negative balance (may be a normal overdraft)
+        if let Some(cash_balance_issues) = by_type.get(&ConsistencyIssueType::NegativeCashBalance) {
+            let count = cash_balance_issues.len();
+            let account_ids: Vec<String> = cash_balance_issues
+                .iter()
+                .map(|i| i.record_id.clone())
+                .collect();
+            let data_hash = compute_data_hash(&account_ids);
+            let affected_items: Vec<AffectedItem> = cash_balance_issues
+                .iter()
+                .map(|i| AffectedItem::account(i.record_id.clone(), i.description.clone()))
+                .collect();
+            let details: String = cash_balance_issues
+                .iter()
+                .filter_map(|i| {
+                    let ccy = i.account_currency.as_deref()?;
+                    let cash = i.cash_balance?;
+                    let date_line = i
+                        .first_negative_date
+                        .map(|d| format!("First went negative on {}.", d.format("%Y-%m-%d")))
+                        .unwrap_or_default();
+                    Some(format!(
+                        "{}\n{}\nCash: {} {}\n→ This may be a bank overdraft or a missing deposit entry.",
+                        i.description, date_line, cash.round_dp(2), ccy,
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            let mut builder = HealthIssue::builder()
+                .id(format!("negative_cash_balance:{}", data_hash))
+                .severity(Severity::Info)
+                .category(HealthCategory::DataConsistency)
+                .title(if count == 1 {
+                    "Cash account had a negative balance".to_string()
+                } else {
+                    format!("{} cash accounts had a negative balance", count)
+                })
+                .message(
+                    "One or more cash accounts show a negative balance in their history. This may be a normal bank overdraft or a missing deposit entry.",
+                )
+                .affected_count(count as u32)
+                .affected_items(affected_items)
+                .navigate_action(NavigateAction::to_activities(None))
+                .data_hash(data_hash);
+            if !details.is_empty() {
+                builder = builder.details(details);
+            }
+            health_issues.push(builder.build());
+        }
+
+        if let Some(missing_disposal_issues) =
+            by_type.get(&ConsistencyIssueType::MissingLotDisposalForSell)
+        {
+            let count = missing_disposal_issues.len();
+            let data_keys: Vec<String> = missing_disposal_issues
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        i.record_id,
+                        i.activity_date
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default(),
+                        i.quantity.unwrap_or_default(),
+                        i.proceeds.unwrap_or_default()
                     )
-                    .affected_count(count as u32)
-                    .navigate_action(NavigateAction::to_activities(None))
-                    .data_hash(data_hash)
-                    .build(),
-            );
+                })
+                .collect();
+            let data_hash = compute_data_hash(&data_keys);
+
+            let mut seen_accounts = std::collections::HashSet::new();
+            let affected_items: Vec<AffectedItem> = missing_disposal_issues
+                .iter()
+                .filter_map(|i| {
+                    let account_id = i.account_id.as_ref()?;
+                    if !seen_accounts.insert(account_id.clone()) {
+                        return None;
+                    }
+                    Some(AffectedItem::account(
+                        account_id.clone(),
+                        i.description.clone(),
+                    ))
+                })
+                .collect();
+
+            let details = missing_disposal_issues
+                .iter()
+                .map(|i| {
+                    let asset = i
+                        .asset_symbol
+                        .as_deref()
+                        .or(i.asset_name.as_deref())
+                        .unwrap_or("asset");
+                    let date = i
+                        .activity_date
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "unknown date".to_string());
+                    let quantity = i
+                        .quantity
+                        .map(|q| format!("Quantity: {}", q.round_dp(6)))
+                        .unwrap_or_else(|| "Quantity: unavailable".to_string());
+                    let proceeds = match (i.proceeds, i.account_currency.as_deref()) {
+                        (Some(amount), Some(currency)) => {
+                            format!("Proceeds: {} {}", amount.round_dp(2), currency)
+                        }
+                        (Some(amount), None) => format!("Proceeds: {}", amount.round_dp(2)),
+                        _ => "Proceeds: unavailable".to_string(),
+                    };
+                    format!(
+                        "{}\nSell: {} on {}\n{} | {}\nReview the sell activity or rebuild account history so cost-basis lots are available.",
+                        i.description, asset, date, quantity, proceeds
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            let mut builder = HealthIssue::builder()
+                .id(format!("missing_lot_disposal_for_sell:{}", data_hash))
+                .severity(Severity::Warning)
+                .category(HealthCategory::DataConsistency)
+                .title(if count == 1 {
+                    "Sale missing cost-basis match".to_string()
+                } else {
+                    format!("{} sales missing cost-basis matches", count)
+                })
+                .message(
+                    "A sale could not be matched to a lot, so realized gain/loss and performance attribution may be incomplete.",
+                )
+                .affected_count(count as u32)
+                .navigate_action(NavigateAction {
+                    route: "/activities".to_string(),
+                    query: Some(serde_json::json!({ "types": "SELL" })),
+                    label: "View Activities".to_string(),
+                })
+                .data_hash(data_hash);
+            if !affected_items.is_empty() {
+                builder = builder.affected_items(affected_items);
+            }
+            if !details.is_empty() {
+                builder = builder.details(details);
+            }
+            health_issues.push(builder.build());
         }
 
         health_issues
@@ -278,6 +489,15 @@ mod tests {
             description: "Activity references deleted account".to_string(),
             account_id: Some("acc_deleted".to_string()),
             asset_id: None,
+            first_negative_date: None,
+            cash_balance: None,
+            total_value_at_date: None,
+            account_currency: None,
+            activity_date: None,
+            asset_symbol: None,
+            asset_name: None,
+            quantity: None,
+            proceeds: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
@@ -297,6 +517,15 @@ mod tests {
             description: "Position has negative quantity".to_string(),
             account_id: Some("acc_1".to_string()),
             asset_id: Some("SEC:AAPL:XNAS".to_string()),
+            first_negative_date: None,
+            cash_balance: None,
+            total_value_at_date: None,
+            account_currency: None,
+            activity_date: None,
+            asset_symbol: None,
+            asset_name: None,
+            quantity: None,
+            proceeds: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
@@ -315,6 +544,15 @@ mod tests {
             description: "Asset has legacy sector data".to_string(),
             account_id: None,
             asset_id: Some("SEC:AAPL:XNAS".to_string()),
+            first_negative_date: None,
+            cash_balance: None,
+            total_value_at_date: None,
+            account_currency: None,
+            activity_date: None,
+            asset_symbol: None,
+            asset_name: None,
+            quantity: None,
+            proceeds: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
@@ -335,6 +573,15 @@ mod tests {
                 description: "Orphan 1".to_string(),
                 account_id: None,
                 asset_id: None,
+                first_negative_date: None,
+                cash_balance: None,
+                total_value_at_date: None,
+                account_currency: None,
+                activity_date: None,
+                asset_symbol: None,
+                asset_name: None,
+                quantity: None,
+                proceeds: None,
             },
             ConsistencyIssueInfo {
                 issue_type: ConsistencyIssueType::OrphanActivityAccount,
@@ -342,6 +589,15 @@ mod tests {
                 description: "Orphan 2".to_string(),
                 account_id: None,
                 asset_id: None,
+                first_negative_date: None,
+                cash_balance: None,
+                total_value_at_date: None,
+                account_currency: None,
+                activity_date: None,
+                asset_symbol: None,
+                asset_name: None,
+                quantity: None,
+                proceeds: None,
             },
             ConsistencyIssueInfo {
                 issue_type: ConsistencyIssueType::NegativePosition,
@@ -349,6 +605,15 @@ mod tests {
                 description: "Negative".to_string(),
                 account_id: None,
                 asset_id: None,
+                first_negative_date: None,
+                cash_balance: None,
+                total_value_at_date: None,
+                account_currency: None,
+                activity_date: None,
+                asset_symbol: None,
+                asset_name: None,
+                quantity: None,
+                proceeds: None,
             },
         ];
 
@@ -365,9 +630,18 @@ mod tests {
         let issues_data = vec![ConsistencyIssueInfo {
             issue_type: ConsistencyIssueType::NegativeAccountBalance,
             record_id: "acc_123".to_string(),
-            description: "Account has negative total value".to_string(),
+            description: "My Account".to_string(),
             account_id: Some("acc_123".to_string()),
             asset_id: None,
+            first_negative_date: Some(chrono::NaiveDate::from_ymd_opt(2025, 1, 10).unwrap()),
+            cash_balance: Some(rust_decimal_macros::dec!(-50.20)),
+            total_value_at_date: Some(rust_decimal_macros::dec!(-50.20)),
+            account_currency: Some("EUR".to_string()),
+            activity_date: None,
+            asset_symbol: None,
+            asset_name: None,
+            quantity: None,
+            proceeds: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
@@ -375,6 +649,52 @@ mod tests {
         assert_eq!(issues[0].severity, Severity::Warning);
         assert_eq!(issues[0].category, HealthCategory::DataConsistency);
         assert!(issues[0].navigate_action.is_some());
+    }
+
+    #[test]
+    fn test_missing_lot_disposal_for_sell() {
+        let check = DataConsistencyCheck::new();
+        let ctx = HealthContext::new(HealthConfig::default(), "USD", 100_000.0);
+
+        let issues_data = vec![ConsistencyIssueInfo {
+            issue_type: ConsistencyIssueType::MissingLotDisposalForSell,
+            record_id: "sell-aapl".to_string(),
+            description: "Business Investment".to_string(),
+            account_id: Some("business".to_string()),
+            asset_id: Some("aapl".to_string()),
+            first_negative_date: None,
+            cash_balance: None,
+            total_value_at_date: None,
+            account_currency: Some("USD".to_string()),
+            activity_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()),
+            asset_symbol: Some("AAPL".to_string()),
+            asset_name: Some("Apple Inc.".to_string()),
+            quantity: Some(rust_decimal_macros::dec!(1)),
+            proceeds: Some(rust_decimal_macros::dec!(291.10598755)),
+        }];
+
+        let issues = check.analyze(&issues_data, &ctx);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert_eq!(issues[0].category, HealthCategory::DataConsistency);
+        assert_eq!(issues[0].title, "Sale missing cost-basis match");
+        assert!(issues[0]
+            .message
+            .contains("realized gain/loss and performance attribution"));
+        assert!(issues[0]
+            .details
+            .as_deref()
+            .is_some_and(|details| details.contains("AAPL on 2026-06-01")));
+        let navigate_action = issues[0].navigate_action.as_ref().unwrap();
+        assert_eq!(navigate_action.route, "/activities");
+        assert_eq!(
+            navigate_action
+                .query
+                .as_ref()
+                .and_then(|query| query.get("types")),
+            Some(&serde_json::json!("SELL"))
+        );
     }
 
     #[test]

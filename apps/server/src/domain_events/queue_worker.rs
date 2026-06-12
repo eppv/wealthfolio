@@ -12,9 +12,13 @@ use tokio::sync::mpsc;
 use wealthfolio_connect::{
     ensure_valid_access_token, BrokerSyncServiceTrait, TokenLifecycleConfig, TokenLifecycleState,
 };
-use wealthfolio_core::{assets::AssetServiceTrait, events::DomainEvent, secrets::SecretStore};
+use wealthfolio_core::{
+    assets::AssetServiceTrait, events::DomainEvent, goals::GoalServiceTrait, secrets::SecretStore,
+};
 
-use super::planner::{plan_asset_enrichment, plan_broker_sync, plan_portfolio_job};
+use super::planner::{
+    plan_asset_enrichment, plan_broker_sync, plan_categorization_job, plan_portfolio_job,
+};
 use crate::events::EventBus;
 
 /// Debounce window for collecting events before processing.
@@ -36,12 +40,18 @@ pub struct QueueWorkerDeps {
     pub valuation_service:
         Arc<dyn wealthfolio_core::portfolio::valuation::ValuationServiceTrait + Send + Sync>,
     pub account_service: Arc<wealthfolio_core::accounts::AccountService>,
+    pub goal_service: Arc<dyn GoalServiceTrait + Send + Sync>,
     pub fx_service: Arc<dyn wealthfolio_core::fx::FxServiceTrait + Send + Sync>,
     pub timezone: Arc<RwLock<String>>,
     /// Secret store for accessing credentials (e.g., refresh tokens for broker sync)
     pub secret_store: Arc<dyn SecretStore>,
     /// Shared token lifecycle state; must be the same instance used by API handlers.
     pub token_lifecycle: Arc<TokenLifecycleState>,
+    /// Spending settings — used to filter ActivitiesChanged events to opted-in accounts.
+    pub spending_settings_service: Arc<wealthfolio_spending::settings::SpendingSettingsService>,
+    /// Categorization rules service — auto-runs rules against newly-changed activities.
+    pub categorization_rules_service:
+        Arc<wealthfolio_spending::categorization_rules::CategorizationRulesService>,
 }
 
 /// Runs the event queue worker.
@@ -206,7 +216,13 @@ async fn process_event_batch(events: &[DomainEvent], deps: Arc<QueueWorkerDeps>)
         // Run the portfolio job directly (not spawned) so that is_processing
         // guard properly tracks completion and prevents concurrent jobs
         run_portfolio_job(deps.clone(), config).await;
+
+        // Keep goal cards current after valuation changes, matching the Tauri worker.
+        refresh_all_goal_summaries(deps.clone()).await;
     }
+
+    // 2b. Auto-categorize newly-changed activities on opted-in spending accounts.
+    spawn_auto_categorize_for_batch(events, deps.clone()).await;
 
     // 3. Plan and trigger broker sync
     let sync_accounts = plan_broker_sync(events);
@@ -265,12 +281,59 @@ async fn run_portfolio_job(
     };
     use serde_json::json;
     use wealthfolio_core::accounts::AccountServiceTrait;
-    use wealthfolio_core::constants::PORTFOLIO_TOTAL_ACCOUNT_ID;
+    use wealthfolio_core::portfolio::snapshot::reconcile_quote_sync_from_latest_account_snapshots;
 
     let event_bus = deps.event_bus.clone();
+    let snapshot_mode = config
+        .since_date
+        .map(wealthfolio_core::portfolio::snapshot::SnapshotRecalcMode::SinceDate)
+        .unwrap_or_else(|| config.snapshot_mode.clone());
+    let valuation_mode = config
+        .since_date
+        .map(wealthfolio_core::portfolio::valuation::ValuationRecalcMode::SinceDate)
+        .unwrap_or_else(|| config.valuation_mode.clone());
+
+    let accounts_for_scope = match deps.account_service.get_non_archived_accounts() {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            let err_msg = format!("Failed to list non-archived accounts: {}", err);
+            tracing::error!("{}", err_msg);
+            event_bus.publish(ServerEvent::with_payload(
+                PORTFOLIO_UPDATE_ERROR,
+                json!(err_msg),
+            ));
+            return;
+        }
+    };
+
+    // Determine which accounts to calculate individual snapshots for:
+    // - If specific account_ids provided: process those accounts (even if archived)
+    // - Otherwise: process all non-archived accounts
+    let account_ids: Vec<String> = if let Some(ref target_ids) = config.account_ids {
+        // Process the specific requested accounts (even if archived, for their own snapshots)
+        target_ids.clone()
+    } else {
+        // No specific accounts requested - use non-archived accounts
+        accounts_for_scope.iter().map(|a| a.id.clone()).collect()
+    };
+    let quote_reconciliation_account_ids: Vec<String> =
+        accounts_for_scope.iter().map(|a| a.id.clone()).collect();
 
     // Only perform market sync if the mode requires it
     if config.market_sync_mode.requires_sync() {
+        if let Err(e) = reconcile_quote_sync_from_latest_account_snapshots(
+            deps.snapshot_service.as_ref(),
+            deps.quote_service.as_ref(),
+            &quote_reconciliation_account_ids,
+        )
+        .await
+        {
+            tracing::warn!(
+                "Failed to reconcile quote sync state from latest holdings: {}. Quote sync planning may be affected.",
+                e
+            );
+        }
+
         event_bus.publish(ServerEvent::new(MARKET_SYNC_START));
 
         let sync_start = std::time::Instant::now();
@@ -286,9 +349,17 @@ async fn run_portfolio_job(
 
         match sync_result {
             Ok(result) => {
+                let skipped_reasons: Vec<(String, String)> = result
+                    .skipped_reasons
+                    .into_iter()
+                    .map(|(asset_id, reason)| (asset_id, reason.to_string()))
+                    .collect();
                 event_bus.publish(ServerEvent::with_payload(
                     MARKET_SYNC_COMPLETE,
-                    json!({ "failed_syncs": result.failed }),
+                    json!({
+                        "failed_syncs": result.failures,
+                        "skipped_reasons": skipped_reasons,
+                    }),
                 ));
                 tracing::info!("Market data sync completed in {:?}", sync_start.elapsed());
                 deps.health_service.clear_cache().await;
@@ -312,36 +383,11 @@ async fn run_portfolio_job(
 
     event_bus.publish(ServerEvent::new(PORTFOLIO_UPDATE_START));
 
-    // For TOTAL portfolio calculation, use non-archived accounts (ignores is_active)
-    let accounts_for_total = match deps.account_service.get_non_archived_accounts() {
-        Ok(accounts) => accounts,
-        Err(err) => {
-            let err_msg = format!("Failed to list non-archived accounts: {}", err);
-            tracing::error!("{}", err_msg);
-            event_bus.publish(ServerEvent::with_payload(
-                PORTFOLIO_UPDATE_ERROR,
-                json!(err_msg),
-            ));
-            return;
-        }
-    };
-
-    // Determine which accounts to calculate individual snapshots for:
-    // - If specific account_ids provided: process those accounts (even if archived)
-    // - Otherwise: process all non-archived accounts
-    let mut account_ids: Vec<String> = if let Some(ref target_ids) = config.account_ids {
-        // Process the specific requested accounts (even if archived, for their own snapshots)
-        target_ids.clone()
-    } else {
-        // No specific accounts requested - use non-archived accounts
-        accounts_for_total.iter().map(|a| a.id.clone()).collect()
-    };
-
     if !account_ids.is_empty() {
         let ids_slice = account_ids.as_slice();
         if let Err(err) = deps
             .snapshot_service
-            .recalculate_holdings_snapshots(Some(ids_slice), config.snapshot_mode.clone())
+            .recalculate_holdings_snapshots(Some(ids_slice), snapshot_mode.clone())
             .await
         {
             let err_msg = format!(
@@ -356,55 +402,24 @@ async fn run_portfolio_job(
         }
     }
 
-    if let Err(err) = deps
-        .snapshot_service
-        .recalculate_total_portfolio_snapshots(config.snapshot_mode)
-        .await
+    // Update position status from latest real-account snapshots for quote sync planning.
+    if let Err(e) = reconcile_quote_sync_from_latest_account_snapshots(
+        deps.snapshot_service.as_ref(),
+        deps.quote_service.as_ref(),
+        &quote_reconciliation_account_ids,
+    )
+    .await
     {
-        let err_msg = format!("Failed to calculate TOTAL portfolio snapshot: {}", err);
-        tracing::error!("{}", err_msg);
-        event_bus.publish(ServerEvent::with_payload(
-            PORTFOLIO_UPDATE_ERROR,
-            json!(err_msg),
-        ));
-        return;
-    }
-
-    // Update position status from TOTAL snapshot
-    if let Ok(Some(total_snapshot)) = deps
-        .snapshot_service
-        .get_latest_holdings_snapshot(PORTFOLIO_TOTAL_ACCOUNT_ID)
-    {
-        let current_holdings: std::collections::HashMap<String, rust_decimal::Decimal> =
-            total_snapshot
-                .positions
-                .iter()
-                .map(|(asset_id, position)| (asset_id.clone(), position.quantity))
-                .collect();
-
-        if let Err(e) = deps
-            .quote_service
-            .update_position_status_from_holdings(&current_holdings)
-            .await
-        {
-            tracing::warn!(
-                "Failed to update position status from holdings: {}. Quote sync planning may be affected.",
-                e
-            );
-        }
-    }
-
-    if !account_ids
-        .iter()
-        .any(|id| id == PORTFOLIO_TOTAL_ACCOUNT_ID)
-    {
-        account_ids.push(PORTFOLIO_TOTAL_ACCOUNT_ID.to_string());
+        tracing::warn!(
+            "Failed to update position status from holdings: {}. Quote sync planning may be affected.",
+            e
+        );
     }
 
     for account_id in account_ids {
         if let Err(err) = deps
             .valuation_service
-            .calculate_valuation_history(&account_id, config.valuation_mode.clone())
+            .calculate_valuation_history(&account_id, valuation_mode.clone())
             .await
         {
             let err_msg = format!(
@@ -420,6 +435,123 @@ async fn run_portfolio_job(
     }
 
     event_bus.publish(ServerEvent::new(PORTFOLIO_UPDATE_COMPLETE));
+}
+
+/// Plans and spawns auto-categorization for this batch's spending-account
+/// activity changes. Loads `SpendingSettings` once per batch; no-op when
+/// spending tracking is disabled or no opted-in account was touched.
+///
+/// Fire-and-forget by design — categorization writes are idempotent and
+/// the originating mutation has already returned to the API caller.
+async fn spawn_auto_categorize_for_batch(events: &[DomainEvent], deps: Arc<QueueWorkerDeps>) {
+    let settings = match deps.spending_settings_service.get().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Skipping auto-categorization: failed to load spending settings: {}",
+                e
+            );
+            return;
+        }
+    };
+    if !settings.enabled || settings.account_ids.is_empty() {
+        return;
+    }
+    let opted_in: std::collections::HashSet<String> =
+        settings.account_ids.iter().cloned().collect();
+    let account_ids = plan_categorization_job(events, &opted_in);
+    if account_ids.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "Triggering auto-categorization for {} account(s)",
+        account_ids.len()
+    );
+    let rules_service = deps.categorization_rules_service.clone();
+    tokio::spawn(async move {
+        match rules_service
+            .rerun_all(&account_ids, /* only_uncategorized */ true)
+            .await
+        {
+            Ok(count) if count > 0 => {
+                tracing::info!("Auto-categorization wrote {} assignment(s)", count);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Auto-categorization failed: {}", e),
+        }
+    });
+}
+
+/// Refreshes cached summary fields for all active goals after valuation changes.
+async fn refresh_all_goal_summaries(deps: Arc<QueueWorkerDeps>) {
+    use rust_decimal::prelude::ToPrimitive;
+    use wealthfolio_core::accounts::AccountServiceTrait;
+
+    let goals = match deps.goal_service.get_goals() {
+        Ok(goals) => goals,
+        Err(err) => {
+            tracing::warn!("Failed to load goals for summary refresh: {}", err);
+            return;
+        }
+    };
+
+    let active_goals: Vec<_> = goals
+        .iter()
+        .filter(|goal| goal.status_lifecycle == "active")
+        .collect();
+
+    if active_goals.is_empty() {
+        return;
+    }
+
+    let accounts = match deps.account_service.get_active_non_archived_accounts() {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            tracing::warn!("Failed to load accounts for goal summary refresh: {}", err);
+            return;
+        }
+    };
+    let account_ids: Vec<String> = accounts.into_iter().map(|account| account.id).collect();
+    let valuations = match deps.valuation_service.get_latest_valuations(&account_ids) {
+        Ok(valuations) => valuations,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load valuations for goal summary refresh: {}",
+                err
+            );
+            return;
+        }
+    };
+
+    let mut valuation_map = std::collections::HashMap::new();
+    for valuation in &valuations {
+        let Some(value_in_base) = valuation.total_value_base.to_f64() else {
+            tracing::warn!(
+                "Skipping goal summary refresh: invalid base valuation total for account {}",
+                valuation.account_id
+            );
+            return;
+        };
+        valuation_map.insert(valuation.account_id.clone(), value_in_base);
+    }
+
+    for goal in active_goals {
+        if let Err(err) = deps
+            .goal_service
+            .refresh_goal_summary(&goal.id, &valuation_map)
+            .await
+        {
+            tracing::debug!("Failed to refresh summary for goal {}: {}", goal.id, err);
+        }
+    }
+
+    tracing::debug!(
+        "Refreshed summaries for {} active goal(s)",
+        goals
+            .iter()
+            .filter(|goal| goal.status_lifecycle == "active")
+            .count()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

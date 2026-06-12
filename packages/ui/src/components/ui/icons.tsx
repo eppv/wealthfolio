@@ -75,6 +75,8 @@ import {
   LayoutDashboard,
   Link,
   List,
+  Lock,
+  LockOpen,
   ListChecks,
   ListCollapse,
   ListFilter,
@@ -92,12 +94,12 @@ import {
   PanelLeft,
   PanelLeftOpen,
   PauseCircle,
-  PlayCircle,
   Pencil,
   Percent,
   PieChart,
   Pin,
   PinOff,
+  PlayCircle,
   Plus,
   PlusCircle,
   Presentation,
@@ -128,31 +130,65 @@ import {
   TrendingDown,
   TrendingUp,
   Type,
-  Wand2,
   Undo2,
+  Unlink,
   Upload,
   User,
   Users,
   Wallet,
+  Wand2,
   X,
   XCircle,
+  // Spending taxonomy icons (referenced by category seed data)
+  Award,
+  Banknote,
+  Code,
+  Coffee,
+  Dumbbell,
+  Film,
+  Fuel,
+  Gamepad2,
+  Gift,
+  GraduationCap,
+  Heart,
+  Laptop,
+  Lightbulb,
+  MoreHorizontal,
+  ParkingCircle,
+  PiggyBank,
+  Pill,
+  Plane,
+  RotateCcw,
+  Shirt,
+  ShoppingBag,
+  ShoppingCart,
+  Smile,
+  Sofa,
+  Stethoscope,
+  Train,
+  Truck,
+  Tv,
+  UtensilsCrossed,
+  Wifi,
+  Wine,
+  Wrench,
 } from "lucide-react";
 import type { ComponentType, CSSProperties } from "react";
 
 // Phosphor icons - deep imports for optimal tree shaking with Vite
-import { GarageIcon } from "@phosphor-icons/react/dist/csr/Garage";
 import { CarProfileIcon } from "@phosphor-icons/react/dist/csr/CarProfile";
 import { ClockCounterClockwiseIcon } from "@phosphor-icons/react/dist/csr/ClockCounterClockwise";
 import { CoinsIcon } from "@phosphor-icons/react/dist/csr/Coins";
 import { CreditCardIcon } from "@phosphor-icons/react/dist/csr/CreditCard";
 import { CubeIcon } from "@phosphor-icons/react/dist/csr/Cube";
 import { DevicesIcon } from "@phosphor-icons/react/dist/csr/Devices";
-import { SketchLogoIcon } from "@phosphor-icons/react/dist/csr/SketchLogo";
 import { DotsThreeOutlineIcon } from "@phosphor-icons/react/dist/csr/DotsThreeOutline";
 import { DotsThreeOutlineVerticalIcon } from "@phosphor-icons/react/dist/csr/DotsThreeOutlineVertical";
 import { EyeIcon } from "@phosphor-icons/react/dist/csr/Eye";
 import { EyeSlashIcon } from "@phosphor-icons/react/dist/csr/EyeSlash";
+import { GarageIcon } from "@phosphor-icons/react/dist/csr/Garage";
 import { HouseIcon } from "@phosphor-icons/react/dist/csr/House";
+import { SketchLogoIcon } from "@phosphor-icons/react/dist/csr/SketchLogo";
 import { SparkleIcon } from "@phosphor-icons/react/dist/csr/Sparkle";
 import { TagIcon } from "@phosphor-icons/react/dist/csr/Tag";
 import { UploadSimpleIcon } from "@phosphor-icons/react/dist/csr/UploadSimple";
@@ -277,6 +313,7 @@ const IconsInternal = {
   TrendingDown: TrendingDown,
   Wand2: Wand2,
   Link: Link,
+  Unlink: Unlink,
   Building: Building2,
   Car: Car,
   Gem: Gem,
@@ -306,6 +343,8 @@ const IconsInternal = {
   Folder: Folder,
   FolderOpen: FolderOpen,
   List: List,
+  Lock: Lock,
+  LockOpen: LockOpen,
   Pin: Pin,
   PinOff: PinOff,
   Presentation: Presentation,
@@ -715,6 +754,42 @@ const IconsInternal = {
   OtherAssetDuotone: ({ size, className, style, color }: IconProps) => (
     <CubeIcon size={size} weight="duotone" className={className} style={style} color={color} />
   ),
+  // Spending taxonomy icons (referenced by category seed data; keys must match
+  // the strings stored in `taxonomy_categories.icon`).
+  Award: Award,
+  Banknote: Banknote,
+  Code: Code,
+  Coffee: Coffee,
+  Dumbbell: Dumbbell,
+  Film: Film,
+  Fuel: Fuel,
+  Gamepad2: Gamepad2,
+  Gift: Gift,
+  GraduationCap: GraduationCap,
+  Heart: Heart,
+  Laptop: Laptop,
+  Lightbulb: Lightbulb,
+  MoreHorizontal: MoreHorizontal,
+  ParkingCircle: ParkingCircle,
+  PiggyBank: PiggyBank,
+  Pill: Pill,
+  Plane: Plane,
+  RotateCcw: RotateCcw,
+  Shirt: Shirt,
+  ShoppingBag: ShoppingBag,
+  ShoppingCart: ShoppingCart,
+  Smile: Smile,
+  Sofa: Sofa,
+  Stethoscope: Stethoscope,
+  // Tag is registered above as a Phosphor TagIcon — don't re-register here
+  // (Lucide and Phosphor Tag both want the same key).
+  Train: Train,
+  Truck: Truck,
+  Tv: Tv,
+  UtensilsCrossed: UtensilsCrossed,
+  Wifi: Wifi,
+  Wine: Wine,
+  Wrench: Wrench,
 };
 
 /**
@@ -823,6 +898,7 @@ export type IconName =
   | "TrendingDown"
   | "Wand2"
   | "Link"
+  | "Unlink"
   | "Building"
   | "Car"
   | "Gem"
@@ -877,6 +953,8 @@ export type IconName =
   | "Folder"
   | "FolderOpen"
   | "List"
+  | "Lock"
+  | "LockOpen"
   | "Pin"
   | "PinOff"
   | "Presentation"
@@ -897,7 +975,40 @@ export type IconName =
   | "CollectibleDuotone"
   | "PreciousDuotone"
   | "LiabilityDuotone"
-  | "OtherAssetDuotone";
+  | "OtherAssetDuotone"
+  // Spending taxonomy icons
+  | "Award"
+  | "Banknote"
+  | "Code"
+  | "Coffee"
+  | "Dumbbell"
+  | "Film"
+  | "Fuel"
+  | "Gamepad2"
+  | "Gift"
+  | "GraduationCap"
+  | "Heart"
+  | "Laptop"
+  | "Lightbulb"
+  | "MoreHorizontal"
+  | "ParkingCircle"
+  | "PiggyBank"
+  | "Pill"
+  | "Plane"
+  | "RotateCcw"
+  | "Shirt"
+  | "ShoppingBag"
+  | "ShoppingCart"
+  | "Smile"
+  | "Sofa"
+  | "Stethoscope"
+  | "Train"
+  | "Truck"
+  | "Tv"
+  | "UtensilsCrossed"
+  | "Wifi"
+  | "Wine"
+  | "Wrench";
 
 /**
  * Icons object with unified typing - all icons have the same Icon type

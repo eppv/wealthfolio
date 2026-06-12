@@ -15,7 +15,9 @@ use crate::errors::StorageError;
 use crate::schema::daily_account_valuation;
 use crate::schema::daily_account_valuation::dsl::*;
 use wealthfolio_core::errors::Result;
-use wealthfolio_core::portfolio::valuation::{DailyAccountValuation, ValuationRepositoryTrait};
+use wealthfolio_core::portfolio::valuation::{
+    DailyAccountValuation, NegativeBalanceInfo, ValuationRepositoryTrait,
+};
 
 pub struct ValuationRepository {
     pool: Arc<Pool<ConnectionManager<SqliteConnection>>>,
@@ -31,16 +33,16 @@ impl ValuationRepository {
 #[async_trait]
 impl ValuationRepositoryTrait for ValuationRepository {
     async fn save_valuations(&self, valuation_records: &[DailyAccountValuation]) -> Result<()> {
-        if valuation_records.is_empty() {
-            return Ok(());
-        }
-
         // Materialize the records once before moving into the closure
         let records_to_save: Vec<DailyAccountValuationDB> = valuation_records
             .iter()
             .cloned()
             .map(DailyAccountValuationDB::from)
             .collect();
+
+        if records_to_save.is_empty() {
+            return Ok(());
+        }
 
         self.writer
             .exec(move |conn| {
@@ -50,6 +52,54 @@ impl ValuationRepositoryTrait for ValuationRepository {
                         .execute(conn)
                         .map_err(StorageError::from)?;
                 }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn replace_valuations_for_account(
+        &self,
+        input_account_id: &str,
+        since_date: Option<NaiveDate>,
+        valuation_records: &[DailyAccountValuation],
+    ) -> Result<()> {
+        let account_id_owned = input_account_id.to_string();
+        let records_to_save: Vec<DailyAccountValuationDB> = valuation_records
+            .iter()
+            .cloned()
+            .map(DailyAccountValuationDB::from)
+            .collect();
+
+        self.writer
+            .exec(move |conn| {
+                match since_date {
+                    None => {
+                        diesel::delete(
+                            daily_account_valuation::table
+                                .filter(account_id.eq(account_id_owned.clone())),
+                        )
+                        .execute(conn)
+                        .map_err(StorageError::from)?;
+                    }
+                    Some(date) => {
+                        let date_str = date.to_string();
+                        diesel::delete(
+                            daily_account_valuation::table
+                                .filter(account_id.eq(account_id_owned.clone()))
+                                .filter(valuation_date.ge(date_str)),
+                        )
+                        .execute(conn)
+                        .map_err(StorageError::from)?;
+                    }
+                }
+
+                for chunk in records_to_save.chunks(1000) {
+                    diesel::replace_into(daily_account_valuation::table)
+                        .values(chunk)
+                        .execute(conn)
+                        .map_err(StorageError::from)?;
+                }
+
                 Ok(())
             })
             .await
@@ -88,6 +138,75 @@ impl ValuationRepositoryTrait for ValuationRepository {
             .collect();
 
         Ok(history_records)
+    }
+
+    fn get_historical_valuations_for_accounts(
+        &self,
+        input_account_ids: &[String],
+        start_date_opt: Option<NaiveDate>,
+        end_date_opt: Option<NaiveDate>,
+    ) -> Result<Vec<DailyAccountValuation>> {
+        if input_account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+
+        let mut query = daily_account_valuation::table
+            .filter(account_id.eq_any(input_account_ids))
+            .order((valuation_date.asc(), account_id.asc()))
+            .into_boxed();
+
+        if let Some(start_date_val) = start_date_opt {
+            query = query.filter(valuation_date.ge(start_date_val));
+        }
+
+        if let Some(end_date_val) = end_date_opt {
+            query = query.filter(valuation_date.le(end_date_val));
+        }
+
+        let history_dbs = query
+            .load::<DailyAccountValuationDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(history_dbs
+            .into_iter()
+            .map(DailyAccountValuation::from)
+            .collect())
+    }
+
+    fn get_max_calculated_at_for_accounts(
+        &self,
+        input_account_ids: &[String],
+        start_date_opt: Option<NaiveDate>,
+        end_date_opt: Option<NaiveDate>,
+    ) -> Result<Option<String>> {
+        use diesel::OptionalExtension;
+
+        if input_account_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let mut query = daily_account_valuation::table
+            .filter(account_id.eq_any(input_account_ids))
+            .into_boxed();
+
+        if let Some(start_date_val) = start_date_opt {
+            query = query.filter(valuation_date.ge(start_date_val));
+        }
+
+        if let Some(end_date_val) = end_date_opt {
+            query = query.filter(valuation_date.le(end_date_val));
+        }
+
+        let result: Option<Option<String>> = query
+            .select(diesel::dsl::max(calculated_at))
+            .first::<Option<String>>(&mut conn)
+            .optional()
+            .map_err(StorageError::from)?;
+
+        Ok(result.flatten())
     }
 
     fn load_latest_valuation_date(&self, input_account_id: &str) -> Result<Option<NaiveDate>> {
@@ -164,16 +283,22 @@ impl ValuationRepositoryTrait for ValuationRepository {
             "WITH RankedValuations AS ( \
                 SELECT \
                     id, account_id, valuation_date, account_currency, base_currency, \
-                    fx_rate_to_base, cash_balance, investment_market_value, total_value, \
-                    cost_basis, net_contribution, calculated_at, \
+                    fx_rate_to_base, cash_balance, investment_market_value, \
+                    total_value, cost_basis, net_contribution, cash_balance_base, \
+                    investment_market_value_base, total_value_base, cost_basis_base, \
+                    net_contribution_base, external_inflow_base, external_outflow_base, \
+                    external_flow_source, performance_eligible_value_base, calculated_at, \
                     ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY valuation_date DESC) as rn \
                 FROM {} \
                 WHERE account_id IN ({}) \
             ) \
             SELECT \
                 id, account_id, valuation_date, account_currency, base_currency, \
-                fx_rate_to_base, cash_balance, investment_market_value, total_value, \
-                cost_basis, net_contribution, calculated_at \
+                fx_rate_to_base, cash_balance, investment_market_value, \
+                total_value, cost_basis, net_contribution, cash_balance_base, \
+                investment_market_value_base, total_value_base, cost_basis_base, \
+                net_contribution_base, external_inflow_base, external_outflow_base, \
+                external_flow_source, performance_eligible_value_base, calculated_at \
             FROM RankedValuations \
             WHERE rn = 1",
             "daily_account_valuation", // Use direct table name string
@@ -215,7 +340,7 @@ impl ValuationRepositoryTrait for ValuationRepository {
     fn get_accounts_with_negative_balance(
         &self,
         input_account_ids: &[String],
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<NegativeBalanceInfo>> {
         if input_account_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -225,9 +350,13 @@ impl ValuationRepositoryTrait for ValuationRepository {
             .map(|_| "?")
             .collect::<Vec<&str>>()
             .join(", ");
+        // SQLite returns non-aggregated columns from the row that determines MIN().
         let sql = format!(
-            "SELECT DISTINCT account_id FROM daily_account_valuation \
-             WHERE CAST(total_value AS REAL) < 0 AND account_id IN ({})",
+            "SELECT account_id, MIN(valuation_date) AS first_negative_date, \
+             cash_balance, total_value, account_currency \
+             FROM daily_account_valuation \
+             WHERE CAST(total_value AS REAL) < 0 AND account_id IN ({}) \
+             GROUP BY account_id",
             placeholders
         );
         let mut query_builder = sql_query(sql).into_boxed::<Sqlite>();
@@ -235,14 +364,37 @@ impl ValuationRepositoryTrait for ValuationRepository {
             query_builder = query_builder.bind::<Text, _>(acc_id);
         }
         #[derive(QueryableByName)]
-        struct AccountIdRow {
+        struct NegativeBalanceRow {
             #[diesel(sql_type = diesel::sql_types::Text, column_name = "account_id")]
             acc_id: String,
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "first_negative_date")]
+            neg_date: String,
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "cash_balance")]
+            cash_bal: String,
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "total_value")]
+            total_val: String,
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "account_currency")]
+            acc_currency: String,
         }
-        let rows: Vec<AccountIdRow> = query_builder
-            .load::<AccountIdRow>(&mut conn)
+        let rows: Vec<NegativeBalanceRow> = query_builder
+            .load::<NegativeBalanceRow>(&mut conn)
             .map_err(StorageError::from)?;
-        Ok(rows.into_iter().map(|r| r.acc_id).collect())
+        let result = rows
+            .into_iter()
+            .filter_map(|r| {
+                let date = NaiveDate::parse_from_str(&r.neg_date, "%Y-%m-%d").ok()?;
+                let cash = r.cash_bal.parse::<rust_decimal::Decimal>().ok()?;
+                let total = r.total_val.parse::<rust_decimal::Decimal>().ok()?;
+                Some(NegativeBalanceInfo {
+                    account_id: r.acc_id,
+                    first_negative_date: date,
+                    cash_balance: cash,
+                    total_value: total,
+                    account_currency: r.acc_currency,
+                })
+            })
+            .collect();
+        Ok(result)
     }
 
     fn get_valuations_on_date(

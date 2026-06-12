@@ -19,6 +19,7 @@ import {
   SUBTYPE_DISPLAY_NAMES,
 } from "@/lib/constants";
 import { needsImportAssetResolution } from "@/lib/activity-utils";
+import { quoteModeFromSearchResult } from "@/lib/asset-utils";
 import { ActivityTypeBadge } from "../../components/activity-type-badge";
 import type { DraftActivity, DraftActivityStatus } from "../context";
 import { ImportToolbar, ImportContextMenu } from "./import-toolbar";
@@ -26,6 +27,13 @@ import { useAccounts } from "@/hooks/use-accounts";
 import { searchTicker } from "@/adapters";
 import { CreateCustomAssetDialog } from "@/components/create-custom-asset-dialog";
 import { useSettingsContext } from "@/lib/settings-provider";
+import {
+  DEFAULT_ACTIVITY_IMPORT_PROFILE,
+  type ActivityImportProfile,
+} from "../utils/activity-import-profile";
+
+const UNIT_PRICE_HELP_TEXT =
+  "For buys and sells, enter the trade price. For staking rewards and in-kind dividends, enter the fair market value per unit at receipt; it sets income amount and cost basis.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -43,6 +51,9 @@ export interface ImportReviewGridProps {
   onBulkForceImport?: (rowIndexes: number[]) => void;
   onBulkSetCurrency?: (rowIndexes: number[], currency: string) => void;
   onBulkSetAccount?: (rowIndexes: number[], accountId: string) => void;
+  /** Override the grid height (default: "calc(100vh - 360px)"). */
+  gridHeight?: string | number;
+  importProfile?: ActivityImportProfile;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,7 +105,7 @@ function getStatusTitle(
   if (typeof duplicateOfLineNumber === "number") {
     return `Duplicate of line ${duplicateOfLineNumber} in this import batch`;
   }
-  if (duplicateOfId) return `Duplicate of existing activity: ${duplicateOfId}`;
+  if (duplicateOfId) return "Duplicate of an existing activity in your portfolio";
   if (errors) {
     const errorDetails = Object.entries(errors)
       .flatMap(([field, msgs]) => msgs.map((msg) => `${field}: ${msg}`))
@@ -133,6 +144,7 @@ interface UseImportReviewColumnsOptions {
   onSymbolSearch: (query: string) => Promise<SymbolSearchResult[]>;
   onSymbolSelect?: (rowIndex: number, symbol: string, result?: SymbolSearchResult) => void;
   onCreateCustomAsset?: (rowIndex: number, symbol: string) => void;
+  importProfile: ActivityImportProfile;
 }
 
 function useImportReviewColumns({
@@ -140,6 +152,7 @@ function useImportReviewColumns({
   onSymbolSearch,
   onSymbolSelect,
   onCreateCustomAsset,
+  importProfile,
 }: UseImportReviewColumnsOptions): ColumnDef<DraftActivity>[] {
   const accountOptions = useMemo(
     () =>
@@ -152,11 +165,11 @@ function useImportReviewColumns({
 
   const activityTypeOptions = useMemo(
     () =>
-      Object.values(ActivityType).map((type) => ({
+      importProfile.allowedActivityTypes.map((type) => ({
         value: type,
         label: ActivityTypeNames[type],
       })),
-    [],
+    [importProfile.allowedActivityTypes],
   );
 
   // Dynamic subtype options based on activity type
@@ -172,8 +185,9 @@ function useImportReviewColumns({
     }));
   }, []);
 
-  return useMemo<ColumnDef<DraftActivity>[]>(
-    () => [
+  return useMemo<ColumnDef<DraftActivity>[]>(() => {
+    const visibleDataColumns = new Set<string>(importProfile.reviewColumns);
+    const allColumns: ColumnDef<DraftActivity>[] = [
       // === Pinned left (always visible) ===
       // 1. Select
       {
@@ -296,8 +310,12 @@ function useImportReviewColumns({
           cell: {
             variant: "select",
             options: activityTypeOptions,
-            valueRenderer: (value: string) => (
-              <ActivityTypeBadge type={value as ActivityType} className="text-xs font-normal" />
+            valueRenderer: (value: string, _option, rowData) => (
+              <ActivityTypeBadge
+                type={value as ActivityType}
+                subtype={(rowData as { subtype?: string } | undefined)?.subtype}
+                className="text-xs font-normal"
+              />
             ),
           },
         },
@@ -397,7 +415,10 @@ function useImportReviewColumns({
         header: "Price",
         size: 120,
         enableSorting: false,
-        meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
+        meta: {
+          helpText: UNIT_PRICE_HELP_TEXT,
+          cell: { variant: "number", step: 0.000001, valueType: "string" },
+        },
       },
       // 10. Amount
       {
@@ -446,16 +467,23 @@ function useImportReviewColumns({
         enableSorting: false,
         meta: { cell: { variant: "long-text" } },
       },
-    ],
-    [
-      accountOptions,
-      activityTypeOptions,
-      getSubtypeOptions,
-      onSymbolSearch,
-      onSymbolSelect,
-      onCreateCustomAsset,
-    ],
-  );
+    ];
+
+    return allColumns.filter(
+      (column) =>
+        column.id === "select" ||
+        column.id === "status" ||
+        (column.id ? visibleDataColumns.has(column.id) : true),
+    );
+  }, [
+    accountOptions,
+    activityTypeOptions,
+    getSubtypeOptions,
+    importProfile.reviewColumns,
+    onSymbolSearch,
+    onSymbolSelect,
+    onCreateCustomAsset,
+  ]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,6 +501,8 @@ export function ImportReviewGrid({
   onBulkForceImport,
   onBulkSetCurrency,
   onBulkSetAccount,
+  gridHeight,
+  importProfile = DEFAULT_ACTIVITY_IMPORT_PROFILE,
 }: ImportReviewGridProps) {
   const { settings } = useSettingsContext();
   const fallbackCurrency = settings?.baseCurrency ?? "USD";
@@ -583,14 +613,18 @@ export function ImportReviewGrid({
 
       // Currency fallback: search result → current draft currency → fallback
       const currency = result.currency ?? draft.currency ?? fallbackCurrency;
+      const canonicalSymbol = (result.canonicalSymbol || result.symbol).trim().toUpperCase();
+      const canonicalExchangeMic = result.canonicalExchangeMic || result.exchangeMic;
 
       onDraftUpdate(rowIndex, {
-        symbol: result.symbol,
+        symbol: canonicalSymbol,
         currency,
-        exchangeMic: result.exchangeMic,
+        exchangeMic: canonicalExchangeMic,
         quoteCcy: result.currency ?? draft.quoteCcy,
         instrumentType: result.quoteType,
-        quoteMode: result.dataSource === "MANUAL" ? "MANUAL" : undefined,
+        quoteMode: quoteModeFromSearchResult(result),
+        providerId: result.providerId,
+        providerSymbol: result.providerSymbol,
         symbolName: result.longName || result.shortName || draft.symbolName,
         assetId: undefined,
         importAssetKey: undefined,
@@ -615,14 +649,18 @@ export function ImportReviewGrid({
       if (!draft) return;
 
       const currency = result.currency ?? draft.currency ?? fallbackCurrency;
+      const canonicalSymbol = (result.canonicalSymbol || result.symbol).trim().toUpperCase();
+      const canonicalExchangeMic = result.canonicalExchangeMic || result.exchangeMic;
 
       onDraftUpdate(rowIndex, {
-        symbol: result.symbol,
+        symbol: canonicalSymbol,
         currency,
-        exchangeMic: result.exchangeMic,
+        exchangeMic: canonicalExchangeMic,
         quoteCcy: result.currency ?? draft.quoteCcy,
         instrumentType: result.quoteType,
-        quoteMode: result.dataSource === "MANUAL" ? "MANUAL" : undefined,
+        quoteMode: quoteModeFromSearchResult(result),
+        providerId: result.providerId,
+        providerSymbol: result.providerSymbol,
         symbolName: result.longName || result.shortName || draft.symbolName,
         assetId: undefined,
         importAssetKey: undefined,
@@ -639,6 +677,7 @@ export function ImportReviewGrid({
     onSymbolSearch: handleSymbolSearch,
     onSymbolSelect: handleSymbolSelect,
     onCreateCustomAsset: handleCreateCustomAsset,
+    importProfile,
   });
 
   // Ref to track if we're in the middle of syncing selection
@@ -829,7 +868,12 @@ export function ImportReviewGrid({
 
       {/* Data grid with context menu support */}
       <div className="min-h-0 flex-1" onContextMenu={handleContextMenu} onWheel={handleWheel}>
-        <DataGrid {...dataGrid} stretchColumns height="calc(100vh - 360px)" className="text-sm" />
+        <DataGrid
+          {...dataGrid}
+          stretchColumns
+          height={gridHeight ?? "calc(100vh - 360px)"}
+          className="text-sm"
+        />
       </div>
 
       {/* Context menu */}

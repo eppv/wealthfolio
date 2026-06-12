@@ -15,7 +15,7 @@ import {
 } from "@/adapters";
 import { usePortfolioSyncOptional } from "@/context/portfolio-sync-context";
 import { useIsMobileViewport } from "@/hooks/use-platform";
-import { QueryKeys } from "@/lib/query-keys";
+import { shouldInvalidateAfterPortfolioUpdate } from "@/lib/query-invalidation";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
@@ -29,30 +29,16 @@ const TOAST_IDS = {
   brokerSyncStart: "broker-sync-start",
 } as const;
 
-const CLOUD_SYNC_INVALIDATION_EXCLUSIONS = new Set<string>([
-  QueryKeys.BROKER_CONNECTIONS,
-  QueryKeys.BROKER_ACCOUNTS,
-  QueryKeys.BROKER_SYNC_STATES,
-  QueryKeys.IMPORT_RUNS,
-  QueryKeys.USER_INFO,
-  QueryKeys.SUBSCRIPTION_PLANS,
-  QueryKeys.SUBSCRIPTION_PLANS_PUBLIC,
-  QueryKeys.SYNCED_ACCOUNTS,
-  QueryKeys.PLATFORMS,
-]);
+const BROKER_SYNC_FAILURE_DESCRIPTION =
+  "We couldn't sync your broker data. Please try again later.";
 
-function shouldInvalidateAfterPortfolioUpdate(queryKey: readonly unknown[]): boolean {
-  const rootKey = queryKey[0];
+interface MarketSyncCompletePayload {
+  failed_syncs?: [string, string][];
+  skipped_reasons?: [string, string][];
+}
 
-  if (typeof rootKey === "string" && CLOUD_SYNC_INVALIDATION_EXCLUSIONS.has(rootKey)) {
-    return false;
-  }
-
-  if (rootKey === "sync") {
-    return false;
-  }
-
-  return true;
+function getSyncFailures(payload?: MarketSyncCompletePayload | null): [string, string][] {
+  return Array.isArray(payload?.failed_syncs) ? payload.failed_syncs : [];
 }
 
 const useGlobalEventListener = () => {
@@ -92,8 +78,8 @@ const useGlobalEventListener = () => {
       }
     };
 
-    const handleMarketSyncComplete = (event: { payload: { failed_syncs: [string, string][] } }) => {
-      const { failed_syncs } = event.payload || { failed_syncs: [] };
+    const handleMarketSyncComplete = (event: { payload: MarketSyncCompletePayload | null }) => {
+      const failed_syncs = getSyncFailures(event.payload);
 
       if (isMobileViewportRef.current && syncContextRef.current) {
         syncContextRef.current.setIdle();
@@ -258,9 +244,10 @@ const useGlobalEventListener = () => {
         }
       } else {
         toast.error("Broker Sync Failed", {
-          description: message,
+          description: BROKER_SYNC_FAILURE_DESCRIPTION,
           duration: 10000,
         });
+        logger.error("Broker sync failed: " + message);
       }
     };
 
@@ -269,9 +256,10 @@ const useGlobalEventListener = () => {
       // Dismiss the loading toast
       toast.dismiss(TOAST_IDS.brokerSyncStart);
       toast.error("Broker Sync Failed", {
-        description: error,
+        description: BROKER_SYNC_FAILURE_DESCRIPTION,
         duration: 10000,
       });
+      logger.error("Broker sync error: " + error);
     };
 
     const setupListeners = async () => {

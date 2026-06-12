@@ -69,6 +69,7 @@ pub struct Quote {
 /// * `type_display` - Human-readable type display
 /// * `currency` - Trading currency (e.g., "USD", "CAD")
 /// * `data_source` - Data source provider (e.g., "YAHOO", "MANUAL")
+/// * `quote_mode` - Pricing mode (e.g., "MARKET", "MANUAL")
 /// * `is_existing` - True if this asset already exists in user's database
 /// * `existing_asset_id` - The ID if asset exists (e.g., "SEC:AAPL:XNAS")
 /// * `index` - Index membership if applicable
@@ -77,6 +78,14 @@ pub struct Quote {
 #[serde(rename_all = "camelCase")]
 pub struct SymbolSearchResult {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_exchange_mic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_symbol: Option<String>,
     pub short_name: String,
     pub long_name: String,
     pub exchange: String,
@@ -92,6 +101,8 @@ pub struct SymbolSearchResult {
     pub currency_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_mode: Option<String>,
     #[serde(default)]
     pub is_existing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,7 +129,7 @@ pub struct LatestQuotePair {
     pub previous: Option<Quote>,
 }
 
-/// Result from resolving a symbol's latest quote (currency + price).
+/// Result from resolving a symbol's latest quote (currency, price, and provider).
 ///
 /// Used during symbol selection to confirm inferred currency and pre-fill price.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -126,4 +137,5 @@ pub struct LatestQuotePair {
 pub struct ResolvedQuote {
     pub currency: Option<String>,
     pub price: Option<Decimal>,
+    pub resolved_provider_id: Option<String>,
 }

@@ -1,9 +1,10 @@
 import { expect, Page, test } from "@playwright/test";
+import { gotoActivities } from "./helpers";
 
 test.describe.configure({ mode: "serial" });
 
 test.describe("Activity Creation Tests", () => {
-  const BASE_URL = "http://localhost:1420";
+  const BASE_URL = process.env.WF_E2E_BASE_URL || "http://localhost:1420";
   const TEST_PASSWORD = "password001";
   let page: Page;
 
@@ -70,8 +71,10 @@ test.describe("Activity Creation Tests", () => {
         currency: "USD",
         symbol: "MSFT",
         amount: 15,
-        notes: "Dividend with no subtype",
-        subtype: "None",
+        quantity: 0.1,
+        unitPrice: 150,
+        notes: "Dividend in kind",
+        subtype: "In kind",
       },
       transfer: {
         fromAccount: "Test USD Account",
@@ -253,25 +256,59 @@ test.describe("Activity Creation Tests", () => {
   }
 
   async function searchAndSelectSymbol(symbol: string) {
-    const symbolCombobox = page.getByRole("combobox").filter({ hasText: /Select symbol/i });
+    const escapedSymbol = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const exactSymbolPattern = new RegExp(`^${escapedSymbol}$`, "i");
+    const activityDialog = page.getByRole("dialog", { name: "Add Activity" });
+    const symbolCombobox = activityDialog
+      .getByRole("combobox")
+      .filter({ hasText: /Select symbol/i });
     await symbolCombobox.click();
-    await page.waitForTimeout(200);
 
     const searchInput = page.getByPlaceholder("Search for symbol");
+    await expect(searchInput).toBeVisible({ timeout: 5000 });
     await searchInput.fill(symbol);
-    await page.waitForTimeout(500);
 
-    const symbolOption = page.getByRole("option", { name: new RegExp(symbol, "i") }).first();
-    await expect(symbolOption).toBeVisible({ timeout: 5000 });
+    const suggestions = page.getByRole("listbox", { name: /Suggestions/i });
+    await expect(suggestions).toBeVisible({ timeout: 10000 });
+    const symbolOption = suggestions
+      .getByRole("option")
+      .filter({
+        has: page.locator("span.font-mono").filter({ hasText: exactSymbolPattern }),
+        hasNotText: /Create custom|manual/i,
+      })
+      .first();
+    await expect(symbolOption).toBeVisible({ timeout: 30000 });
     await symbolOption.click();
-    await page.waitForTimeout(200);
   }
 
   async function fillAmount(value: number, testId = "amount-input") {
-    const amountInput = page.getByTestId(testId);
+    const amountInput = page.getByRole("dialog", { name: "Add Activity" }).getByTestId(testId);
+    await expect(amountInput).toBeVisible({ timeout: 5000 });
     await amountInput.fill(String(value));
     await amountInput.blur();
-    await page.waitForTimeout(200);
+  }
+
+  async function fillInternalTransferCashAmount(value: number) {
+    const activityDialog = page.getByRole("dialog", { name: "Add Activity" });
+    const sentAmountInput = activityDialog.getByTestId("sent-amount-input");
+    const simpleAmountInput = activityDialog.getByTestId("input-amount");
+
+    await expect(sentAmountInput.or(simpleAmountInput)).toBeVisible({ timeout: 5000 });
+
+    if (await sentAmountInput.isVisible()) {
+      await sentAmountInput.fill(String(value));
+      await sentAmountInput.blur();
+
+      const receivedAmountInput = activityDialog.getByTestId("received-amount-input");
+      if (await receivedAmountInput.isVisible()) {
+        await receivedAmountInput.fill(String(value));
+        await receivedAmountInput.blur();
+      }
+      return;
+    }
+
+    await simpleAmountInput.fill(String(value));
+    await simpleAmountInput.blur();
   }
 
   async function fillQuantity(value: number) {
@@ -312,10 +349,12 @@ test.describe("Activity Creation Tests", () => {
   }
 
   async function selectSubtype(subtype: string) {
-    const subtypeSelect = page.getByTestId("subtype-select");
-    await expect(subtypeSelect).toBeVisible({ timeout: 5000 });
-    await subtypeSelect.click();
-    await page.getByRole("option", { name: subtype }).click();
+    const subtypeLabel = subtype === "None" ? "Cash" : subtype;
+    const dialog = page.getByRole("dialog", { name: "Add Activity" });
+    const subtypeRadio = dialog.getByRole("radio", { name: subtypeLabel, exact: true });
+    await expect(subtypeRadio).toBeVisible({ timeout: 5000 });
+    await subtypeRadio.click();
+    await expect(subtypeRadio).toBeChecked();
   }
 
   async function fillFxRate(rate: number) {
@@ -475,8 +514,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("3. Create DEPOSIT activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Deposit");
@@ -492,8 +530,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("4. Create WITHDRAWAL activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Withdrawal");
@@ -509,8 +546,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("5. Create BUY activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Buy");
@@ -530,8 +566,7 @@ test.describe("Activity Creation Tests", () => {
 
   test("6. Create BUY activity with advanced options", async () => {
     test.setTimeout(60000); // Longer timeout for advanced options test
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Buy");
@@ -555,8 +590,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("7. Create SELL activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Sell");
@@ -575,8 +609,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("8. Create DIVIDEND activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Dividend");
@@ -593,8 +626,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("9. Create DIVIDEND activity with subtype", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Dividend");
@@ -603,21 +635,30 @@ test.describe("Activity Creation Tests", () => {
     await selectAccount(dividend.account, dividend.currency);
     await searchAndSelectSymbol(dividend.symbol);
     await selectDate();
-    await fillAmount(dividend.amount);
 
-    // Expand advanced options and select subtype
-    await expandAdvancedOptions();
+    // Subtype is now a main form radio group, not an advanced select.
     await selectSubtype(dividend.subtype);
+    await page.getByTestId("received-quantity-input").fill(String(dividend.quantity));
+    await page.getByTestId("received-quantity-input").blur();
+    await page.getByTestId("fmv-per-unit-input").fill(String(dividend.unitPrice));
+    await page.getByTestId("fmv-per-unit-input").blur();
+    await fillAmount(dividend.amount, "dividend-amount-input");
 
     await fillNotes(dividend.notes);
 
     await submitActivity("Dividend");
     await verifyActivityInTable("DIVIDEND", dividend.symbol, { amount: dividend.amount });
+    await expect(
+      page
+        .locator("tr")
+        .filter({ hasText: "Dividend in Kind" })
+        .filter({ hasText: dividend.symbol })
+        .first(),
+    ).toBeVisible({ timeout: 10000 });
   });
 
   test("10. Create TRANSFER activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Transfer");
@@ -631,7 +672,7 @@ test.describe("Activity Creation Tests", () => {
     await selectAccount("Test CAD Account", "CAD", "To Account");
 
     await selectDate();
-    await fillAmount(transfer.amount);
+    await fillInternalTransferCashAmount(transfer.amount);
     await fillNotes(transfer.notes);
 
     await submitActivity("Transfer");
@@ -640,8 +681,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("10b. Create external TRANSFER OUT (cash)", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Transfer");
@@ -667,8 +707,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("10c. Create external TRANSFER IN (cash)", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Transfer");
@@ -694,8 +733,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("10d. Create internal TRANSFER (securities)", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Transfer");
@@ -722,8 +760,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("10e. Create external TRANSFER IN (securities)", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Transfer");
@@ -763,8 +800,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("11. Create FEE activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Fee");
@@ -780,8 +816,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("15. Create INTEREST activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Interest");
@@ -797,8 +832,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("16. Create TAX activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Tax");
@@ -814,8 +848,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("17. Create SPLIT activity", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Split");
@@ -837,8 +870,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("18. Create BUY activity with custom asset", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     await openAddActivitySheet();
     await selectActivityType("Buy");
@@ -968,8 +1000,7 @@ test.describe("Activity Creation Tests", () => {
   });
 
   test("21. Verify activity count in activities page", async () => {
-    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible({ timeout: 10000 });
+    await gotoActivities(page);
 
     // Wait for activities to load
     await page.waitForTimeout(1000);

@@ -285,7 +285,7 @@ pub async fn sync_bootstrap_snapshot_if_needed(
         .map_err(|e| e.message)?;
     if sync_state.state != SyncState::Ready {
         return Ok(SyncBootstrapResult {
-            status: "skipped".to_string(),
+            status: "skipped_not_ready".to_string(),
             message: "Device is not in READY state".to_string(),
             snapshot_id: None,
             cursor: None,
@@ -655,9 +655,19 @@ pub async fn generate_snapshot_now_internal(
         }
     }
 
+    let sync_tables = APP_SYNC_TABLES
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    context
+        .app_sync_repository()
+        .validate_snapshot_upload_integrity(sync_tables.clone())
+        .await
+        .map_err(|e| format!("Cannot upload snapshot: {}", e))?;
+
     let sqlite_bytes = context
         .app_sync_repository()
-        .export_snapshot_sqlite_image(APP_SYNC_TABLES.iter().map(|v| v.to_string()).collect())
+        .export_snapshot_sqlite_image(sync_tables)
         .await
         .map_err(|e| format!("Failed to export snapshot SQLite image: {}", e))?;
     emit_snapshot_upload_progress(handle, "exported", 35, "Snapshot exported");

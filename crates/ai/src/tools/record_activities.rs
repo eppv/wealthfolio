@@ -84,7 +84,7 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivitiesTool<E> {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Record multiple investment transactions from natural language. Returns a read-only batch draft preview for single confirmation.".to_string(),
+            description: "Record multiple investment transactions from natural language. Returns a read-only batch draft preview for single confirmation. If the user has multiple accounts and did not specify which account to use, ask which account before calling this tool.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -101,7 +101,7 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivitiesTool<E> {
                                 },
                                 "symbol": {
                                     "type": "string",
-                                    "description": "Symbol or ticker (e.g., 'AAPL', 'BTC', 'VTI'). Required for BUY/SELL/DIVIDEND/SPLIT"
+                                    "description": "Symbol or ticker (e.g., 'AAPL', 'BTC', 'VTI'). Required for BUY/SELL/DIVIDEND/SPLIT and asset-backed income subtypes like DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD"
                                 },
                                 "activityDate": {
                                     "type": "string",
@@ -109,15 +109,15 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivitiesTool<E> {
                                 },
                                 "quantity": {
                                     "type": "number",
-                                    "description": "Number of shares or units. Required for BUY/SELL/SPLIT"
+                                    "description": "Number of shares or units. Required for BUY/SELL/SPLIT and asset-backed income subtypes like DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD"
                                 },
                                 "unitPrice": {
                                     "type": "number",
-                                    "description": "Price per unit"
+                                    "description": "Price or fair market value per unit. For DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD, provide either unitPrice or amount"
                                 },
                                 "amount": {
                                     "type": "number",
-                                    "description": "Total amount for cash-style activities"
+                                    "description": "Total cash amount or taxable income amount. For DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD, provide either amount or unitPrice"
                                 },
                                 "fee": {
                                     "type": "number",
@@ -125,11 +125,11 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivitiesTool<E> {
                                 },
                                 "account": {
                                     "type": "string",
-                                    "description": "Account name or ID"
+                                    "description": "Account name or ID. Required before calling this tool when the user has multiple accounts. If the user did not specify an account for a row, ask which account first instead of calling this tool with an empty account."
                                 },
                                 "subtype": {
                                     "type": "string",
-                                    "description": "Activity subtype: DRIP, DIVIDEND_IN_KIND, STAKING_REWARD, BONUS"
+                                    "description": "Activity subtype: DRIP, DIVIDEND_IN_KIND (additional units of the same asset), STAKING_REWARD (staking income received as more units of the same asset), BONUS"
                                 },
                                 "notes": {
                                     "type": "string",
@@ -178,7 +178,7 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivitiesTool<E> {
         let accounts = self
             .env
             .account_service()
-            .get_active_accounts()
+            .get_active_non_archived_accounts()
             .map_err(|e| AiError::ToolExecutionFailed(e.to_string()))?;
 
         let available_accounts: Vec<AccountOption> = accounts
@@ -187,6 +187,7 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivitiesTool<E> {
                 id: a.id.clone(),
                 name: a.name.clone(),
                 currency: a.currency.clone(),
+                account_type: Some(a.account_type.clone()),
             })
             .collect();
 
@@ -498,6 +499,7 @@ mod tests {
                 long_name: "Apple Inc.".to_string(),
                 exchange_mic: Some("XNAS".to_string()),
                 exchange_name: Some("NASDAQ".to_string()),
+                quote_type: "EQUITY".to_string(),
                 currency: Some("USD".to_string()),
                 existing_asset_id: Some("SEC:AAPL:XNAS".to_string()),
                 ..SymbolSearchResult::default()
@@ -555,6 +557,13 @@ mod tests {
             Some("STAKING_REWARD")
         );
         assert_eq!(output.drafts[2].draft.subtype.as_deref(), Some("BONUS"));
+        assert_eq!(
+            output.drafts[0]
+                .resolved_asset
+                .as_ref()
+                .and_then(|asset| asset.instrument_type.as_deref()),
+            Some("EQUITY")
+        );
         assert!(output.drafts[0]
             .available_subtypes
             .iter()

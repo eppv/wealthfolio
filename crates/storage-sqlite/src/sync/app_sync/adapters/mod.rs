@@ -46,6 +46,10 @@ pub fn default_adapter_descriptors() -> Vec<EntityAdapterDescriptor> {
             table_name: "goals",
         },
         EntityAdapterDescriptor {
+            entity: SyncEntity::GoalPlan,
+            table_name: "goal_plans",
+        },
+        EntityAdapterDescriptor {
             entity: SyncEntity::GoalsAllocation,
             table_name: "goals_allocation",
         },
@@ -86,6 +90,66 @@ pub fn default_adapter_descriptors() -> Vec<EntityAdapterDescriptor> {
         EntityAdapterDescriptor {
             entity: SyncEntity::CustomTaxonomy,
             table_name: "taxonomies",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::Portfolio,
+            table_name: "portfolios",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::PortfolioAccount,
+            table_name: "portfolio_accounts",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::AllocationTarget,
+            table_name: "allocation_targets",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::AllocationTargetWeight,
+            table_name: "allocation_target_weights",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::SpendingSetting,
+            table_name: "app_settings",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::ActivityTaxonomyAssignment,
+            table_name: "activity_taxonomy_assignments",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::SpendingActivityEvent,
+            table_name: "spending_activity_events",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::SpendingCategorizationRule,
+            table_name: "spending_categorization_rules",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::SpendingPresetRuleDeletion,
+            table_name: "spending_preset_rule_deletions",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::SpendingEvent,
+            table_name: "spending_events",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::SpendingEventType,
+            table_name: "spending_event_types",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::BudgetGroup,
+            table_name: "budget_groups",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::BudgetGroupAssignment,
+            table_name: "budget_group_assignments",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::BudgetTarget,
+            table_name: "budget_targets",
+        },
+        EntityAdapterDescriptor {
+            entity: SyncEntity::BudgetRolloverSetting,
+            table_name: "budget_rollover_settings",
         },
     ]
 }

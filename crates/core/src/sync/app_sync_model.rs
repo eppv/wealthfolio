@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Canonical list of local tables that participate in app-side device sync.
 /// Order matters: parent tables before children (FK dependencies).
-pub const APP_SYNC_TABLES: [&str; 19] = [
+pub const APP_SYNC_TABLES: &[&str] = &[
     // Base tables (no FK deps)
     "platforms",
     "assets",
@@ -13,6 +13,7 @@ pub const APP_SYNC_TABLES: [&str; 19] = [
     // Depends on: assets
     "quotes",
     "goals",
+    "goal_plans",
     "ai_threads",
     "contribution_limits",
     // Depends on: platforms
@@ -23,6 +24,12 @@ pub const APP_SYNC_TABLES: [&str; 19] = [
     "activities",
     // No FK deps
     "import_templates",
+    // Spending settings only; storage filters to spending.* keys.
+    "app_settings",
+    // Spending budget groups have no FK deps.
+    "budget_groups",
+    // Spending event types — no FK deps.
+    "spending_event_types",
     // Depends on: import_templates
     "import_account_templates",
     // No FK deps (base table)
@@ -31,6 +38,20 @@ pub const APP_SYNC_TABLES: [&str; 19] = [
     "taxonomy_categories",
     // Depends on: assets, taxonomy_categories
     "asset_taxonomy_assignments",
+    // Spending activity↔category join. Depends on: activities, taxonomies, taxonomy_categories
+    "activity_taxonomy_assignments",
+    // Spending categorization rules. Depends on: accounts (optional FK), taxonomies, taxonomy_categories
+    "spending_categorization_rules",
+    // Preset rule deletion memory. Depends logically on spending_categorization_rules payloads.
+    "spending_preset_rule_deletions",
+    // Spending events. Depends on: spending_event_types
+    "spending_events",
+    // Spending activity↔event tag. Depends on: activities, spending_events
+    "spending_activity_events",
+    // Depends on: budget_groups, taxonomy_categories
+    "budget_group_assignments",
+    "budget_targets",
+    "budget_rollover_settings",
     // Depends on: accounts, goals
     "goals_allocation",
     // Depends on: ai_threads
@@ -39,6 +60,16 @@ pub const APP_SYNC_TABLES: [&str; 19] = [
     "ai_thread_tags",
     // No FK deps (account_id has no FK constraint)
     "holdings_snapshots",
+    // Depends on: holdings_snapshots, assets
+    "snapshot_positions",
+    // No FK deps
+    "portfolios",
+    // Depends on: portfolios, accounts
+    "portfolio_accounts",
+    // Depends on: taxonomy_categories, portfolios/accounts by optional scope.
+    "allocation_targets",
+    // Depends on: allocation_targets, taxonomy_categories.
+    "allocation_target_weights",
 ];
 
 /// Entity names used by incremental sync events.
@@ -50,9 +81,11 @@ pub enum SyncEntity {
     Quote,
     AssetTaxonomyAssignment,
     Activity,
+    BrokerActivityUserPatch,
     ActivityImportProfile,
     ImportTemplate,
     Goal,
+    GoalPlan,
     GoalsAllocation,
     AiThread,
     AiMessage,
@@ -63,6 +96,25 @@ pub enum SyncEntity {
     CustomProvider,
     CustomTaxonomy,
     ImportRun,
+    Portfolio,
+    PortfolioAccount,
+    AllocationTarget,
+    AllocationTargetWeight,
+    // Spending module (wealthfolio-spending crate). Prefixed with `Spending*`
+    // because the bare names (`Event`, `EventType`, `CategorizationRule`)
+    // would clash with the codebase's existing event-system vocabulary
+    // (DomainEvent, EventBus, sync_applied_events, etc.).
+    SpendingSetting,
+    ActivityTaxonomyAssignment,
+    SpendingActivityEvent,
+    SpendingCategorizationRule,
+    SpendingPresetRuleDeletion,
+    SpendingEvent,
+    SpendingEventType,
+    BudgetGroup,
+    BudgetGroupAssignment,
+    BudgetTarget,
+    BudgetRolloverSetting,
 }
 
 /// Supported sync operations.
@@ -111,6 +163,7 @@ pub struct SyncEntityMetadata {
     pub entity_id: String,
     pub last_event_id: String,
     pub last_client_timestamp: String,
+    pub last_op: SyncOperation,
     pub last_seq: i64,
 }
 
@@ -271,8 +324,10 @@ mod tests {
             SyncEntity::Quote,
             SyncEntity::AssetTaxonomyAssignment,
             SyncEntity::Activity,
+            SyncEntity::BrokerActivityUserPatch,
             SyncEntity::ActivityImportProfile,
             SyncEntity::Goal,
+            SyncEntity::GoalPlan,
             SyncEntity::GoalsAllocation,
             SyncEntity::AiThread,
             SyncEntity::AiMessage,
@@ -283,6 +338,21 @@ mod tests {
             SyncEntity::CustomProvider,
             SyncEntity::CustomTaxonomy,
             SyncEntity::ImportRun,
+            SyncEntity::Portfolio,
+            SyncEntity::PortfolioAccount,
+            SyncEntity::AllocationTarget,
+            SyncEntity::AllocationTargetWeight,
+            SyncEntity::SpendingSetting,
+            SyncEntity::ActivityTaxonomyAssignment,
+            SyncEntity::SpendingActivityEvent,
+            SyncEntity::SpendingCategorizationRule,
+            SyncEntity::SpendingPresetRuleDeletion,
+            SyncEntity::SpendingEvent,
+            SyncEntity::SpendingEventType,
+            SyncEntity::BudgetGroup,
+            SyncEntity::BudgetGroupAssignment,
+            SyncEntity::BudgetTarget,
+            SyncEntity::BudgetRolloverSetting,
         ]
         .iter()
         .map(|entity| serde_json::to_string(entity).expect("serialize sync entity"))
@@ -294,8 +364,10 @@ mod tests {
             "\"quote\"",
             "\"asset_taxonomy_assignment\"",
             "\"activity\"",
+            "\"broker_activity_user_patch\"",
             "\"activity_import_profile\"",
             "\"goal\"",
+            "\"goal_plan\"",
             "\"goals_allocation\"",
             "\"ai_thread\"",
             "\"ai_message\"",
@@ -306,6 +378,21 @@ mod tests {
             "\"custom_provider\"",
             "\"custom_taxonomy\"",
             "\"import_run\"",
+            "\"portfolio\"",
+            "\"portfolio_account\"",
+            "\"allocation_target\"",
+            "\"allocation_target_weight\"",
+            "\"spending_setting\"",
+            "\"activity_taxonomy_assignment\"",
+            "\"spending_activity_event\"",
+            "\"spending_categorization_rule\"",
+            "\"spending_preset_rule_deletion\"",
+            "\"spending_event\"",
+            "\"spending_event_type\"",
+            "\"budget_group\"",
+            "\"budget_group_assignment\"",
+            "\"budget_target\"",
+            "\"budget_rollover_setting\"",
         ];
 
         assert_eq!(actual, expected);

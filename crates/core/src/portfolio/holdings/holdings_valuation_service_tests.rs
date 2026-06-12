@@ -30,6 +30,7 @@ mod tests {
     struct MockFxService {
         rates: Arc<Mutex<HashMap<(String, String), Decimal>>>,
         should_fail: Arc<Mutex<HashMap<(String, String), bool>>>,
+        latest_rate_calls: Arc<Mutex<HashMap<(String, String), usize>>>,
     }
 
     impl MockFxService {
@@ -44,6 +45,15 @@ mod tests {
         fn set_fail(&self, from: &str, to: &str, fail: bool) {
             let mut should_fail = self.should_fail.lock().unwrap();
             should_fail.insert((from.to_string(), to.to_string()), fail);
+        }
+
+        fn latest_rate_call_count(&self, from: &str, to: &str) -> usize {
+            *self
+                .latest_rate_calls
+                .lock()
+                .unwrap()
+                .get(&(from.to_string(), to.to_string()))
+                .unwrap_or(&0)
         }
     }
 
@@ -126,19 +136,24 @@ mod tests {
             from_currency: &str,
             to_currency: &str,
         ) -> Result<Decimal> {
+            let cache_key = (from_currency.to_string(), to_currency.to_string());
+            self.latest_rate_calls
+                .lock()
+                .unwrap()
+                .entry(cache_key.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+
             if from_currency == to_currency {
                 return Ok(Decimal::ONE);
             }
             let should_fail = self.should_fail.lock().unwrap();
-            if *should_fail
-                .get(&(from_currency.to_string(), to_currency.to_string()))
-                .unwrap_or(&false)
-            {
+            if *should_fail.get(&cache_key).unwrap_or(&false) {
                 return Err(Error::Unexpected("Intentional FX failure".to_string()));
             }
 
             let rates = self.rates.lock().unwrap();
-            match rates.get(&(from_currency.to_string(), to_currency.to_string())) {
+            match rates.get(&cache_key) {
                 Some(rate) => Ok(*rate),
                 None => Err(Error::Fx(crate::fx::FxError::RateNotFound(format!(
                     "Mock rate not found for {}->{}",
@@ -176,6 +191,14 @@ mod tests {
             unimplemented!()
         }
 
+        fn get_latest_quotes_as_of(
+            &self,
+            _symbols: &[String],
+            _as_of: chrono::NaiveDate,
+        ) -> Result<HashMap<String, Quote>> {
+            Ok(HashMap::new())
+        }
+
         fn get_latest_quotes_snapshot(
             &self,
             asset_ids: &[String],
@@ -189,10 +212,11 @@ mod tests {
                     (
                         asset_id,
                         LatestQuoteSnapshot {
-                            quote,
+                            quote: Some(quote),
                             is_stale: quote_day < today,
                             effective_market_date: today.to_string(),
-                            quote_date: quote_day.to_string(),
+                            quote_date: Some(quote_day.to_string()),
+                            no_quote_reason: None,
                         },
                     )
                 })
@@ -379,6 +403,10 @@ mod tests {
             Ok(())
         }
 
+        async fn reset_sync_state_for_profile_change(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
         // =========================================================================
         // Provider Settings
         // =========================================================================
@@ -463,6 +491,7 @@ mod tests {
                 notes: None,
                 pricing_mode: "MARKET".to_string(),
                 preferred_provider: None,
+                exchange_mic: None,
                 classifications: None,
             })
         } else {
@@ -500,6 +529,11 @@ mod tests {
             realized_gain_pct: None,   // To be calculated
             total_gain: None,          // To be calculated
             total_gain_pct: None,      // To be calculated
+            income: None,
+            total_return: None,
+            total_return_pct: None,
+            return_basis: None,
+            source_account_ids: vec![],
             metadata: None,
         }
     }
@@ -778,6 +812,153 @@ mod tests {
             TOLERANCE,
             "Day Change Pct",
         );
+    }
+
+    #[tokio::test]
+    async fn issue_408_preserves_historical_base_cost_basis() {
+        let (fx_service, market_data_service, valuation_service) = setup_test_env();
+        fx_service.add_rate("USD", "EUR", dec!(0.8));
+
+        let latest_quote = create_quote("2024-01-10", dec!(110.0), "USD");
+        let prev_quote = create_quote("2024-01-09", dec!(100.0), "USD");
+        market_data_service.add_quote_pair("AAPL", latest_quote, Some(prev_quote));
+
+        let mut holdings = vec![create_holding(
+            "h_408",
+            HoldingType::Security,
+            "AAPL",
+            dec!(10),
+            "USD",
+            "EUR",
+            Some(dec!(1000.0)),
+            Some("Apple Inc."),
+        )];
+        holdings[0].cost_basis.as_mut().unwrap().base = dec!(1000.0);
+
+        let result = valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await;
+        assert!(result.is_ok());
+        let holding = &holdings[0];
+
+        assert_monetary_value_approx(
+            Some(&holding.market_value),
+            dec!(1100.0),
+            dec!(880.0),
+            TOLERANCE,
+            "Market Value",
+        );
+        assert_monetary_value_approx(
+            holding.cost_basis.as_ref(),
+            dec!(1000.0),
+            dec!(1000.0),
+            TOLERANCE,
+            "Cost Basis",
+        );
+        assert_monetary_value_approx(
+            holding.unrealized_gain.as_ref(),
+            dec!(100.0),
+            dec!(-120.0),
+            TOLERANCE,
+            "Unrealized Gain",
+        );
+        assert_decimal_approx(
+            holding.unrealized_gain_pct,
+            dec!(-0.1200),
+            TOLERANCE,
+            "Unrealized Gain Pct",
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_historical_base_cost_basis_falls_back_to_current_fx() {
+        let (fx_service, market_data_service, valuation_service) = setup_test_env();
+        fx_service.add_rate("USD", "EUR", dec!(0.8));
+
+        market_data_service.add_quote_pair(
+            "AAPL",
+            create_quote("2024-01-10", dec!(110.0), "USD"),
+            None,
+        );
+
+        let mut holdings = vec![create_holding(
+            "h_current_fx_fallback",
+            HoldingType::Security,
+            "AAPL",
+            dec!(10),
+            "USD",
+            "EUR",
+            Some(dec!(1000.0)),
+            Some("Apple Inc."),
+        )];
+
+        valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await
+            .unwrap();
+
+        let holding = &holdings[0];
+        assert_monetary_value_approx(
+            holding.cost_basis.as_ref(),
+            dec!(1000.0),
+            dec!(800.0),
+            TOLERANCE,
+            "Cost Basis",
+        );
+        assert_monetary_value_approx(
+            holding.unrealized_gain.as_ref(),
+            dec!(100.0),
+            dec!(80.0),
+            TOLERANCE,
+            "Unrealized Gain",
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_fx_rates_are_cached_per_valuation_request() {
+        let (fx_service, market_data_service, valuation_service) = setup_test_env();
+
+        market_data_service.add_quote_pair(
+            "AAPL",
+            create_quote("2024-01-10", dec!(100.0), "USD"),
+            None,
+        );
+        market_data_service.add_quote_pair(
+            "MSFT",
+            create_quote("2024-01-10", dec!(200.0), "USD"),
+            None,
+        );
+
+        let mut holdings = vec![
+            create_holding(
+                "h_cache_1",
+                HoldingType::Security,
+                "AAPL",
+                dec!(1),
+                "USD",
+                "CAD",
+                Some(dec!(90.0)),
+                Some("Apple Inc."),
+            ),
+            create_holding(
+                "h_cache_2",
+                HoldingType::Security,
+                "MSFT",
+                dec!(1),
+                "USD",
+                "CAD",
+                Some(dec!(180.0)),
+                Some("Microsoft"),
+            ),
+        ];
+
+        valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await
+            .unwrap();
+
+        assert_eq!(fx_service.latest_rate_call_count("USD", "CAD"), 1);
+        assert_eq!(fx_service.latest_rate_call_count("USD", "USD"), 1);
     }
 
     #[tokio::test]

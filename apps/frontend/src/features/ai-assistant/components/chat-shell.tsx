@@ -1,10 +1,10 @@
-import { useState, useMemo } from "react";
-import { Link } from "react-router-dom";
-import { AssistantRuntimeProvider } from "@assistant-ui/react";
+import { useState, useMemo, useEffect } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { AssistantRuntimeProvider, useThreadRuntime } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
 import { Button } from "@wealthfolio/ui/components/ui/button";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
-import { Badge, EmptyPlaceholder } from "@wealthfolio/ui";
+import { EmptyPlaceholder } from "@wealthfolio/ui";
 import {
   Sheet,
   SheetContent,
@@ -21,10 +21,16 @@ import {
   AccountsToolUI,
   ActivitiesToolUI,
   AllocationToolUI,
+  AssetClassificationToolUI,
+  CategorizationProposalsToolUI,
+  CreateCategorizationRuleToolUI,
+  GetAssetTaxonomyAssignmentsToolUI,
   GoalsToolUI,
   HoldingsToolUI,
   ImportCsvToolUI,
   IncomeToolUI,
+  ListAssetTaxonomiesToolUI,
+  ListCategorizationContextToolUI,
   PerformanceToolUI,
   RecordActivityToolUI,
   RecordActivitiesToolUI,
@@ -136,16 +142,6 @@ function Header({
       </ButtonWithTooltip>
       <ProviderPicker />
       <div className="flex-1" />
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Badge variant="warning" className="cursor-default">
-            Beta
-          </Badge>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">
-          This feature is in beta. Results may vary as we continue to improve.
-        </TooltipContent>
-      </Tooltip>
     </header>
   );
 }
@@ -170,6 +166,33 @@ function NoProvidersEmptyState({ className }: { className?: string }) {
       </EmptyPlaceholder>
     </div>
   );
+}
+
+// Tracks history entries whose prompt has already been auto-sent, so a
+// re-render or React strict-mode double-invoke can't resend the same message.
+const consumedPromptKeys = new Set<string>();
+
+/**
+ * Reads an `aiPrompt` passed via navigation state (e.g. from the spending
+ * insights "Ask AI to categorize" action), auto-sends it as a new message,
+ * then clears the state so it isn't resent on refresh or back navigation.
+ * Renders nothing; must live under AssistantRuntimeProvider.
+ */
+function InitialPromptSender() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const threadRuntime = useThreadRuntime();
+
+  useEffect(() => {
+    const prompt = (location.state as { aiPrompt?: string } | null)?.aiPrompt;
+    if (!prompt || consumedPromptKeys.has(location.key)) return;
+    consumedPromptKeys.add(location.key);
+    // Clear navigation state first so a refresh or back nav won't resend.
+    navigate(location.pathname, { replace: true, state: null });
+    threadRuntime.append(prompt);
+  }, [location, navigate, threadRuntime]);
+
+  return null;
 }
 
 /**
@@ -222,6 +245,14 @@ function ChatShellInner({ className }: ChatShellProps) {
         <RecordActivityToolUI />
         <RecordActivitiesToolUI />
         <ImportCsvToolUI />
+        <CreateCategorizationRuleToolUI />
+        <ListAssetTaxonomiesToolUI />
+        <GetAssetTaxonomyAssignmentsToolUI />
+        <AssetClassificationToolUI />
+        <ListCategorizationContextToolUI />
+        <CategorizationProposalsToolUI />
+
+        <InitialPromptSender />
 
         <div className={cn("bg-background flex h-full min-h-0 w-full", className)}>
           {/* Desktop Sidebar */}

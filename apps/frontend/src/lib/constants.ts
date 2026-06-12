@@ -7,7 +7,8 @@ export const DISPLAY_DECIMAL_PRECISION = 2;
 // Wealthfolio Connect Portal URL - centralized configuration
 export const WEALTHFOLIO_CONNECT_PORTAL_URL = "https://connect.wealthfolio.app";
 
-export const PORTFOLIO_ACCOUNT_ID = "TOTAL";
+export const PORTFOLIO_SCOPE_ID = "portfolio:all";
+export const PORTFOLIO_ACCOUNT_TYPE = "PORTFOLIO";
 
 /**
  * Creates a synthetic "All Portfolio" account used as default selection
@@ -15,9 +16,9 @@ export const PORTFOLIO_ACCOUNT_ID = "TOTAL";
  */
 export function createPortfolioAccount(baseCurrency: string) {
   return {
-    id: PORTFOLIO_ACCOUNT_ID,
+    id: PORTFOLIO_SCOPE_ID,
     name: "All Portfolio",
-    accountType: "PORTFOLIO" as never,
+    accountType: PORTFOLIO_ACCOUNT_TYPE as never,
     balance: 0,
     currency: baseCurrency,
     isDefault: false,
@@ -42,14 +43,112 @@ export type HoldingType = (typeof HoldingType)[keyof typeof HoldingType];
 export const AccountType = {
   SECURITIES: "SECURITIES",
   CASH: "CASH",
+  CREDIT_CARD: "CREDIT_CARD",
   CRYPTOCURRENCY: "CRYPTOCURRENCY",
 } as const;
 
 export type AccountType = (typeof AccountType)[keyof typeof AccountType];
 
+export const AccountPurpose = {
+  SPENDING: "spending",
+  PERFORMANCE: "performance",
+  HOLDINGS: "holdings",
+  INCOME: "income",
+  GOAL_FUNDING: "goalFunding",
+  CONTRIBUTION_LIMITS: "contributionLimits",
+  NET_WORTH: "netWorth",
+} as const;
+
+export type AccountPurpose = (typeof AccountPurpose)[keyof typeof AccountPurpose];
+
+export interface AccountCapabilities {
+  spending: boolean;
+  performance: boolean;
+  holdings: boolean;
+  income: boolean;
+  goalFunding: boolean;
+  contributionLimits: boolean;
+  netWorth: boolean;
+  liability: boolean;
+}
+
+const ACCOUNT_PURPOSE_TYPES = {
+  [AccountPurpose.SPENDING]: [AccountType.CASH, AccountType.CREDIT_CARD],
+  [AccountPurpose.PERFORMANCE]: [
+    AccountType.SECURITIES,
+    AccountType.CASH,
+    AccountType.CRYPTOCURRENCY,
+  ],
+  [AccountPurpose.HOLDINGS]: [AccountType.SECURITIES, AccountType.CASH, AccountType.CRYPTOCURRENCY],
+  [AccountPurpose.INCOME]: [AccountType.SECURITIES, AccountType.CASH, AccountType.CRYPTOCURRENCY],
+  [AccountPurpose.GOAL_FUNDING]: [
+    AccountType.SECURITIES,
+    AccountType.CASH,
+    AccountType.CRYPTOCURRENCY,
+  ],
+  [AccountPurpose.CONTRIBUTION_LIMITS]: [
+    AccountType.SECURITIES,
+    AccountType.CASH,
+    AccountType.CRYPTOCURRENCY,
+  ],
+  [AccountPurpose.NET_WORTH]: [
+    AccountType.SECURITIES,
+    AccountType.CASH,
+    AccountType.CREDIT_CARD,
+    AccountType.CRYPTOCURRENCY,
+  ],
+} as const satisfies Record<AccountPurpose, readonly AccountType[]>;
+
+export const REPORT_ACCOUNT_TYPES = ACCOUNT_PURPOSE_TYPES[AccountPurpose.PERFORMANCE];
+
+export type ReportAccountType = (typeof REPORT_ACCOUNT_TYPES)[number];
+
+export function isLiabilityAccountType(accountType: string | undefined): boolean {
+  return accountType === AccountType.CREDIT_CARD;
+}
+
+export function accountPurposeAccountTypes(purpose: AccountPurpose): readonly AccountType[] {
+  return ACCOUNT_PURPOSE_TYPES[purpose];
+}
+
+export function accountSupportsPurpose(
+  accountOrType: { accountType?: string } | string | undefined,
+  purpose: AccountPurpose,
+): boolean {
+  const accountType =
+    typeof accountOrType === "string" ? accountOrType : accountOrType?.accountType;
+  return (ACCOUNT_PURPOSE_TYPES[purpose] as readonly AccountType[]).includes(
+    accountType as AccountType,
+  );
+}
+
+export function accountCapabilities(
+  accountOrType: { accountType?: string } | string | undefined,
+): AccountCapabilities {
+  return {
+    spending: accountSupportsPurpose(accountOrType, AccountPurpose.SPENDING),
+    performance: accountSupportsPurpose(accountOrType, AccountPurpose.PERFORMANCE),
+    holdings: accountSupportsPurpose(accountOrType, AccountPurpose.HOLDINGS),
+    income: accountSupportsPurpose(accountOrType, AccountPurpose.INCOME),
+    goalFunding: accountSupportsPurpose(accountOrType, AccountPurpose.GOAL_FUNDING),
+    contributionLimits: accountSupportsPurpose(accountOrType, AccountPurpose.CONTRIBUTION_LIMITS),
+    netWorth: accountSupportsPurpose(accountOrType, AccountPurpose.NET_WORTH),
+    liability: isLiabilityAccountType(
+      typeof accountOrType === "string" ? accountOrType : accountOrType?.accountType,
+    ),
+  };
+}
+
+export function isReportAccountType(
+  accountType: string | undefined,
+): accountType is ReportAccountType {
+  return accountSupportsPurpose(accountType, AccountPurpose.PERFORMANCE);
+}
+
 export const accountTypeSchema = z.enum([
   AccountType.SECURITIES,
   AccountType.CASH,
+  AccountType.CREDIT_CARD,
   AccountType.CRYPTOCURRENCY,
 ]);
 
@@ -62,6 +161,8 @@ export function defaultGroupForAccountType(accountType: AccountType): string {
       return "Investments";
     case AccountType.CASH:
       return "Cash";
+    case AccountType.CREDIT_CARD:
+      return "Credit Cards";
     case AccountType.CRYPTOCURRENCY:
       return "Crypto";
     default:
@@ -224,20 +325,20 @@ export type ActivityType = (typeof ActivityType)[keyof typeof ActivityType];
 
 // Array of all activity types for iteration
 export const ACTIVITY_TYPES = [
-  "BUY",
-  "SELL",
-  "SPLIT",
-  "DIVIDEND",
-  "INTEREST",
-  "DEPOSIT",
-  "WITHDRAWAL",
-  "TRANSFER_IN",
-  "TRANSFER_OUT",
-  "FEE",
-  "TAX",
-  "CREDIT",
-  "ADJUSTMENT",
-  "UNKNOWN",
+  ActivityType.BUY,
+  ActivityType.SELL,
+  ActivityType.SPLIT,
+  ActivityType.DIVIDEND,
+  ActivityType.INTEREST,
+  ActivityType.DEPOSIT,
+  ActivityType.WITHDRAWAL,
+  ActivityType.TRANSFER_IN,
+  ActivityType.TRANSFER_OUT,
+  ActivityType.FEE,
+  ActivityType.TAX,
+  ActivityType.CREDIT,
+  ActivityType.ADJUSTMENT,
+  ActivityType.UNKNOWN,
 ] as const;
 
 export const TRADING_ACTIVITY_TYPES = [
@@ -306,12 +407,11 @@ export const ActivityStatus = {
 export type ActivityStatus = (typeof ActivityStatus)[keyof typeof ActivityStatus];
 
 // Subtypes that affect calculations (compiler expansion or flow classification)
-// Other subtypes are just labels - the backend accepts any string value
 export const ACTIVITY_SUBTYPES = {
   // DIVIDEND subtypes
   // DRIP: cash dividend → immediately reinvested as BUY of same ticker
   DRIP: "DRIP",
-  // DIVIDEND_IN_KIND: dividend paid in asset (not cash), e.g., spinoff shares
+  // DIVIDEND_IN_KIND: dividend paid as additional units of the same asset
   DIVIDEND_IN_KIND: "DIVIDEND_IN_KIND",
 
   // INTEREST subtypes - STAKING_REWARD expands to INTEREST + BUY
@@ -324,18 +424,23 @@ export const ACTIVITY_SUBTYPES = {
   REBATE: "REBATE",
   // REFUND: internal flow (fee correction/reversal, no net_contribution change)
   REFUND: "REFUND",
+
+  // ADJUSTMENT subtypes
+  // OPTION_EXPIRY: removes option lots with no cash effect
+  OPTION_EXPIRY: "OPTION_EXPIRY",
 } as const;
 
 export type ActivitySubtype = (typeof ACTIVITY_SUBTYPES)[keyof typeof ACTIVITY_SUBTYPES];
 
 // Display names for subtypes
 export const SUBTYPE_DISPLAY_NAMES: Record<string, string> = {
-  DRIP: "Dividend Reinvested (DRIP)",
-  DIVIDEND_IN_KIND: "Dividend in Kind",
-  STAKING_REWARD: "Staking Reward",
-  BONUS: "Bonus",
-  REBATE: "Trading Rebate",
-  REFUND: "Fee Refund",
+  [ACTIVITY_SUBTYPES.DRIP]: "Dividend Reinvested (DRIP)",
+  [ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND]: "Dividend in Kind",
+  [ACTIVITY_SUBTYPES.STAKING_REWARD]: "Staking Reward",
+  [ACTIVITY_SUBTYPES.BONUS]: "Bonus",
+  [ACTIVITY_SUBTYPES.REBATE]: "Trading Rebate",
+  [ACTIVITY_SUBTYPES.REFUND]: "Fee Refund",
+  [ACTIVITY_SUBTYPES.OPTION_EXPIRY]: "Option Expiry",
 };
 
 // Suggested subtypes per activity type
@@ -347,6 +452,7 @@ export const SUBTYPES_BY_ACTIVITY_TYPE: Record<string, string[]> = {
     ACTIVITY_SUBTYPES.REBATE,
     ACTIVITY_SUBTYPES.REFUND,
   ],
+  [ActivityType.ADJUSTMENT]: [ACTIVITY_SUBTYPES.OPTION_EXPIRY],
 };
 
 // Asset kinds for behavior classification
@@ -491,6 +597,7 @@ export const HOLDING_GROUP_DISPLAY_NAMES: Record<string, string> = {
   [AccountType.SECURITIES]: "Investments",
   [AccountType.CRYPTOCURRENCY]: "Investments",
   [AccountType.CASH]: "Cash",
+  [AccountType.CREDIT_CARD]: "Liabilities",
 };
 
 /**
@@ -528,7 +635,7 @@ export const EXCHANGE_DISPLAY_NAMES: Record<string, string> = {
   XTSE: "TSX",
   XTSX: "TSX-V",
   XCNQ: "CSE",
-  XNEO: "Aequitas NEO",
+  XNEO: "Cboe Canada",
 
   // European exchanges
   XLON: "LSE",

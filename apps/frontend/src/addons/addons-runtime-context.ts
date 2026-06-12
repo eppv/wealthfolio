@@ -29,20 +29,14 @@ import {
   updateContributionLimit,
 } from "@/adapters";
 import { openCsvFileDialog, openFileSaveDialog } from "@/adapters";
-import {
-  createGoal,
-  getGoals,
-  getGoalsAllocation,
-  updateGoal,
-  updateGoalsAllocations,
-} from "@/adapters";
+import { createGoal, getGoals, getGoalFunding, saveGoalFunding, updateGoal } from "@/adapters";
 import {
   listenFileDrop as listenImportFileDrop,
   listenFileDropCancelled as listenImportFileDropCancelled,
   listenFileDropHover as listenImportFileDropHover,
 } from "@/adapters";
 import {
-  fetchYahooDividends,
+  fetchDividends,
   getAssetProfile,
   getMarketDataProviders,
   getQuoteHistory,
@@ -224,7 +218,7 @@ export function createAddonContext(addonId: string): AddonContext {
       const baseAPI = createSDKHostAPIBridge(
         {
           // Core data access
-          getHoldings: getHoldings,
+          getHoldings: (accountId: string) => getHoldings({ type: "account", accountId }),
           getActivities: getActivities,
           getAccounts: getAccounts,
 
@@ -243,12 +237,12 @@ export function createAddonContext(addonId: string): AddonContext {
           getGoals,
           createGoal,
           updateGoal,
-          updateGoalsAllocations,
-          getGoalsAllocation,
+          getGoalFunding,
+          saveGoalFunding,
 
           // Market data
           searchTicker,
-          fetchYahooDividends,
+          fetchDividends,
           syncHistoryQuotes,
           getAssetProfile,
           updateAssetProfile,
@@ -261,8 +255,13 @@ export function createAddonContext(addonId: string): AddonContext {
           // Portfolio
           updatePortfolio,
           recalculatePortfolio,
-          getIncomeSummary,
-          getHistoricalValuations,
+          getIncomeSummary: () => getIncomeSummary(undefined),
+          getHistoricalValuations: (accountId?: string, startDate?: string, endDate?: string) =>
+            getHistoricalValuations(
+              accountId ? { type: "account", accountId } : { type: "all" },
+              startDate,
+              endDate,
+            ),
           getLatestValuations,
           calculatePerformanceHistory,
           calculatePerformanceSummary,

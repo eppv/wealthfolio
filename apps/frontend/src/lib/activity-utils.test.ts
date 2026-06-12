@@ -1,11 +1,19 @@
-import { ActivityType } from "./constants";
+import {
+  ACTIVITY_SUBTYPES,
+  ActivityType,
+  InstrumentType,
+  METADATA_CONTRACT_MULTIPLIER,
+} from "./constants";
 import {
   isCashActivity,
   isCashTransfer,
   isIncomeActivity,
   isAssetBackedIncomeActivity,
+  isAssetBackedIncomeSubtype,
+  isAssetIdentityRequired,
   needsImportAssetResolution,
   calculateActivityValue,
+  calculateActivityCashImpact,
   formatSplitRatio,
 } from "./activity-utils";
 import { ActivityDetails } from "./types";
@@ -69,6 +77,29 @@ describe("Activity Utilities", () => {
     });
   });
 
+  describe("isAssetBackedIncomeSubtype", () => {
+    it("identifies calculation subtypes that carry asset quantities", () => {
+      expect(
+        isAssetBackedIncomeSubtype(ActivityType.INTEREST, ACTIVITY_SUBTYPES.STAKING_REWARD),
+      ).toBe(true);
+      expect(isAssetBackedIncomeSubtype(ActivityType.DIVIDEND, ACTIVITY_SUBTYPES.DRIP)).toBe(true);
+      expect(
+        isAssetBackedIncomeSubtype(ActivityType.DIVIDEND, ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND),
+      ).toBe(true);
+      expect(isAssetBackedIncomeSubtype(ActivityType.INTEREST, null)).toBe(false);
+      expect(isAssetBackedIncomeSubtype(ActivityType.DIVIDEND, null)).toBe(false);
+    });
+  });
+
+  describe("isAssetIdentityRequired", () => {
+    it("requires assets for staking rewards even though interest is normally cash-like", () => {
+      expect(isAssetIdentityRequired(ActivityType.INTEREST, ACTIVITY_SUBTYPES.STAKING_REWARD)).toBe(
+        true,
+      );
+      expect(isAssetIdentityRequired(ActivityType.INTEREST, null)).toBe(false);
+    });
+  });
+
   describe("needsImportAssetResolution", () => {
     it("treats staking rewards as asset-backed imports", () => {
       expect(needsImportAssetResolution(ActivityType.INTEREST, "STAKING_REWARD")).toBe(true);
@@ -129,6 +160,33 @@ describe("Activity Utilities", () => {
       expect(calculateActivityValue(activity)).toBe(990);
     });
 
+    it("should apply the contract multiplier for option BUY activities", () => {
+      const activity = createActivity({
+        activityType: ActivityType.BUY,
+        instrumentType: InstrumentType.OPTION,
+        quantity: "2",
+        unitPrice: "3",
+        fee: "1",
+      });
+
+      // (2 * 3 * 100) + 1 = 601
+      expect(calculateActivityValue(activity)).toBe(601);
+    });
+
+    it("should honor a non-default contract multiplier from metadata", () => {
+      const activity = createActivity({
+        activityType: ActivityType.SELL,
+        instrumentType: InstrumentType.OPTION,
+        quantity: "2",
+        unitPrice: "5",
+        fee: "0",
+        metadata: { [METADATA_CONTRACT_MULTIPLIER]: 10 },
+      });
+
+      // (2 * 5 * 10) - 0 = 100
+      expect(calculateActivityValue(activity)).toBe(100);
+    });
+
     it("should calculate DEPOSIT activity value correctly", () => {
       const activity = createActivity({
         activityType: ActivityType.DEPOSIT,
@@ -160,6 +218,36 @@ describe("Activity Utilities", () => {
 
       // 300 - 3 = 297
       expect(calculateActivityValue(activity)).toBe(297);
+    });
+
+    it("should derive staking reward value from quantity and FMV when amount is empty", () => {
+      const activity = createActivity({
+        activityType: ActivityType.INTEREST,
+        subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+        quantity: "0.01",
+        unitPrice: "200",
+        amount: "0",
+        fee: "0",
+        assetSymbol: "SOL",
+        assetId: "SOL",
+      });
+
+      expect(calculateActivityValue(activity)).toBe(2);
+    });
+
+    it("should derive dividend in kind value from quantity and FMV when amount is empty", () => {
+      const activity = createActivity({
+        activityType: ActivityType.DIVIDEND,
+        subtype: ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND,
+        quantity: "2",
+        unitPrice: "50",
+        amount: "0",
+        fee: "0",
+        assetSymbol: "AAPL",
+        assetId: "AAPL",
+      });
+
+      expect(calculateActivityValue(activity)).toBe(100);
     });
 
     it("should calculate WITHDRAWAL activity value correctly", () => {
@@ -209,6 +297,164 @@ describe("Activity Utilities", () => {
       });
 
       expect(calculateActivityValue(transferOut)).toBe(1010);
+    });
+
+    it("treats blank-asset transfers as cash and uses amount", () => {
+      const transferIn = createActivity({
+        activityType: ActivityType.TRANSFER_IN,
+        assetSymbol: "",
+        assetId: "",
+        quantity: "0",
+        unitPrice: "0",
+        amount: "500",
+        fee: "0",
+      });
+
+      expect(calculateActivityValue(transferIn)).toBe(500);
+    });
+
+    it("treats broker cash placeholders ($CASH-EUR, CASH-GBP, CASH_GBP) as cash and uses amount", () => {
+      const placeholders = ["$CASH-EUR", "CASH-GBP", "CASH_GBP", "$CASH_CAD"];
+      for (const symbol of placeholders) {
+        const transferIn = createActivity({
+          activityType: ActivityType.TRANSFER_IN,
+          assetSymbol: symbol,
+          assetId: symbol,
+          quantity: "0",
+          unitPrice: "0",
+          amount: "750",
+          fee: "0",
+        });
+        expect(calculateActivityValue(transferIn)).toBe(750);
+      }
+    });
+
+    it("preserves amount for securities transfers missing unitPrice (legacy imports)", () => {
+      const transferIn = createActivity({
+        activityType: ActivityType.TRANSFER_IN,
+        assetSymbol: "AAPL",
+        assetId: "AAPL",
+        quantity: "10",
+        unitPrice: "0",
+        amount: "1500",
+        fee: "0",
+      });
+
+      expect(calculateActivityValue(transferIn)).toBe(1500);
+    });
+
+    it("should calculate securities transfer value from qty × unitPrice, not amount", () => {
+      // Simulates a real DB row where `amount` is stale/corrupted but
+      // quantity and unitPrice are correct. For securities transfers the
+      // activity value must derive from qty × unitPrice, NOT the amount field.
+      const transferIn = createActivity({
+        activityType: ActivityType.TRANSFER_IN,
+        assetSymbol: "FWIA",
+        quantity: "2078",
+        unitPrice: "7.29",
+        amount: "31478832.36", // bogus value that must be ignored
+        fee: "0",
+      });
+
+      expect(calculateActivityValue(transferIn)).toBeCloseTo(15148.62, 2);
+
+      const transferOut = createActivity({
+        activityType: ActivityType.TRANSFER_OUT,
+        assetSymbol: "AAPL",
+        quantity: "10",
+        unitPrice: "150",
+        amount: "999999", // bogus
+        fee: "5",
+      });
+
+      // Transfer out of securities: qty × price + fee (mirrors SELL-like handling for value display)
+      expect(calculateActivityValue(transferOut)).toBe(1500);
+    });
+
+    it("calculates signed cash impact for trading and cash activities", () => {
+      expect(
+        calculateActivityCashImpact(
+          createActivity({
+            activityType: ActivityType.BUY,
+            quantity: "10",
+            unitPrice: "100",
+            fee: "10",
+          }),
+        ),
+      ).toBe(-1010);
+
+      expect(
+        calculateActivityCashImpact(
+          createActivity({
+            activityType: ActivityType.SELL,
+            quantity: "10",
+            unitPrice: "100",
+            fee: "10",
+          }),
+        ),
+      ).toBe(990);
+
+      expect(
+        calculateActivityCashImpact(
+          createActivity({
+            activityType: ActivityType.DEPOSIT,
+            amount: "500",
+            fee: "0",
+          }),
+        ),
+      ).toBe(500);
+
+      expect(
+        calculateActivityCashImpact(
+          createActivity({
+            activityType: ActivityType.WITHDRAWAL,
+            amount: "100",
+            fee: "5",
+          }),
+        ),
+      ).toBe(-105);
+    });
+
+    it("does not treat securities transfers or asset-backed income as cash impact", () => {
+      expect(
+        calculateActivityCashImpact(
+          createActivity({
+            activityType: ActivityType.TRANSFER_IN,
+            assetSymbol: "AAPL",
+            assetId: "AAPL",
+            quantity: "10",
+            unitPrice: "100",
+            amount: "0",
+            fee: "0",
+          }),
+        ),
+      ).toBe(0);
+
+      expect(
+        calculateActivityCashImpact(
+          createActivity({
+            activityType: ActivityType.DIVIDEND,
+            subtype: ACTIVITY_SUBTYPES.DRIP,
+            quantity: "1",
+            unitPrice: "100",
+            amount: "100",
+            fee: "0",
+          }),
+        ),
+      ).toBe(0);
+
+      expect(
+        calculateActivityCashImpact(
+          createActivity({
+            activityType: ActivityType.DIVIDEND,
+            subtype: null,
+            assetSymbol: "AAPL",
+            assetId: "AAPL",
+            amount: "100",
+            fee: "0",
+          }),
+        ),
+      ).toBe(100);
     });
   });
 

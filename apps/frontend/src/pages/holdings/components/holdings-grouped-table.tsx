@@ -10,17 +10,19 @@ import { AmountDisplay, GainPercent, QuantityDisplay } from "@wealthfolio/ui";
 import { TickerAvatar } from "@/components/ticker-avatar";
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
 import { Holding, HOLDING_GROUP_ORDER } from "@/lib/types";
-import { AccountType, AssetKind } from "@/lib/constants";
+import { AccountType, AssetKind, HoldingType } from "@/lib/constants";
 import { cn, safeDivide } from "@/lib/utils";
 import { useSettingsContext } from "@/lib/settings-provider";
 import { useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 
+type PerformanceMode = "daily" | "pnl" | "return";
+
 interface HoldingsGroupedTableProps {
   holdings: Holding[];
   accountTypeMap: Map<string, string>; // accountId -> accountType
   linkedLiabilities: Map<string, Holding[]>; // assetId -> linked liabilities
-  showTotalReturn: boolean;
+  performanceMode: PerformanceMode;
   showConvertedValues: boolean;
   isLoading: boolean;
 }
@@ -46,7 +48,7 @@ export function HoldingsGroupedTable({
   holdings,
   accountTypeMap,
   linkedLiabilities,
-  showTotalReturn,
+  performanceMode,
   showConvertedValues,
   isLoading,
 }: HoldingsGroupedTableProps) {
@@ -153,7 +155,7 @@ export function HoldingsGroupedTable({
                 <HoldingRow
                   key={holding.id}
                   holding={holding}
-                  showTotalReturn={showTotalReturn}
+                  performanceMode={performanceMode}
                   showConvertedValues={showConvertedValues}
                   isBalanceHidden={isBalanceHidden}
                   navigate={navigate}
@@ -169,7 +171,7 @@ export function HoldingsGroupedTable({
 
 interface HoldingRowProps {
   holding: HoldingWithMeta;
-  showTotalReturn: boolean;
+  performanceMode: PerformanceMode;
   showConvertedValues: boolean;
   isBalanceHidden: boolean;
   navigate: (path: string, options?: { state?: { holding: Holding } }) => void;
@@ -178,13 +180,15 @@ interface HoldingRowProps {
 
 function HoldingRow({
   holding,
-  showTotalReturn,
+  performanceMode,
   showConvertedValues,
   isBalanceHidden,
   navigate,
   isIndented = false,
 }: HoldingRowProps) {
   const symbol = holding.instrument?.symbol ?? holding.id;
+  const avatarSymbol =
+    holding.holdingType === HoldingType.CASH ? `CASH:${holding.localCurrency}` : symbol;
 
   const handleNavigate = () => {
     // Use instrument.id (asset ID) for navigation, not symbol (which may be stripped)
@@ -205,9 +209,24 @@ function HoldingRow({
   // For liabilities, display value as negative
   const displayValue = holding.isLiability ? -Math.abs(marketValue) : marketValue;
 
-  const valueBase = showTotalReturn ? holding.totalGain?.base : holding.dayChange?.base;
-  const gainValue = showConvertedValues ? valueBase : safeDivide(valueBase ?? 0, fxRate);
-  const gainPct = showTotalReturn ? holding.totalGainPct : holding.dayChangePct;
+  const gainValue =
+    performanceMode === "return"
+      ? showConvertedValues
+        ? (holding.totalReturn?.base ?? holding.totalGain?.base ?? 0)
+        : (holding.totalReturn?.local ?? holding.totalGain?.local ?? 0)
+      : performanceMode === "pnl"
+        ? showConvertedValues
+          ? (holding.totalGain?.base ?? 0)
+          : (holding.totalGain?.local ?? 0)
+        : showConvertedValues
+          ? (holding.dayChange?.base ?? 0)
+          : (holding.dayChange?.local ?? 0);
+  const gainPct =
+    performanceMode === "return"
+      ? (holding.totalReturnPct ?? holding.totalGainPct)
+      : performanceMode === "pnl"
+        ? holding.totalGainPct
+        : holding.dayChangePct;
 
   return (
     <>
@@ -221,7 +240,7 @@ function HoldingRow({
       >
         {/* Symbol/Name Column */}
         <div className="flex min-w-0 flex-1 items-center gap-3">
-          <TickerAvatar symbol={symbol} className="h-8 w-8 flex-shrink-0" />
+          <TickerAvatar symbol={avatarSymbol} className="h-8 w-8 flex-shrink-0" />
           <div className="flex min-w-0 flex-1 flex-col">
             <div className="flex items-center gap-2">
               <span className="truncate font-medium">{symbol}</span>
@@ -280,7 +299,7 @@ function HoldingRow({
         <HoldingRow
           key={liability.id}
           holding={{ ...liability, isLiability: true } as HoldingWithMeta}
-          showTotalReturn={showTotalReturn}
+          performanceMode={performanceMode}
           showConvertedValues={showConvertedValues}
           isBalanceHidden={isBalanceHidden}
           navigate={navigate}
@@ -298,6 +317,8 @@ function getGroupName(accountType: string | undefined): string {
       return "Investments";
     case AccountType.CASH:
       return "Cash";
+    case AccountType.CREDIT_CARD:
+      return "Liabilities";
     default:
       return "Investments";
   }

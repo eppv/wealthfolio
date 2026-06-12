@@ -342,6 +342,7 @@ impl MarketDataProvider for MoexProvider {
             supports_historical: true,
             supports_search: true,
             supports_profile: true,
+            supports_dividends: false,
         }
     }
 
@@ -377,7 +378,7 @@ impl MarketDataProvider for MoexProvider {
             ),
         ];
 
-        let mut last_error = None;
+        let last_error = None;
 
         for url in &endpoints {
             let resp = self.make_request(url).await?;

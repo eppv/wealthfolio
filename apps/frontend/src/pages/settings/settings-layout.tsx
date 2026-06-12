@@ -23,7 +23,7 @@ const settingsSections = [
     ],
   },
   {
-    title: "Portfolio",
+    title: "Finance",
     items: [
       {
         title: "Accounts",
@@ -32,10 +32,10 @@ const settingsSections = [
         icon: <Icons.CreditCard className="size-5" />,
       },
       {
-        title: "Goals & Allocations",
-        href: "goals",
-        subtitle: "Targets and allocation rules",
-        icon: <Icons.Goal className="size-5" />,
+        title: "Portfolios",
+        href: "portfolios",
+        subtitle: "Named reporting scopes",
+        icon: <Icons.Folder className="size-5" />,
       },
       {
         title: "Contribution Limits",
@@ -43,12 +43,12 @@ const settingsSections = [
         subtitle: "Limits by year and account",
         icon: <Icons.TrendingUp className="size-5" />,
       },
-      // {
-      //   title: "FIRE Planner",
-      //   href: "fire-planner",
-      //   subtitle: "Retirement planning settings",
-      //   icon: <Icons.Target className="size-5" />,
-      // },
+      {
+        title: "Spending Tracker",
+        href: "spending",
+        subtitle: "Enable + pick spending accounts",
+        icon: <Icons.Wallet className="size-5" />,
+      },
     ],
   },
   {
@@ -125,13 +125,15 @@ export default function SettingsLayout() {
   const location = useLocation();
   const navigate = useNavigate();
 
+  const sections = settingsSections;
+
   // Check if we're on the main settings page (mobile) or a specific setting page
   const isMainSettingsPage =
     location.pathname === "/settings" || location.pathname === "/settings/";
 
   // Mobile-first: show list view on main page, detail view on specific pages
   return (
-    <ApplicationShell className="settings-root app-shell h-screen overflow-x-hidden">
+    <ApplicationShell className="settings-root app-shell h-screen overflow-x-hidden supports-[height:100dvh]:h-dvh">
       {/* Mobile Layout */}
       <div className="w-full lg:hidden">
         {isMainSettingsPage ? (
@@ -142,8 +144,8 @@ export default function SettingsLayout() {
                 <h1 className="text-lg font-semibold">Settings</h1>
               </div>
             </div>
-            <div className="space-y-6 p-3 pb-[calc(var(--mobile-nav-ui-height)+max(var(--mobile-nav-gap),env(safe-area-inset-bottom)))] lg:p-4 lg:pb-4">
-              {settingsSections.map((section) => (
+            <div className="space-y-6 p-3 pb-[var(--mobile-nav-total-offset)] lg:p-4 lg:pb-4">
+              {sections.map((section) => (
                 <div key={section.title} className="space-y-3">
                   <div className="text-muted-foreground px-2 text-xs font-semibold uppercase tracking-widest">
                     {section.title}
@@ -180,7 +182,7 @@ export default function SettingsLayout() {
         ) : (
           <div className="scan-hide-target pt-safe w-full max-w-full overflow-x-hidden">
             <div className="w-full max-w-full overflow-x-hidden scroll-smooth">
-              <div className="p-2 pb-[calc(var(--mobile-nav-ui-height)+max(var(--mobile-nav-gap),env(safe-area-inset-bottom)))] lg:p-4 lg:pb-4">
+              <div className="p-2 pb-[var(--mobile-nav-total-offset)] lg:p-4 lg:pb-4">
                 <Outlet />
               </div>
             </div>
@@ -198,7 +200,7 @@ export default function SettingsLayout() {
           <div className="flex gap-10">
             <aside className="hidden w-[240px] shrink-0 lg:sticky lg:top-24 lg:flex lg:flex-col lg:self-start">
               <div className="space-y-6">
-                {settingsSections.map((section) => (
+                {sections.map((section) => (
                   <div key={section.title} className="space-y-2">
                     <div className="text-muted-foreground pl-2 text-sm font-light uppercase tracking-widest">
                       {section.title}

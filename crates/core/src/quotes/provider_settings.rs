@@ -59,6 +59,7 @@ impl ProviderCapabilities {
                     "Historical".to_string(),
                     "Search".to_string(),
                     "Profiles".to_string(),
+                    "Dividends".to_string(),
                 ],
             }),
             "MARKETDATA_APP" => Some(Self {
@@ -74,6 +75,7 @@ impl ProviderCapabilities {
                     "Historical".to_string(),
                     "Search".to_string(),
                     "Profiles".to_string(),
+                    "Dividends".to_string(),
                 ],
             }),
             "METAL_PRICE_API" => Some(Self {
@@ -89,6 +91,30 @@ impl ProviderCapabilities {
                     "Historical".to_string(),
                     "Search".to_string(),
                     "Profiles".to_string(),
+                    "Dividends".to_string(),
+                ],
+            }),
+            "BOERSE_FRANKFURT" => Some(Self {
+                instruments: "Stocks • ETFs • Bonds".to_string(),
+                coverage: "XETR • XFRA".to_string(),
+                features: vec![
+                    "Real-time".to_string(),
+                    "Historical".to_string(),
+                    "Profiles".to_string(),
+                ],
+            }),
+            "OPENFIGI" => Some(Self {
+                instruments: "Bonds".to_string(),
+                coverage: "Global".to_string(),
+                features: vec!["Search".to_string(), "Profiles".to_string()],
+            }),
+            "US_TREASURY_CALC" => Some(Self {
+                instruments: "US Treasuries".to_string(),
+                coverage: "US Treasury".to_string(),
+                features: vec![
+                    "Real-time".to_string(),
+                    "Historical".to_string(),
+                    "No API key".to_string(),
                 ],
             }),
             "CUSTOM_SCRAPER" => Some(Self {

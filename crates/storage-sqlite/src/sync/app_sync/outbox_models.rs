@@ -5,10 +5,13 @@ use crate::activities::{ActivityDB, ImportAccountTemplateDB, ImportTemplateDB};
 use crate::ai_chat::{AiMessageDB, AiThreadDB, AiThreadTagDB};
 use crate::assets::AssetDB;
 use crate::custom_provider::CustomProviderDB;
-use crate::goals::{GoalDB, GoalsAllocationDB};
+use crate::goals::{GoalDB, GoalPlanDB, GoalsAllocationDB};
 use crate::limits::ContributionLimitDB;
 use crate::market_data::QuoteDB;
+use crate::portfolio::allocation_targets::{AllocationTargetDB, AllocationTargetWeightDB};
 use crate::portfolio::snapshot::AccountStateSnapshotDB;
+use crate::portfolios::{PortfolioAccountDB, PortfolioDB};
+use crate::settings::model::AppSettingDB;
 use crate::sync::import_run::ImportRunDB;
 use crate::sync::platform::PlatformDB;
 use crate::sync::SyncOutboxModel;
@@ -22,6 +25,11 @@ use uuid::Uuid;
 use wealthfolio_core::portfolio::snapshot::SnapshotSource;
 use wealthfolio_core::sync::SyncEntity;
 use wealthfolio_core::sync::SyncOperation;
+use wealthfolio_spending::settings::{SETTING_KEY_ACCOUNT_IDS, SETTING_KEY_ENABLED};
+
+pub(crate) fn is_syncable_spending_setting_key(key: &str) -> bool {
+    matches!(key, SETTING_KEY_ENABLED | SETTING_KEY_ACCOUNT_IDS)
+}
 
 impl SyncOutboxModel for AccountDB {
     const ENTITY: SyncEntity = SyncEntity::Account;
@@ -107,6 +115,14 @@ impl SyncOutboxModel for GoalDB {
 
     fn sync_entity_id(&self) -> &str {
         &self.id
+    }
+}
+
+impl SyncOutboxModel for GoalPlanDB {
+    const ENTITY: SyncEntity = SyncEntity::GoalPlan;
+
+    fn sync_entity_id(&self) -> &str {
+        &self.goal_id
     }
 }
 
@@ -206,5 +222,57 @@ impl SyncOutboxModel for CustomProviderDB {
 
     fn sync_entity_id(&self) -> &str {
         &self.id
+    }
+}
+
+impl SyncOutboxModel for PortfolioDB {
+    const ENTITY: SyncEntity = SyncEntity::Portfolio;
+
+    fn sync_entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl SyncOutboxModel for PortfolioAccountDB {
+    const ENTITY: SyncEntity = SyncEntity::PortfolioAccount;
+
+    fn sync_entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl SyncOutboxModel for AllocationTargetDB {
+    const ENTITY: SyncEntity = SyncEntity::AllocationTarget;
+
+    fn sync_entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl SyncOutboxModel for AllocationTargetWeightDB {
+    const ENTITY: SyncEntity = SyncEntity::AllocationTargetWeight;
+
+    fn sync_entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl SyncOutboxModel for AppSettingDB {
+    const ENTITY: SyncEntity = SyncEntity::SpendingSetting;
+
+    fn sync_entity_id(&self) -> &str {
+        &self.setting_key
+    }
+
+    fn should_sync_outbox(&self, _op: SyncOperation) -> bool {
+        is_syncable_spending_setting_key(&self.setting_key)
+    }
+
+    fn should_sync_outbox_delete(entity_id: &str) -> bool {
+        is_syncable_spending_setting_key(entity_id)
+    }
+
+    fn delete_payload(entity_id: &str) -> serde_json::Value {
+        serde_json::json!({ "setting_key": entity_id })
     }
 }

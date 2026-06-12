@@ -28,10 +28,10 @@ import type {
   IncomeSummary,
   MarketDataProviderInfo,
   NewContributionLimit,
-  PerformanceMetrics,
+  PerformanceResult,
   Quote,
   Settings,
-  SimplePerformanceMetrics,
+  SimplePerformanceResult,
   SnapshotHoldingInput,
   SnapshotImportResult,
   SnapshotInfo,
@@ -207,11 +207,20 @@ export interface ActivitiesAPI {
 }
 
 /**
- * A single dividend event returned by Yahoo Finance.
+ * A cash dividend event returned by a market data provider.
  */
-export interface YahooDividend {
+export interface DividendEvent {
   amount: number;
   date: number; // unix seconds
+}
+
+export interface FetchDividendsOptions {
+  exchangeMic?: string;
+  instrumentType?: string;
+  quoteCcy?: string;
+  providerId?: string;
+  startDate?: string;
+  endDate?: string;
 }
 
 /**
@@ -251,11 +260,14 @@ export interface MarketDataAPI {
   getProviders(): Promise<MarketDataProviderInfo[]>;
 
   /**
-   * Fetch dividend history for a symbol from Yahoo Finance.
+   * Fetch dividend history for a symbol.
    * @param symbol Ticker symbol
    * @returns Promise resolving to array of dividend events
    */
-  fetchDividends(symbol: string): Promise<YahooDividend[]>;
+  fetchDividends(
+    symbol: string,
+    options?: FetchDividendsOptions,
+  ): Promise<DividendEvent[]>;
 }
 
 /**
@@ -320,9 +332,9 @@ export interface PerformanceAPI {
   calculateHistory(
     itemType: 'account' | 'symbol',
     itemId: string,
-    startDate: string,
-    endDate: string,
-  ): Promise<PerformanceMetrics>;
+    startDate?: string,
+    endDate?: string,
+  ): Promise<PerformanceResult>;
 
   /**
    * Calculate performance summary
@@ -334,14 +346,14 @@ export interface PerformanceAPI {
     itemId: string;
     startDate?: string | null;
     endDate?: string | null;
-  }): Promise<PerformanceMetrics>;
+  }): Promise<PerformanceResult>;
 
   /**
    * Calculate simple performance for multiple accounts
    * @param accountIds Array of account identifiers
    * @returns Promise resolving to array of simple performance metrics
    */
-  calculateAccountsSimple(accountIds: string[]): Promise<SimplePerformanceMetrics[]>;
+  calculateAccountsSimple(accountIds: string[]): Promise<SimplePerformanceResult[]>;
 }
 
 /**
@@ -427,17 +439,34 @@ export interface GoalsAPI {
   update(goal: Goal): Promise<Goal>;
 
   /**
-   * Update goal allocations
-   * @param allocations Array of goal allocations
-   * @returns Promise that resolves when update is complete
+   * Get funding rules for a goal
+   * @param goalId Goal ID
+   * @returns Promise resolving to array of funding rules
    */
-  updateAllocations(allocations: GoalAllocation[]): Promise<void>;
+  getFunding(goalId: string): Promise<GoalAllocation[]>;
 
   /**
-   * Get goal allocations
-   * @returns Promise resolving to array of goal allocations
+   * Get funding rules across all goals
+   * @deprecated Use getAll() and getFunding(goalId). This compatibility shim will be removed in a future major version.
+   * @returns Promise resolving to array of funding rules
    */
   getAllocations(): Promise<GoalAllocation[]>;
+
+  /**
+   * Save funding rules for a goal
+   * @param goalId Goal ID
+   * @param rules Array of funding rule inputs
+   * @returns Promise resolving to saved rules
+   */
+  saveFunding(goalId: string, rules: GoalAllocation[]): Promise<GoalAllocation[]>;
+
+  /**
+   * Save funding rules grouped by goalId
+   * @deprecated Use saveFunding(goalId, rules). This compatibility shim will be removed in a future major version.
+   * @param allocations Array of funding rules
+   * @returns Promise resolving when funding rules are saved
+   */
+  updateAllocations(allocations: GoalAllocation[]): Promise<void>;
 }
 
 /**
@@ -461,7 +490,7 @@ export interface SettingsAPI {
    * Create database backup
    * @returns Promise resolving to backup file information
    */
-  backupDatabase(): Promise<{ filename: string; data: Uint8Array }>;
+  backupDatabase(): Promise<{ filename: string }>;
 }
 
 /**

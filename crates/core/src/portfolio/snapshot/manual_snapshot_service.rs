@@ -6,7 +6,7 @@ use log::debug;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::assets::{AssetKind, AssetMetadata, AssetServiceTrait};
+use crate::assets::{AssetKind, AssetMetadata, AssetServiceTrait, InstrumentType, QuoteMode};
 use crate::errors::Result;
 use crate::events::{DomainEvent, DomainEventSink, NoOpDomainEventSink};
 use crate::fx::FxServiceTrait;
@@ -30,6 +30,14 @@ pub struct ManualHoldingInput {
     pub data_source: Option<String>,
     /// Asset kind string (e.g., "INVESTMENT", "OTHER")
     pub asset_kind: Option<String>,
+    /// Quote currency resolved during search/review (e.g., GBp)
+    pub quote_ccy: Option<String>,
+    /// Instrument type resolved during search/review (e.g., EQUITY, CRYPTO)
+    pub instrument_type: Option<String>,
+    /// Market data provider that resolved this holding, if selected.
+    pub provider_id: Option<String>,
+    /// Provider-native symbol/code selected by search/import.
+    pub provider_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +116,14 @@ impl ManualSnapshotService {
                 display_code: Some(holding.symbol.clone()),
                 name: holding.name.clone(),
                 kind,
+                instrument_type: holding
+                    .instrument_type
+                    .as_deref()
+                    .and_then(InstrumentType::from_external_str),
+                requested_quote_ccy: holding.quote_ccy.clone(),
+                provider_config: None,
+                provider_id: holding.provider_id.clone(),
+                provider_symbol: holding.provider_symbol.clone(),
                 ..Default::default()
             };
 
@@ -137,8 +153,13 @@ impl ManualSnapshotService {
                 }
             }
 
-            // Create a quote from the snapshot price as a fallback
-            if !holding.average_cost.is_zero() {
+            // Create a quote from the snapshot price as a fallback.
+            // Only for MANUAL-mode assets: average cost is a cost basis, not a market
+            // price, and writing it for MARKET-mode assets would overwrite provider
+            // quotes for the snapshot date.
+            let is_manual_mode = asset.quote_mode == QuoteMode::Manual
+                || matches!(quote_mode.as_deref(), Some(DATA_SOURCE_MANUAL));
+            if is_manual_mode && !holding.average_cost.is_zero() {
                 let source = DATA_SOURCE_MANUAL.to_string();
                 self.create_quote_from_snapshot(
                     &asset.id,

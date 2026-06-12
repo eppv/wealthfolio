@@ -1,24 +1,37 @@
-use crate::accounts::TrackingMode;
-use crate::constants::{DECIMAL_PRECISION, PORTFOLIO_TOTAL_ACCOUNT_ID};
+use crate::accounts::{account_types, TrackingMode};
+use crate::activities::{Activity, ActivityRepositoryTrait, ActivityType, TransferPairResolution};
+use crate::constants::DECIMAL_PRECISION;
 use crate::errors::{self, Result, ValidationError};
+use crate::fx::FxServiceTrait;
+use crate::lots::{LotDisposal, LotRecord, LotRepositoryTrait};
 use crate::performance::ReturnData;
 use crate::quotes::QuoteServiceTrait;
-use crate::utils::time_utils::{parse_user_timezone_or_default, user_today};
+use crate::utils::time_utils::{activity_date_in_tz, parse_user_timezone_or_default, user_today};
 use crate::valuation::ValuationServiceTrait;
 
 use async_trait::async_trait;
-use chrono::{Duration, NaiveDate};
-use std::collections::HashMap;
+use chrono::{DateTime, Duration, NaiveDate, Utc};
+use num_traits::ToPrimitive;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use log::{debug, warn};
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal::MathematicalOps;
 use rust_decimal_macros::dec;
 
-use super::{PerformanceMetrics, SimplePerformanceMetrics};
-use crate::portfolio::valuation::DailyAccountValuation;
+use super::{
+    is_external_transfer, DataQualityStatus, PerformanceAttribution, PerformanceDataQuality,
+    PerformancePeriod, PerformanceResult, PerformanceReturns, PerformanceRisk,
+    PerformanceScopeDescriptor, PerformanceSummaryProfile, ReturnMethod, SimplePerformanceMetrics,
+};
+use crate::portfolio::valuation::{
+    DailyAccountValuation, ExternalFlowSource as ValuationExternalFlowSource,
+};
 
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait PerformanceServiceTrait: Send + Sync {
     async fn calculate_performance_history(
@@ -28,7 +41,19 @@ pub trait PerformanceServiceTrait: Send + Sync {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
         tracking_mode: Option<TrackingMode>,
-    ) -> Result<PerformanceMetrics>;
+        account_type: Option<&str>,
+    ) -> Result<PerformanceResult>;
+
+    async fn calculate_performance_history_for_accounts(
+        &self,
+        scope_id: &str,
+        account_ids: &[String],
+        base_currency: &str,
+        account_tracking_modes: &HashMap<String, TrackingMode>,
+        account_types: &HashMap<String, String>,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+    ) -> Result<PerformanceResult>;
 
     async fn calculate_performance_summary(
         &self,
@@ -37,9 +62,24 @@ pub trait PerformanceServiceTrait: Send + Sync {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
         tracking_mode: Option<TrackingMode>,
-    ) -> Result<PerformanceMetrics>;
+        account_type: Option<&str>,
+        profile: PerformanceSummaryProfile,
+    ) -> Result<PerformanceResult>;
 
-    /// Calculates simple performance metrics (daily returns, cumulative returns, portfolio weights) for multiple accounts.
+    #[allow(clippy::too_many_arguments)]
+    async fn calculate_performance_summary_for_accounts(
+        &self,
+        scope_id: &str,
+        account_ids: &[String],
+        base_currency: &str,
+        account_tracking_modes: &HashMap<String, TrackingMode>,
+        account_types: &HashMap<String, String>,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+        profile: PerformanceSummaryProfile,
+    ) -> Result<PerformanceResult>;
+
+    /// Calculates lightweight account performance metrics (cumulative returns and portfolio weights) for multiple accounts.
     /// This method efficiently fetches the latest and previous day's valuations in bulk to minimize database queries.
     /// Can be used for a single account by passing a slice with one ID.
     fn calculate_accounts_simple_performance(
@@ -52,11 +92,111 @@ pub struct PerformanceService {
     valuation_service: Arc<dyn ValuationServiceTrait + Send + Sync>,
     quote_service: Arc<dyn QuoteServiceTrait + Send + Sync>,
     timezone: Arc<RwLock<String>>,
+    lot_repository: Option<Arc<dyn LotRepositoryTrait>>,
+    activity_repository: Option<Arc<dyn ActivityRepositoryTrait>>,
+    fx_service: Option<Arc<dyn FxServiceTrait>>,
 }
 
-const TRADING_DAYS_PER_YEAR: u32 = 252;
 const DAYS_PER_YEAR_DECIMAL: Decimal = dec!(365.25);
-const SQRT_TRADING_DAYS_APPROX: Decimal = dec!(15.874507866); // sqrt(252)
+const SQRT_DAYS_PER_YEAR_APPROX: Decimal = dec!(19.111514854); // sqrt(365.25)
+const ATTRIBUTION_RESIDUAL_TOLERANCE_RATE: Decimal = dec!(0.002);
+const ATTRIBUTION_RESIDUAL_LEGACY_WARNING_PREFIX: &str = "Attribution residual ";
+const ATTRIBUTION_INCOMPLETE_WARNING_PREFIX: &str = "Performance attribution is incomplete";
+
+fn parse_decimal_lossy(value: &str) -> Decimal {
+    value.parse::<Decimal>().unwrap_or(Decimal::ZERO)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DailyReturnSample {
+    twr: Decimal,
+    cumulative_twr_to_date: Decimal,
+    excluded_from_compounding: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RiskSample {
+    date: NaiveDate,
+    simple_return: Decimal,
+}
+
+#[derive(Clone, Debug)]
+struct TwrComputation {
+    cumulative_twr: Option<Decimal>,
+    samples: Vec<(NaiveDate, DailyReturnSample)>,
+    warnings: Vec<String>,
+    not_applicable_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct IrrComputation {
+    annualized_irr: Option<Decimal>,
+    warnings: Vec<String>,
+    not_applicable_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DrawdownComputation {
+    max_drawdown: Option<Decimal>,
+    peak_date: Option<NaiveDate>,
+    trough_date: Option<NaiveDate>,
+    recovery_date: Option<NaiveDate>,
+    duration_days: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct ScopedUnrealizedAttribution {
+    unrealized_pnl_change: Decimal,
+    fx_effect: Decimal,
+    warnings: Vec<String>,
+    complete: bool,
+}
+
+struct ScopedPerformanceRequest<'a> {
+    scope_id: &'a str,
+    account_ids: &'a [String],
+    base_currency: &'a str,
+    account_tracking_modes: &'a HashMap<String, TrackingMode>,
+    account_types: &'a HashMap<String, String>,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    include_returns_series: bool,
+    profile: PerformanceSummaryProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopedTrackingComposition {
+    TransactionsOnly,
+    HoldingsOnly,
+    Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum ExternalFlowBasis {
+    AccountCurrency,
+    BaseCurrency,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttributionBaseline {
+    PeriodStart,
+    Inception,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DailyExternalFlow {
+    date: NaiveDate,
+    inflow: Decimal,
+    outflow: Decimal,
+    source: ValuationExternalFlowSource,
+}
+
+impl DailyExternalFlow {
+    fn net(self) -> Decimal {
+        self.inflow - self.outflow
+    }
+}
 
 impl PerformanceService {
     pub fn new(
@@ -79,6 +219,35 @@ impl PerformanceService {
             valuation_service,
             quote_service,
             timezone,
+            lot_repository: None,
+            activity_repository: None,
+            fx_service: None,
+        }
+    }
+
+    pub fn with_lot_repository(mut self, lot_repository: Arc<dyn LotRepositoryTrait>) -> Self {
+        self.lot_repository = Some(lot_repository);
+        self
+    }
+
+    pub fn with_activity_repository(
+        mut self,
+        activity_repository: Arc<dyn ActivityRepositoryTrait>,
+        fx_service: Arc<dyn FxServiceTrait>,
+    ) -> Self {
+        self.activity_repository = Some(activity_repository);
+        self.fx_service = Some(fx_service);
+        self
+    }
+
+    fn empty_risk() -> PerformanceRisk {
+        PerformanceRisk {
+            volatility: None,
+            max_drawdown: None,
+            peak_date: None,
+            trough_date: None,
+            recovery_date: None,
+            drawdown_duration_days: None,
         }
     }
 
@@ -87,64 +256,1564 @@ impl PerformanceService {
         user_today(tz)
     }
 
-    fn get_account_boundary_data(
-        &self,
-        account_id: &str,
-        start_date_opt: Option<NaiveDate>,
-        end_date_opt: Option<NaiveDate>,
-    ) -> Result<(
-        DailyAccountValuation,
-        DailyAccountValuation,
-        NaiveDate,
-        NaiveDate,
-        String,
-    )> {
-        let full_history = self.valuation_service.get_historical_valuations(
-            account_id,
-            start_date_opt,
-            end_date_opt,
-        )?;
+    fn activity_local_date(&self, activity: &Activity) -> NaiveDate {
+        let tz = parse_user_timezone_or_default(&self.timezone.read().unwrap());
+        activity_date_in_tz(activity.activity_date, tz)
+    }
 
-        if full_history.len() < 2 {
-            warn!(
-                "Account '{}': Not enough history data ({} points). Cannot calculate performance.",
-                account_id,
-                full_history.len()
+    fn activity_query_utc_bounds(
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        let start_utc = (start_date - Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc();
+        let end_exclusive_utc = (end_date + Duration::days(2))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc();
+        (start_utc, end_exclusive_utc)
+    }
+
+    fn activity_flow_amount(activity: &Activity) -> Decimal {
+        activity
+            .amount
+            .or_else(|| Some(activity.quantity? * activity.unit_price?))
+            .unwrap_or(Decimal::ZERO)
+            .abs()
+    }
+
+    // =========================================================================
+    // Shared performance math
+    //
+    // These helpers are the single source of truth for the formulas used by
+    // both the "full" and "summary" account-performance paths. Having two
+    // slightly-diverging copies of this math was the root cause of the
+    // dashboard-vs-account-page percentage mismatch — keep them consolidated.
+    // =========================================================================
+
+    fn compute_time_weighted_returns(
+        history: &[DailyAccountValuation],
+        daily_flows: &[DailyExternalFlow],
+        flow_basis: ExternalFlowBasis,
+    ) -> Result<TwrComputation> {
+        let mut cumulative_twr_factor = Decimal::ONE;
+        let mut samples = Vec::new();
+        let warnings = Vec::new();
+        let mut not_applicable_reasons = Vec::new();
+        let mut chain_started = false;
+
+        for (window, flow) in history.windows(2).zip(daily_flows.iter()) {
+            let prev_point = &window[0];
+            let curr_point = &window[1];
+
+            let prev_value = Self::return_total_value(prev_point, flow_basis);
+            let curr_value = Self::return_total_value(curr_point, flow_basis);
+
+            if prev_value.is_sign_negative() || curr_value.is_sign_negative() {
+                return Err(errors::Error::Validation(ValidationError::InvalidInput(
+                    "Account has negative portfolio value in its history. This may be caused by missing buy activities. Please review your transactions on the Activities page.".to_string(),
+                )));
+            }
+
+            let twr_denominator = prev_value + flow.inflow;
+            if !chain_started && (prev_value <= Decimal::ZERO || twr_denominator < Decimal::ONE) {
+                if prev_value > Decimal::ZERO && twr_denominator < Decimal::ONE {
+                    not_applicable_reasons.push(format!(
+                        "TWR unavailable for {}: denominator {} is below 1 base currency unit before the return chain starts.",
+                        curr_point.valuation_date, twr_denominator
+                    ));
+                }
+                let sample = DailyReturnSample {
+                    twr: Decimal::ZERO,
+                    cumulative_twr_to_date: Decimal::ZERO,
+                    excluded_from_compounding: true,
+                };
+                samples.push((curr_point.valuation_date, sample));
+                continue;
+            }
+
+            chain_started = true;
+
+            let excluded_from_compounding = twr_denominator < Decimal::ONE;
+            let twr = if excluded_from_compounding {
+                let reason = format!(
+                    "TWR unavailable for {}: denominator {} is below 1 base currency unit.",
+                    curr_point.valuation_date, twr_denominator
+                );
+                warn!("{}", reason);
+                not_applicable_reasons.push(reason);
+                Decimal::ZERO
+            } else {
+                let numerator = curr_value + flow.outflow - prev_value - flow.inflow;
+                numerator / twr_denominator
+            };
+
+            if !excluded_from_compounding {
+                cumulative_twr_factor *= Decimal::ONE + twr;
+            }
+
+            let sample = DailyReturnSample {
+                twr,
+                cumulative_twr_to_date: cumulative_twr_factor - Decimal::ONE,
+                excluded_from_compounding,
+            };
+            samples.push((curr_point.valuation_date, sample));
+        }
+
+        let cumulative_twr = if !chain_started {
+            not_applicable_reasons.push(
+                "TWR unavailable: no period starts with positive opening value and denominator of at least 1 base currency unit.".to_string(),
             );
-            return Err(errors::Error::Calculation(
-                errors::CalculatorError::Calculation(format!(
-                    "Account '{}': Not enough history data ({} points).",
-                    account_id,
-                    full_history.len()
-                )),
+            None
+        } else if !not_applicable_reasons.is_empty() {
+            None
+        } else {
+            Some(cumulative_twr_factor - Decimal::ONE)
+        };
+
+        Ok(TwrComputation {
+            cumulative_twr,
+            samples,
+            warnings,
+            not_applicable_reasons,
+        })
+    }
+
+    fn daily_external_flows(
+        prev_point: &DailyAccountValuation,
+        curr_point: &DailyAccountValuation,
+        flow_basis: ExternalFlowBasis,
+    ) -> DailyExternalFlow {
+        let date = curr_point.valuation_date;
+        let cash_flow = match flow_basis {
+            ExternalFlowBasis::AccountCurrency => {
+                curr_point.net_contribution - prev_point.net_contribution
+            }
+            ExternalFlowBasis::BaseCurrency => {
+                if curr_point.external_flow_source.is_explicit_gross()
+                    || curr_point.external_flow_source
+                        == ValuationExternalFlowSource::NetContributionFallback
+                {
+                    return DailyExternalFlow {
+                        date,
+                        inflow: curr_point.external_inflow_base,
+                        outflow: curr_point.external_outflow_base,
+                        source: curr_point.external_flow_source,
+                    };
+                }
+
+                if !curr_point.external_inflow_base.is_zero()
+                    || !curr_point.external_outflow_base.is_zero()
+                {
+                    return DailyExternalFlow {
+                        date,
+                        inflow: curr_point.external_inflow_base,
+                        outflow: curr_point.external_outflow_base,
+                        source: ValuationExternalFlowSource::StoredGross,
+                    };
+                }
+
+                curr_point.net_contribution_base - prev_point.net_contribution_base
+            }
+        };
+        let (inflow, outflow) = if cash_flow.is_sign_negative() {
+            (Decimal::ZERO, -cash_flow)
+        } else {
+            (cash_flow, Decimal::ZERO)
+        };
+        DailyExternalFlow {
+            date,
+            inflow,
+            outflow,
+            source: ValuationExternalFlowSource::NetContributionFallback,
+        }
+    }
+
+    fn daily_external_flow_series(
+        history: &[DailyAccountValuation],
+        flow_basis: ExternalFlowBasis,
+    ) -> Vec<DailyExternalFlow> {
+        history
+            .windows(2)
+            .map(|window| Self::daily_external_flows(&window[0], &window[1], flow_basis))
+            .collect()
+    }
+
+    fn external_flow_quality_warnings(daily_flows: &[DailyExternalFlow]) -> Vec<String> {
+        let used_net_fallback = daily_flows
+            .iter()
+            .any(|flow| flow.source == ValuationExternalFlowSource::NetContributionFallback);
+        let used_degraded_gross = daily_flows.iter().any(|flow| {
+            matches!(
+                flow.source,
+                ValuationExternalFlowSource::Unknown | ValuationExternalFlowSource::Mixed
+            )
+        });
+
+        let mut warnings = Vec::new();
+        if used_net_fallback {
+            warnings.push(
+                "External cash flows were inferred from net contribution deltas for part of this period because gross daily flow data was unavailable; same-day deposits and withdrawals may be netted.".to_string(),
+            );
+        }
+        if used_degraded_gross {
+            warnings.push(
+                "External cash flow provenance is incomplete for part of this period; return and attribution results may include degraded flow data.".to_string(),
+            );
+        }
+        warnings
+    }
+
+    fn return_total_value(point: &DailyAccountValuation, flow_basis: ExternalFlowBasis) -> Decimal {
+        match flow_basis {
+            ExternalFlowBasis::AccountCurrency => point.total_value,
+            ExternalFlowBasis::BaseCurrency => point.total_value_base,
+        }
+    }
+
+    fn return_net_contribution(
+        point: &DailyAccountValuation,
+        flow_basis: ExternalFlowBasis,
+    ) -> Decimal {
+        match flow_basis {
+            ExternalFlowBasis::AccountCurrency => point.net_contribution,
+            ExternalFlowBasis::BaseCurrency => point.net_contribution_base,
+        }
+    }
+
+    fn return_investment_market_value(
+        point: &DailyAccountValuation,
+        flow_basis: ExternalFlowBasis,
+    ) -> Decimal {
+        match flow_basis {
+            ExternalFlowBasis::AccountCurrency => point.investment_market_value,
+            ExternalFlowBasis::BaseCurrency => point.investment_market_value_base,
+        }
+    }
+
+    fn return_cost_basis(point: &DailyAccountValuation, flow_basis: ExternalFlowBasis) -> Decimal {
+        match flow_basis {
+            ExternalFlowBasis::AccountCurrency => point.cost_basis,
+            ExternalFlowBasis::BaseCurrency => point.cost_basis_base,
+        }
+    }
+
+    fn is_cash_only_history(history: &[DailyAccountValuation]) -> bool {
+        history.iter().all(|point| {
+            point.investment_market_value.is_zero()
+                && point.investment_market_value_base.is_zero()
+                && point.cost_basis.is_zero()
+                && point.cost_basis_base.is_zero()
+        })
+    }
+
+    fn is_cash_account_type(account_type: Option<&str>) -> bool {
+        matches!(account_type, Some(account_types::CASH))
+    }
+
+    fn all_accounts_are_cash(
+        account_ids: &[String],
+        account_types: &HashMap<String, String>,
+    ) -> bool {
+        !account_ids.is_empty()
+            && account_ids.iter().all(|account_id| {
+                account_types
+                    .get(account_id)
+                    .is_some_and(|account_type| account_type == account_types::CASH)
+            })
+    }
+
+    fn cash_fx_effect_for_window(
+        prev_point: &DailyAccountValuation,
+        curr_point: &DailyAccountValuation,
+        flow_basis: ExternalFlowBasis,
+    ) -> Decimal {
+        if !matches!(flow_basis, ExternalFlowBasis::BaseCurrency) {
+            return Decimal::ZERO;
+        }
+
+        let cash_delta_base = curr_point.cash_balance_base - prev_point.cash_balance_base;
+        let cash_delta_at_current_fx =
+            (curr_point.cash_balance - prev_point.cash_balance) * curr_point.fx_rate_to_base;
+        (cash_delta_base - cash_delta_at_current_fx).round_dp(DECIMAL_PRECISION)
+    }
+
+    fn cash_fx_effect_from_history(
+        history: &[DailyAccountValuation],
+        flow_basis: ExternalFlowBasis,
+    ) -> Decimal {
+        history
+            .windows(2)
+            .map(|window| Self::cash_fx_effect_for_window(&window[0], &window[1], flow_basis))
+            .sum::<Decimal>()
+            .round_dp(DECIMAL_PRECISION)
+    }
+
+    fn cash_only_fx_effect_from_history(
+        history: &[DailyAccountValuation],
+        flow_basis: ExternalFlowBasis,
+        cash_fx_attribution_enabled: bool,
+    ) -> Decimal {
+        if cash_fx_attribution_enabled && Self::is_cash_only_history(history) {
+            Self::cash_fx_effect_from_history(history, flow_basis)
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    fn compute_simple_value_return(
+        full_history: &[DailyAccountValuation],
+        daily_flows: &[DailyExternalFlow],
+        flow_basis: ExternalFlowBasis,
+    ) -> Option<Decimal> {
+        let start_point = full_history.first()?;
+        let end_point = full_history.last()?;
+        let start_value = Self::return_total_value(start_point, flow_basis);
+        if start_value <= Decimal::ZERO {
+            return None;
+        }
+
+        let net_cash_flow: Decimal = daily_flows.iter().map(|flow| flow.net()).sum();
+        let end_value = Self::return_total_value(end_point, flow_basis);
+
+        Some((end_value - start_value - net_cash_flow) / start_value)
+    }
+
+    fn total_external_flows(daily_flows: &[DailyExternalFlow]) -> (Decimal, Decimal) {
+        daily_flows.iter().fold(
+            (Decimal::ZERO, Decimal::ZERO),
+            |(inflows, outflows), flow| (inflows + flow.inflow, outflows + flow.outflow),
+        )
+    }
+
+    fn attribution_baseline(
+        is_holdings_mode: bool,
+        start_date_opt: Option<NaiveDate>,
+    ) -> AttributionBaseline {
+        if !is_holdings_mode && start_date_opt.is_none() {
+            AttributionBaseline::Inception
+        } else {
+            AttributionBaseline::PeriodStart
+        }
+    }
+
+    fn total_external_flows_for_attribution(
+        daily_flows: &[DailyExternalFlow],
+        start_point: &DailyAccountValuation,
+        flow_basis: ExternalFlowBasis,
+        baseline: AttributionBaseline,
+    ) -> (Decimal, Decimal) {
+        let (mut contributions, mut distributions) = Self::total_external_flows(daily_flows);
+
+        if matches!(baseline, AttributionBaseline::Inception) {
+            let opening_net_contribution = Self::return_net_contribution(start_point, flow_basis);
+            if opening_net_contribution.is_sign_negative() {
+                distributions += -opening_net_contribution;
+            } else {
+                contributions += opening_net_contribution;
+            }
+        }
+
+        (contributions, distributions)
+    }
+
+    fn attribution_total_value_delta(
+        start_point: &DailyAccountValuation,
+        end_point: &DailyAccountValuation,
+        flow_basis: ExternalFlowBasis,
+        baseline: AttributionBaseline,
+    ) -> Decimal {
+        let end_value = Self::return_total_value(end_point, flow_basis);
+        if matches!(baseline, AttributionBaseline::Inception) {
+            end_value
+        } else {
+            end_value - Self::return_total_value(start_point, flow_basis)
+        }
+    }
+
+    fn attribution_residual_threshold(delta_total_value: Decimal, end_value: Decimal) -> Decimal {
+        Decimal::ONE.max(
+            delta_total_value
+                .abs()
+                .max(end_value.abs())
+                .max(Decimal::ONE)
+                * ATTRIBUTION_RESIDUAL_TOLERANCE_RATE,
+        )
+    }
+
+    fn is_attribution_residual_warning(warning: &str) -> bool {
+        warning.starts_with(ATTRIBUTION_RESIDUAL_LEGACY_WARNING_PREFIX)
+            || warning.starts_with(ATTRIBUTION_INCOMPLETE_WARNING_PREFIX)
+    }
+
+    fn attribution_residual_warning(residual: Decimal, threshold: Decimal) -> String {
+        format!(
+            "Performance attribution is incomplete for this period. Difference: {}; tolerance: {}. Review Health Center for possible data issues.",
+            residual.round_dp(DECIMAL_PRECISION),
+            threshold.round_dp(DECIMAL_PRECISION)
+        )
+    }
+
+    fn calculate_xirr(
+        history: &[DailyAccountValuation],
+        daily_flows: &[DailyExternalFlow],
+        flow_basis: ExternalFlowBasis,
+    ) -> IrrComputation {
+        if history.len() < 2 {
+            return IrrComputation {
+                annualized_irr: None,
+                warnings: Vec::new(),
+                not_applicable_reasons: vec![
+                    "IRR unavailable: at least two valuation points are required.".to_string(),
+                ],
+            };
+        }
+
+        let start = history.first().expect("len checked");
+        let end = history.last().expect("len checked");
+        let mut cash_flows: Vec<(NaiveDate, f64)> = Vec::new();
+
+        if let Some(start_value) = Self::return_total_value(start, flow_basis).to_f64() {
+            if start_value > 0.0 {
+                cash_flows.push((start.valuation_date, -start_value));
+            }
+        }
+
+        for flow in daily_flows {
+            if let Some(inflow) = flow.inflow.to_f64() {
+                if inflow > 0.0 {
+                    cash_flows.push((flow.date, -inflow));
+                }
+            }
+            if let Some(outflow) = flow.outflow.to_f64() {
+                if outflow > 0.0 {
+                    cash_flows.push((flow.date, outflow));
+                }
+            }
+        }
+
+        if let Some(end_value) = Self::return_total_value(end, flow_basis).to_f64() {
+            if end_value > 0.0 {
+                cash_flows.push((end.valuation_date, end_value));
+            }
+        }
+
+        if cash_flows.len() < 2 {
+            return IrrComputation {
+                annualized_irr: None,
+                warnings: Vec::new(),
+                not_applicable_reasons: vec![
+                    "IRR unavailable: insufficient dated cash flows.".to_string()
+                ],
+            };
+        }
+
+        let has_positive = cash_flows.iter().any(|(_, amount)| *amount > 0.0);
+        let has_negative = cash_flows.iter().any(|(_, amount)| *amount < 0.0);
+        if !has_positive || !has_negative {
+            return IrrComputation {
+                annualized_irr: None,
+                warnings: vec!["IRR unavailable: cash flows do not change sign.".to_string()],
+                not_applicable_reasons: Vec::new(),
+            };
+        }
+
+        let origin = cash_flows[0].0;
+        let npv = |rate: f64| -> Option<f64> {
+            if rate <= -0.999_999_999 {
+                return None;
+            }
+            let base = 1.0 + rate;
+            let mut total = 0.0;
+            for (date, amount) in &cash_flows {
+                let years = (*date - origin).num_days() as f64 / 365.25;
+                total += amount / base.powf(years);
+            }
+            if total.is_finite() {
+                Some(total)
+            } else {
+                None
+            }
+        };
+
+        let mut low = -0.999_999;
+        let mut high = 10.0;
+        let mut npv_low = match npv(low) {
+            Some(value) => value,
+            None => {
+                return IrrComputation {
+                    annualized_irr: None,
+                    warnings: vec![
+                        "IRR unavailable: solver could not evaluate cash flows.".to_string()
+                    ],
+                    not_applicable_reasons: Vec::new(),
+                }
+            }
+        };
+        let mut npv_high = npv(high).unwrap_or(f64::NAN);
+
+        let mut expanded = 0;
+        while npv_low.signum() == npv_high.signum() && expanded < 16 {
+            high *= 2.0;
+            npv_high = npv(high).unwrap_or(f64::NAN);
+            if !npv_high.is_finite() {
+                break;
+            }
+            expanded += 1;
+        }
+
+        if !npv_high.is_finite() || npv_low.signum() == npv_high.signum() {
+            return IrrComputation {
+                annualized_irr: None,
+                warnings: vec!["IRR unavailable: solver did not converge.".to_string()],
+                not_applicable_reasons: Vec::new(),
+            };
+        }
+
+        for _ in 0..128 {
+            let mid = (low + high) / 2.0;
+            let Some(npv_mid) = npv(mid) else {
+                return IrrComputation {
+                    annualized_irr: None,
+                    warnings: vec!["IRR unavailable: solver did not converge.".to_string()],
+                    not_applicable_reasons: Vec::new(),
+                };
+            };
+            if npv_mid.abs() < 1e-7 || (high - low).abs() < 1e-10 {
+                return IrrComputation {
+                    annualized_irr: Decimal::from_f64(mid)
+                        .map(|value| value.round_dp(DECIMAL_PRECISION)),
+                    warnings: Vec::new(),
+                    not_applicable_reasons: Vec::new(),
+                };
+            }
+
+            if npv_low.signum() == npv_mid.signum() {
+                low = mid;
+                npv_low = npv_mid;
+            } else {
+                high = mid;
+            }
+        }
+
+        IrrComputation {
+            annualized_irr: None,
+            warnings: vec!["IRR unavailable: solver did not converge.".to_string()],
+            not_applicable_reasons: Vec::new(),
+        }
+    }
+
+    fn annualize_optional_return(
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        value: Option<Decimal>,
+    ) -> Option<Decimal> {
+        value.map(|return_value| {
+            Self::calculate_annualized_return(start_date, end_date, return_value)
+                .round_dp(DECIMAL_PRECISION)
+        })
+    }
+
+    fn data_quality(
+        warnings: Vec<String>,
+        not_applicable_reasons: Vec<String>,
+        no_data: bool,
+    ) -> PerformanceDataQuality {
+        let status = if no_data {
+            DataQualityStatus::NoData
+        } else if !warnings.is_empty() || !not_applicable_reasons.is_empty() {
+            DataQualityStatus::Partial
+        } else {
+            DataQualityStatus::Ok
+        };
+        PerformanceDataQuality {
+            status,
+            warnings,
+            not_applicable_reasons,
+        }
+    }
+
+    fn refresh_data_quality_status(data_quality: &mut PerformanceDataQuality) {
+        if matches!(
+            data_quality.status,
+            DataQualityStatus::NoData | DataQualityStatus::NotApplicable
+        ) {
+            return;
+        }
+
+        data_quality.status =
+            if data_quality.warnings.is_empty() && data_quality.not_applicable_reasons.is_empty() {
+                DataQualityStatus::Ok
+            } else {
+                DataQualityStatus::Partial
+            };
+    }
+
+    fn risk_from_samples(
+        samples: &[RiskSample],
+        opening_date: Option<NaiveDate>,
+    ) -> PerformanceRisk {
+        let returns: Vec<Decimal> = samples.iter().map(|sample| sample.simple_return).collect();
+        let drawdown = Self::calculate_max_drawdown(samples, opening_date);
+        PerformanceRisk {
+            volatility: Self::calculate_volatility(&returns),
+            max_drawdown: drawdown.max_drawdown,
+            peak_date: drawdown.peak_date,
+            trough_date: drawdown.trough_date,
+            recovery_date: drawdown.recovery_date,
+            drawdown_duration_days: drawdown.duration_days,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_result(
+        id: String,
+        currency: String,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+        mode: ReturnMethod,
+        returns: PerformanceReturns,
+        attribution: PerformanceAttribution,
+        risk: PerformanceRisk,
+        data_quality: PerformanceDataQuality,
+        series: Vec<ReturnData>,
+        is_holdings_mode: bool,
+        is_mixed_tracking_mode: bool,
+    ) -> PerformanceResult {
+        PerformanceResult {
+            scope: PerformanceScopeDescriptor { id, currency },
+            period: PerformancePeriod {
+                start_date,
+                end_date,
+            },
+            mode,
+            returns,
+            attribution,
+            risk,
+            data_quality,
+            series,
+            is_holdings_mode,
+            is_mixed_tracking_mode,
+        }
+    }
+
+    async fn apply_external_attribution_best_effort(
+        &self,
+        result: &mut PerformanceResult,
+        account_ids: &[String],
+        history: &[DailyAccountValuation],
+        baseline: AttributionBaseline,
+    ) {
+        self.apply_activity_attribution_best_effort(result, account_ids, history, baseline)
+            .await;
+        let period_disposals = self
+            .load_period_lot_disposals_best_effort(result, account_ids)
+            .await;
+        self.apply_realized_attribution_best_effort(
+            result,
+            period_disposals.as_deref(),
+            history,
+            baseline,
+        )
+        .await;
+        self.apply_trade_fee_pnl_gross_up_best_effort(
+            result,
+            account_ids,
+            period_disposals.as_deref(),
+            history,
+            baseline,
+        )
+        .await;
+    }
+
+    async fn load_period_lot_disposals_best_effort(
+        &self,
+        result: &PerformanceResult,
+        account_ids: &[String],
+    ) -> Option<Vec<LotDisposal>> {
+        let lot_repository = self.lot_repository.as_ref()?;
+        let start_date = result.period.start_date?;
+        let end_date = result.period.end_date?;
+        if account_ids.is_empty() {
+            return Some(Vec::new());
+        }
+
+        match lot_repository
+            .get_lot_disposals_for_accounts_in_date_range(account_ids, start_date, end_date)
+            .await
+        {
+            Ok(disposals) => Some(disposals),
+            Err(e) => {
+                warn!(
+                    "Failed to load lot disposals for performance attribution scope {}: {}",
+                    result.scope.id, e
+                );
+                None
+            }
+        }
+    }
+
+    async fn apply_scoped_unrealized_attribution_best_effort(
+        &self,
+        result: &mut PerformanceResult,
+        account_ids: &[String],
+        aggregate_history: &[DailyAccountValuation],
+        baseline: AttributionBaseline,
+    ) {
+        let Some(start_date) = result.period.start_date else {
+            return;
+        };
+        let Some(end_date) = result.period.end_date else {
+            return;
+        };
+        if account_ids.is_empty() {
+            return;
+        }
+
+        let histories_by_account = match self
+            .valuation_service
+            .get_historical_valuations_by_account(account_ids, Some(start_date), Some(end_date))
+        {
+            Ok(histories) => histories,
+            Err(e) => {
+                result.data_quality.warnings.push(format!(
+                    "Scoped FX attribution skipped because valuation history failed: {}",
+                    e
+                ));
+                Self::refresh_data_quality_status(&mut result.data_quality);
+                return;
+            }
+        };
+        let account_histories: Vec<Vec<DailyAccountValuation>> = account_ids
+            .iter()
+            .map(|account_id| {
+                histories_by_account
+                    .get(account_id)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        let attribution = Self::scoped_unrealized_attribution_components(
+            &account_histories,
+            start_date,
+            end_date,
+            baseline,
+        );
+        result.data_quality.warnings.extend(attribution.warnings);
+        if !attribution.complete {
+            Self::refresh_data_quality_status(&mut result.data_quality);
+            return;
+        }
+
+        result.attribution.unrealized_pnl_change = attribution.unrealized_pnl_change;
+        result.attribution.fx_effect = attribution.fx_effect;
+        Self::recompute_attribution_residual(
+            result,
+            aggregate_history,
+            ExternalFlowBasis::BaseCurrency,
+            baseline,
+        );
+    }
+
+    async fn apply_scoped_transfer_pair_attribution_best_effort(
+        &self,
+        result: &mut PerformanceResult,
+        account_ids: &[String],
+        history: &[DailyAccountValuation],
+        baseline: AttributionBaseline,
+    ) {
+        let Some(activity_repository) = &self.activity_repository else {
+            return;
+        };
+        let Some(start_date) = result.period.start_date else {
+            return;
+        };
+        let Some(end_date) = result.period.end_date else {
+            return;
+        };
+        if account_ids.is_empty() {
+            return;
+        }
+
+        let (start_utc, end_exclusive_utc) = Self::activity_query_utc_bounds(start_date, end_date);
+        let transfer_activities = match activity_repository
+            .get_transfer_activities_touching_account_ids_in_date_range(
+                account_ids,
+                Some(start_utc),
+                Some(end_exclusive_utc),
+            ) {
+            Ok(activities) => activities,
+            Err(e) => {
+                warn!(
+                    "Failed to load transfer pairs for performance attribution scope {}: {}",
+                    result.scope.id, e
+                );
+                return;
+            }
+        };
+
+        let transfer_resolution = TransferPairResolution::from_activities(&transfer_activities);
+        let scope_account_ids: HashSet<String> = account_ids.iter().cloned().collect();
+        let mut warnings = Vec::new();
+        let mut warned_invalid_groups = HashSet::new();
+        let mut warned_unresolved_activities = HashSet::new();
+
+        for activity in &transfer_activities {
+            if !scope_account_ids.contains(&activity.account_id) {
+                continue;
+            }
+            let activity_date = self.activity_local_date(activity);
+            if activity_date <= start_date || activity_date > end_date {
+                continue;
+            }
+            if transfer_resolution
+                .pair_for_activity(&activity.id)
+                .is_some()
+            {
+                continue;
+            }
+
+            if let Some(group) = transfer_resolution.invalid_group_for_activity(&activity.id) {
+                if warned_invalid_groups.insert(group.group_id.clone()) {
+                    warnings.push(format!(
+                        "Transfer group {} is invalid ({}); affected transfer activity flows were treated as external.",
+                        group.group_id, group.reason
+                    ));
+                }
+            } else if transfer_resolution.is_ungrouped_transfer(&activity.id)
+                && !is_external_transfer(activity)
+                && warned_unresolved_activities.insert(activity.id.clone())
+            {
+                warnings.push(format!(
+                    "Transfer activity {} has no valid linked transfer pair and no external intent; it was treated as external.",
+                    activity.id
+                ));
+            }
+        }
+
+        let mut processed_groups = HashSet::new();
+        let mut transfer_fx_effect = Decimal::ZERO;
+        for pair in transfer_resolution.pairs() {
+            if !pair.both_accounts_in_scope(&scope_account_ids)
+                || !processed_groups.insert(pair.group_id.clone())
+            {
+                continue;
+            }
+
+            let transfer_in_date = self.activity_local_date(&pair.transfer_in);
+            let transfer_out_date = self.activity_local_date(&pair.transfer_out);
+            let touches_period = [
+                (&pair.transfer_in, transfer_in_date),
+                (&pair.transfer_out, transfer_out_date),
+            ]
+            .iter()
+            .any(|(activity, activity_date)| {
+                scope_account_ids.contains(&activity.account_id)
+                    && *activity_date > start_date
+                    && *activity_date <= end_date
+            });
+            if !touches_period {
+                continue;
+            }
+            if pair
+                .transfer_in
+                .currency
+                .eq_ignore_ascii_case(&pair.transfer_out.currency)
+            {
+                continue;
+            }
+
+            let in_base = Self::activity_flow_amount(&pair.transfer_in);
+            let out_base = Self::activity_flow_amount(&pair.transfer_out);
+            if in_base.is_zero() && out_base.is_zero() {
+                continue;
+            }
+
+            let Some(in_base) = self.convert_activity_amount_for_attribution(
+                &pair.transfer_in,
+                in_base,
+                &result.scope.currency,
+                transfer_in_date,
+            ) else {
+                warnings.push(format!(
+                    "Transfer FX attribution skipped for activity {} because FX conversion failed.",
+                    pair.transfer_in.id
+                ));
+                continue;
+            };
+            let Some(out_base) = self.convert_activity_amount_for_attribution(
+                &pair.transfer_out,
+                out_base,
+                &result.scope.currency,
+                transfer_out_date,
+            ) else {
+                warnings.push(format!(
+                    "Transfer FX attribution skipped for activity {} because FX conversion failed.",
+                    pair.transfer_out.id
+                ));
+                continue;
+            };
+
+            transfer_fx_effect += in_base - out_base;
+        }
+
+        let changed = !transfer_fx_effect.is_zero();
+        if changed {
+            result.attribution.fx_effect =
+                (result.attribution.fx_effect + transfer_fx_effect).round_dp(DECIMAL_PRECISION);
+        }
+        if !warnings.is_empty() {
+            result.data_quality.warnings.extend(warnings);
+        }
+        if changed || !result.data_quality.warnings.is_empty() {
+            Self::recompute_attribution_residual(
+                result,
+                history,
+                ExternalFlowBasis::BaseCurrency,
+                baseline,
+            );
+        }
+    }
+
+    async fn apply_activity_attribution_best_effort(
+        &self,
+        result: &mut PerformanceResult,
+        account_ids: &[String],
+        history: &[DailyAccountValuation],
+        baseline: AttributionBaseline,
+    ) {
+        let Some(activity_repository) = &self.activity_repository else {
+            return;
+        };
+        let Some(start_date) = result.period.start_date else {
+            return;
+        };
+        let Some(end_date) = result.period.end_date else {
+            return;
+        };
+        if account_ids.is_empty() {
+            return;
+        }
+
+        let (start_utc, end_utc) = Self::activity_query_utc_bounds(start_date, end_date);
+
+        let activities = match activity_repository.get_activities_by_account_ids_in_date_range(
+            account_ids,
+            start_utc,
+            end_utc,
+        ) {
+            Ok(activities) => activities,
+            Err(e) => {
+                warn!(
+                    "Failed to load activities for performance attribution scope {}: {}",
+                    result.scope.id, e
+                );
+                return;
+            }
+        };
+
+        let mut income = Decimal::ZERO;
+        let mut fees = Decimal::ZERO;
+        let mut taxes = Decimal::ZERO;
+        let mut warnings = Vec::new();
+
+        for activity in activities {
+            if !activity.is_posted() {
+                continue;
+            }
+
+            let activity_date = self.activity_local_date(&activity);
+            if activity_date <= start_date || activity_date > end_date {
+                continue;
+            }
+
+            let Ok(activity_type) = ActivityType::from_str(activity.effective_type()) else {
+                continue;
+            };
+            let (raw_income, raw_fees, raw_taxes) =
+                Self::activity_attribution_components(&activity, &activity_type);
+
+            if !raw_income.is_zero() {
+                match self.convert_activity_amount_for_attribution(
+                    &activity,
+                    raw_income,
+                    &result.scope.currency,
+                    activity_date,
+                ) {
+                    Some(amount) => income += amount,
+                    None => warnings.push(format!(
+                        "Income attribution skipped for activity {} because FX conversion failed.",
+                        activity.id
+                    )),
+                }
+            }
+
+            if !raw_fees.is_zero() {
+                match self.convert_activity_amount_for_attribution(
+                    &activity,
+                    raw_fees,
+                    &result.scope.currency,
+                    activity_date,
+                ) {
+                    Some(amount) => fees += amount,
+                    None => warnings.push(format!(
+                        "Fee attribution skipped for activity {} because FX conversion failed.",
+                        activity.id
+                    )),
+                }
+            }
+
+            if !raw_taxes.is_zero() {
+                match self.convert_activity_amount_for_attribution(
+                    &activity,
+                    raw_taxes,
+                    &result.scope.currency,
+                    activity_date,
+                ) {
+                    Some(amount) => taxes += amount,
+                    None => warnings.push(format!(
+                        "Tax attribution skipped for activity {} because FX conversion failed.",
+                        activity.id
+                    )),
+                }
+            }
+        }
+
+        let changed = !income.is_zero() || !fees.is_zero() || !taxes.is_zero();
+        if changed {
+            result.attribution.income = income.round_dp(DECIMAL_PRECISION);
+            result.attribution.fees = fees.round_dp(DECIMAL_PRECISION);
+            result.attribution.taxes = taxes.round_dp(DECIMAL_PRECISION);
+        }
+        if !warnings.is_empty() {
+            result.data_quality.warnings.extend(warnings);
+        }
+        if changed || !result.data_quality.warnings.is_empty() {
+            Self::recompute_attribution_residual(
+                result,
+                history,
+                ExternalFlowBasis::BaseCurrency,
+                baseline,
+            );
+        }
+    }
+
+    fn activity_attribution_components(
+        activity: &Activity,
+        activity_type: &ActivityType,
+    ) -> (Decimal, Decimal, Decimal) {
+        match activity_type {
+            ActivityType::Dividend | ActivityType::Interest => {
+                (activity.amt(), activity.fee_amt(), Decimal::ZERO)
+            }
+            ActivityType::Fee => (
+                Decimal::ZERO,
+                Self::activity_charge_amount(activity),
+                Decimal::ZERO,
+            ),
+            ActivityType::Buy | ActivityType::Sell => {
+                (Decimal::ZERO, activity.fee_amt(), Decimal::ZERO)
+            }
+            ActivityType::Tax => (
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Self::activity_charge_amount(activity),
+            ),
+            _ => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+        }
+    }
+
+    fn activity_charge_amount(activity: &Activity) -> Decimal {
+        if activity.fee_amt().is_zero() {
+            activity.amt()
+        } else {
+            activity.fee_amt()
+        }
+    }
+
+    fn convert_activity_amount_for_attribution(
+        &self,
+        activity: &Activity,
+        amount: Decimal,
+        target_currency: &str,
+        activity_date: NaiveDate,
+    ) -> Option<Decimal> {
+        if activity.currency == target_currency {
+            return Some(amount);
+        }
+
+        let Some(fx_service) = &self.fx_service else {
+            warn!(
+                "Missing FX service for performance attribution conversion {} -> {} on activity {}",
+                activity.currency, target_currency, activity.id
+            );
+            return None;
+        };
+
+        match fx_service.convert_currency_for_date(
+            amount,
+            &activity.currency,
+            target_currency,
+            activity_date,
+        ) {
+            Ok(converted) => Some(converted),
+            Err(e) => {
+                warn!(
+                    "Failed performance attribution FX conversion for activity {}: {} {} -> {} on {}: {}",
+                    activity.id, amount, activity.currency, target_currency, activity_date, e
+                );
+                None
+            }
+        }
+    }
+
+    fn realized_pnl_base_from_disposal(
+        disposal: &LotDisposal,
+    ) -> std::result::Result<Decimal, String> {
+        let fx_rate_to_base = parse_decimal_lossy(&disposal.fx_rate_to_base);
+        if disposal.currency != disposal.base_currency && fx_rate_to_base <= Decimal::ZERO {
+            return Err(format!(
+                "Realized P&L attribution skipped for disposal {} because FX conversion was unavailable.",
+                disposal.id
             ));
         }
 
-        let start_point: DailyAccountValuation = full_history.first().unwrap().clone();
-        let end_point: DailyAccountValuation = full_history.last().unwrap().clone();
+        let cost_basis = parse_decimal_lossy(&disposal.cost_basis);
+        let cost_basis_base = parse_decimal_lossy(&disposal.cost_basis_base);
+        if disposal.currency != disposal.base_currency
+            && cost_basis > Decimal::ZERO
+            && cost_basis_base <= Decimal::ZERO
+        {
+            return Err(format!(
+                "Realized P&L attribution skipped for disposal {} because acquisition FX conversion was unavailable.",
+                disposal.id
+            ));
+        }
 
-        let actual_start_date = start_point.valuation_date;
-        let actual_end_date = end_point.valuation_date;
-        let currency = start_point.account_currency.clone();
-
-        Ok((
-            start_point,
-            end_point,
-            actual_start_date,
-            actual_end_date,
-            currency,
-        ))
+        Ok(parse_decimal_lossy(&disposal.realized_pnl_base))
     }
 
-    /// Internal function for calculating account performance (Full)
-    /// For HOLDINGS mode accounts, uses SOTA price-based performance calculations
+    async fn apply_realized_attribution_best_effort(
+        &self,
+        result: &mut PerformanceResult,
+        period_disposals: Option<&[LotDisposal]>,
+        history: &[DailyAccountValuation],
+        baseline: AttributionBaseline,
+    ) {
+        let Some(disposals) = period_disposals else {
+            return;
+        };
+
+        let mut realized_pnl_base = Decimal::ZERO;
+        let initial_warning_count = result.data_quality.warnings.len();
+        for disposal in disposals {
+            match Self::realized_pnl_base_from_disposal(disposal) {
+                Ok(amount) => realized_pnl_base += amount,
+                Err(warning) => result.data_quality.warnings.push(warning),
+            }
+        }
+
+        if realized_pnl_base.is_zero() {
+            if result.data_quality.warnings.len() != initial_warning_count {
+                Self::refresh_data_quality_status(&mut result.data_quality);
+            }
+            return;
+        }
+
+        result.attribution.realized_pnl = realized_pnl_base.round_dp(DECIMAL_PRECISION);
+        Self::recompute_attribution_residual(
+            result,
+            history,
+            ExternalFlowBasis::BaseCurrency,
+            baseline,
+        );
+    }
+
+    async fn apply_trade_fee_pnl_gross_up_best_effort(
+        &self,
+        result: &mut PerformanceResult,
+        account_ids: &[String],
+        period_disposals: Option<&[LotDisposal]>,
+        history: &[DailyAccountValuation],
+        baseline: AttributionBaseline,
+    ) {
+        let Some(activity_repository) = &self.activity_repository else {
+            return;
+        };
+        let Some(lot_repository) = &self.lot_repository else {
+            return;
+        };
+        let Some(disposals) = period_disposals else {
+            return;
+        };
+        let Some(start_date) = result.period.start_date else {
+            return;
+        };
+        let Some(end_date) = result.period.end_date else {
+            return;
+        };
+        if account_ids.is_empty() {
+            return;
+        }
+
+        let start_utc = (start_date - Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let end_utc = (end_date + Duration::days(1))
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc();
+
+        let activities = match activity_repository.get_activities_by_account_ids_in_date_range(
+            account_ids,
+            start_utc,
+            end_utc,
+        ) {
+            Ok(activities) => activities,
+            Err(e) => {
+                warn!(
+                    "Failed to load activities for trade-fee performance attribution scope {}: {}",
+                    result.scope.id, e
+                );
+                return;
+            }
+        };
+
+        let mut buy_fee_by_activity = HashMap::<String, Decimal>::new();
+        let mut sell_fee_by_activity = HashMap::<String, Decimal>::new();
+        for activity in activities {
+            if !activity.is_posted() || activity.fee_amt().is_zero() {
+                continue;
+            }
+
+            let activity_date = self.activity_local_date(&activity);
+            if activity_date <= start_date || activity_date > end_date {
+                continue;
+            }
+
+            let Ok(activity_type) = ActivityType::from_str(activity.effective_type()) else {
+                continue;
+            };
+            if !matches!(activity_type, ActivityType::Buy | ActivityType::Sell) {
+                continue;
+            }
+
+            let Some(fee) = self.convert_activity_amount_for_attribution(
+                &activity,
+                activity.fee_amt(),
+                &result.scope.currency,
+                activity_date,
+            ) else {
+                continue;
+            };
+
+            match activity_type {
+                ActivityType::Buy => {
+                    buy_fee_by_activity.insert(activity.id, fee);
+                }
+                ActivityType::Sell => {
+                    sell_fee_by_activity.insert(activity.id, fee);
+                }
+                _ => {}
+            }
+        }
+
+        if buy_fee_by_activity.is_empty() && sell_fee_by_activity.is_empty() {
+            return;
+        }
+
+        let mut lot_by_account_and_id = HashMap::<(String, String), LotRecord>::new();
+        for account_id in account_ids {
+            match lot_repository.get_all_lots_for_account(account_id).await {
+                Ok(lots) => {
+                    for lot in lots {
+                        lot_by_account_and_id.insert((account_id.clone(), lot.id.clone()), lot);
+                    }
+                }
+                Err(e) => warn!(
+                    "Failed to load lots for trade-fee performance attribution account {}: {}",
+                    account_id, e
+                ),
+            }
+        }
+
+        let mut acquisition_fees_disposed = Decimal::ZERO;
+        let mut disposal_activity_ids = HashSet::<String>::new();
+        for disposal in disposals {
+            disposal_activity_ids.insert(disposal.disposal_activity_id.clone());
+
+            let Some(lot) =
+                lot_by_account_and_id.get(&(disposal.account_id.clone(), disposal.lot_id.clone()))
+            else {
+                continue;
+            };
+            let Ok(open_date) = NaiveDate::parse_from_str(&lot.open_date, "%Y-%m-%d") else {
+                continue;
+            };
+            if open_date <= start_date || open_date > end_date {
+                continue;
+            }
+
+            let original_cost_basis_base = parse_decimal_lossy(&lot.original_cost_basis_base);
+            let fee_allocated_base = parse_decimal_lossy(&lot.fee_allocated_base);
+            let disposal_cost_basis_base = parse_decimal_lossy(&disposal.cost_basis_base);
+            if original_cost_basis_base <= Decimal::ZERO || fee_allocated_base.is_zero() {
+                continue;
+            }
+
+            acquisition_fees_disposed +=
+                disposal_cost_basis_base * fee_allocated_base / original_cost_basis_base;
+        }
+
+        let period_buy_fees = buy_fee_by_activity
+            .values()
+            .copied()
+            .sum::<Decimal>()
+            .round_dp(DECIMAL_PRECISION);
+        let period_sell_fees = disposal_activity_ids
+            .iter()
+            .filter_map(|activity_id| sell_fee_by_activity.get(activity_id))
+            .copied()
+            .sum::<Decimal>()
+            .round_dp(DECIMAL_PRECISION);
+        let acquisition_fees_disposed = acquisition_fees_disposed
+            .min(period_buy_fees)
+            .round_dp(DECIMAL_PRECISION);
+        let remaining_period_buy_fees =
+            (period_buy_fees - acquisition_fees_disposed).round_dp(DECIMAL_PRECISION);
+
+        if period_sell_fees.is_zero()
+            && acquisition_fees_disposed.is_zero()
+            && remaining_period_buy_fees.is_zero()
+        {
+            return;
+        }
+
+        result.attribution.realized_pnl =
+            (result.attribution.realized_pnl + period_sell_fees + acquisition_fees_disposed)
+                .round_dp(DECIMAL_PRECISION);
+        result.attribution.unrealized_pnl_change = (result.attribution.unrealized_pnl_change
+            + remaining_period_buy_fees)
+            .round_dp(DECIMAL_PRECISION);
+        Self::recompute_attribution_residual(
+            result,
+            history,
+            ExternalFlowBasis::BaseCurrency,
+            baseline,
+        );
+    }
+
+    fn recompute_attribution_residual(
+        result: &mut PerformanceResult,
+        history: &[DailyAccountValuation],
+        flow_basis: ExternalFlowBasis,
+        baseline: AttributionBaseline,
+    ) {
+        let Some(start_point) = history.first() else {
+            return;
+        };
+        let Some(end_point) = history.last() else {
+            return;
+        };
+
+        let end_value = Self::return_total_value(end_point, flow_basis);
+        let delta_total_value =
+            Self::attribution_total_value_delta(start_point, end_point, flow_basis, baseline);
+        result.attribution.residual = (delta_total_value
+            - (result.attribution.contributions - result.attribution.distributions
+                + result.attribution.income
+                + result.attribution.realized_pnl
+                + result.attribution.unrealized_pnl_change
+                + result.attribution.fx_effect
+                - result.attribution.fees
+                - result.attribution.taxes))
+            .round_dp(DECIMAL_PRECISION);
+
+        result
+            .data_quality
+            .warnings
+            .retain(|warning| !Self::is_attribution_residual_warning(warning));
+        let residual_threshold = Self::attribution_residual_threshold(delta_total_value, end_value);
+        if result.attribution.residual.abs() > residual_threshold {
+            result
+                .data_quality
+                .warnings
+                .push(Self::attribution_residual_warning(
+                    result.attribution.residual.round_dp(DECIMAL_PRECISION),
+                    residual_threshold.round_dp(DECIMAL_PRECISION),
+                ));
+        }
+        Self::refresh_data_quality_status(&mut result.data_quality);
+    }
+
+    /// HOLDINGS-mode period gain and return.
+    ///
+    /// HOLDINGS mode doesn't track cash flows at the transaction level, so
+    /// TWR/IRR aren't meaningful — we measure unrealized P&L growth instead.
+    ///
+    /// * `is_all_time` — when `true`, divides by ending `cost_basis` (the full
+    ///   amount invested). When `false`, divides by `investment_market_value`
+    ///   at the period start. Non-positive denominators make the percentage
+    ///   undefined, so the return is omitted rather than reported as 0%.
+    fn compute_holdings_value_return(
+        start_point: &DailyAccountValuation,
+        end_point: &DailyAccountValuation,
+        is_all_time: bool,
+        flow_basis: ExternalFlowBasis,
+    ) -> (Decimal, Option<Decimal>) {
+        let start_unrealized_pnl = Self::return_investment_market_value(start_point, flow_basis)
+            - Self::return_cost_basis(start_point, flow_basis);
+        let end_unrealized_pnl = Self::return_investment_market_value(end_point, flow_basis)
+            - Self::return_cost_basis(end_point, flow_basis);
+        let pnl_change = end_unrealized_pnl - start_unrealized_pnl;
+
+        let value_return = if is_all_time {
+            let end_cost_basis = Self::return_cost_basis(end_point, flow_basis);
+            if end_cost_basis <= Decimal::ZERO {
+                None
+            } else {
+                Some(end_unrealized_pnl / end_cost_basis)
+            }
+        } else {
+            let start_market_value = Self::return_investment_market_value(start_point, flow_basis);
+            if start_market_value <= Decimal::ZERO {
+                None
+            } else {
+                Some(pnl_change / start_market_value)
+            }
+        };
+
+        (pnl_change, value_return)
+    }
+
+    fn unrealized_attribution_components(
+        start_point: &DailyAccountValuation,
+        end_point: &DailyAccountValuation,
+        flow_basis: ExternalFlowBasis,
+        baseline: AttributionBaseline,
+    ) -> (Decimal, Decimal) {
+        let end_base_unrealized = Self::return_investment_market_value(end_point, flow_basis)
+            - Self::return_cost_basis(end_point, flow_basis);
+        let start_base_unrealized = if matches!(baseline, AttributionBaseline::Inception) {
+            Decimal::ZERO
+        } else {
+            Self::return_investment_market_value(start_point, flow_basis)
+                - Self::return_cost_basis(start_point, flow_basis)
+        };
+        let base_unrealized_change = end_base_unrealized - start_base_unrealized;
+
+        if !matches!(flow_basis, ExternalFlowBasis::BaseCurrency)
+            || start_point.account_currency == start_point.base_currency
+        {
+            return (base_unrealized_change, Decimal::ZERO);
+        }
+
+        let start_local_unrealized = if matches!(baseline, AttributionBaseline::Inception) {
+            Decimal::ZERO
+        } else {
+            start_point.investment_market_value - start_point.cost_basis
+        };
+        let local_unrealized_change =
+            (end_point.investment_market_value - end_point.cost_basis) - start_local_unrealized;
+        let local_change_at_end_fx = local_unrealized_change * end_point.fx_rate_to_base;
+        (
+            local_change_at_end_fx.round_dp(DECIMAL_PRECISION),
+            (base_unrealized_change - local_change_at_end_fx).round_dp(DECIMAL_PRECISION),
+        )
+    }
+
+    fn account_unrealized_local(point: &DailyAccountValuation) -> Decimal {
+        point.investment_market_value - point.cost_basis
+    }
+
+    fn account_unrealized_base(point: &DailyAccountValuation) -> Decimal {
+        point.investment_market_value_base - point.cost_basis_base
+    }
+
+    fn scoped_unrealized_attribution_components(
+        account_histories: &[Vec<DailyAccountValuation>],
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        baseline: AttributionBaseline,
+    ) -> ScopedUnrealizedAttribution {
+        let mut unrealized_pnl_change = Decimal::ZERO;
+        let mut fx_effect = Decimal::ZERO;
+        let mut warnings = Vec::new();
+        let mut saw_account = false;
+        let mut complete = true;
+
+        for history in account_histories {
+            if history.is_empty() {
+                continue;
+            }
+
+            let start_index = if matches!(baseline, AttributionBaseline::Inception) {
+                None
+            } else {
+                history
+                    .iter()
+                    .rposition(|point| point.valuation_date <= start_date)
+            };
+            let start_point = start_index.map(|index| &history[index]);
+            let Some(end_index) = history
+                .iter()
+                .rposition(|point| point.valuation_date <= end_date)
+            else {
+                continue;
+            };
+            let end_point = &history[end_index];
+
+            let end_fx_rate = if end_point.account_currency == end_point.base_currency {
+                Decimal::ONE
+            } else {
+                end_point.fx_rate_to_base
+            };
+            if end_fx_rate <= Decimal::ZERO {
+                complete = false;
+                warnings.push(format!(
+                    "Scoped FX attribution skipped for account {} because its end-date FX rate is unavailable.",
+                    end_point.account_id
+                ));
+                continue;
+            }
+
+            let start_unrealized_local =
+                start_point.map_or(Decimal::ZERO, Self::account_unrealized_local);
+            let start_unrealized_base =
+                start_point.map_or(Decimal::ZERO, Self::account_unrealized_base);
+            let local_unrealized_change =
+                Self::account_unrealized_local(end_point) - start_unrealized_local;
+            let base_unrealized_change =
+                Self::account_unrealized_base(end_point) - start_unrealized_base;
+            let local_change_at_end_fx = local_unrealized_change * end_fx_rate;
+
+            unrealized_pnl_change += local_change_at_end_fx;
+            fx_effect += base_unrealized_change - local_change_at_end_fx;
+            saw_account = true;
+        }
+
+        ScopedUnrealizedAttribution {
+            unrealized_pnl_change: unrealized_pnl_change.round_dp(DECIMAL_PRECISION),
+            fx_effect: fx_effect.round_dp(DECIMAL_PRECISION),
+            warnings,
+            complete: complete && saw_account,
+        }
+    }
+
+    /// Full account performance calculation including per-day `returns[]`,
+    /// volatility, and max-drawdown. Used by the account-detail page.
     async fn calculate_account_performance(
         &self,
         account_id: &str,
         start_date_opt: Option<NaiveDate>,
         end_date_opt: Option<NaiveDate>,
         tracking_mode: Option<TrackingMode>,
-    ) -> Result<PerformanceMetrics> {
+        account_type: Option<&str>,
+    ) -> Result<PerformanceResult> {
         if let (Some(start), Some(end)) = (start_date_opt, end_date_opt) {
             if start > end {
                 return Err(errors::Error::Validation(ValidationError::InvalidInput(
@@ -161,331 +1830,785 @@ impl PerformanceService {
 
         if full_history.len() < 2 {
             warn!("Performance calculation for account '{}': Not enough valuation data ({} points). Returning empty response.", account_id, full_history.len());
-            return Ok(PerformanceService::empty_response(account_id));
+            let currency = full_history
+                .first()
+                .map(|point| point.base_currency.as_str())
+                .unwrap_or("");
+            let start_date = full_history
+                .first()
+                .map(|point| point.valuation_date)
+                .or(start_date_opt);
+            let end_date = full_history
+                .last()
+                .map(|point| point.valuation_date)
+                .or(end_date_opt);
+            return Ok(PerformanceService::empty_response_with_context(
+                account_id,
+                currency,
+                start_date,
+                end_date,
+                "Performance unavailable: at least two valuation points are required.",
+            ));
         }
 
-        let start_point: &DailyAccountValuation = full_history.first().unwrap();
-        let end_point: &DailyAccountValuation = full_history.last().unwrap();
-        let actual_start_date = start_point.valuation_date;
-        let actual_end_date = end_point.valuation_date;
-        let currency = start_point.account_currency.clone();
-
-        let is_holdings_mode = matches!(tracking_mode, Some(TrackingMode::Holdings));
-
-        let capacity = full_history.len();
-        let mut returns = Vec::with_capacity(capacity);
-        let mut daily_twr_returns = Vec::with_capacity(capacity - 1);
-        // Separate list for risk metrics that excludes days with holdings changes
-        // (detected via cost_basis changes, which indicate position additions/removals)
-        let mut daily_returns_for_risk = Vec::with_capacity(capacity - 1);
-
-        returns.push(ReturnData {
-            date: actual_start_date,
-            value: Decimal::ZERO,
-        });
-
-        let one = Decimal::ONE;
-        let two = dec!(2.0);
-        let mut cumulative_twr_value = one;
-        let mut cumulative_mwr_value = one;
-
-        for window in full_history.windows(2) {
-            let prev_point = &window[0];
-            let curr_point = &window[1];
-
-            if prev_point.total_value.is_sign_negative()
-                || curr_point.total_value.is_sign_negative()
-            {
-                return Err(errors::Error::Validation(ValidationError::InvalidInput(
-                    "Account has negative portfolio value in its history. This may be caused by missing buy activities. Please review your transactions on the Activities page.".to_string(),
-                )));
-            }
-
-            let prev_total_value = prev_point.total_value;
-            let prev_net_contribution = prev_point.net_contribution;
-            let current_total_value = curr_point.total_value;
-            let current_net_contribution = curr_point.net_contribution;
-
-            let cash_flow = current_net_contribution - prev_net_contribution;
-
-            let twr_period_return = {
-                let denominator = prev_total_value + cash_flow;
-                if denominator.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    (current_total_value / denominator) - one
-                }
-            };
-
-            let mwr_period_return = {
-                let numerator = current_total_value - prev_total_value - cash_flow;
-                let denominator = prev_total_value + (cash_flow / two);
-                if denominator.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    numerator / denominator
-                }
-            };
-
-            daily_twr_returns.push(twr_period_return);
-
-            // For risk metrics (volatility, max drawdown), filter logic depends on tracking mode:
-            // - TRANSACTIONS mode: TWR already handles cash flows, use all daily returns
-            // - HOLDINGS mode: exclude days with detected holdings/contribution changes
-            //   (since we can't distinguish market returns from contribution-driven changes)
-            let should_exclude = if is_holdings_mode {
-                // Primary detection: cost_basis change indicates position additions/removals
-                let cost_basis_changed = prev_point.cost_basis != curr_point.cost_basis;
-                // Fallback detection: if cost_basis is zero/missing, check net_contribution
-                // changes which indicate deposits/withdrawals
-                let contribution_changed = prev_point.cost_basis.is_zero()
-                    && prev_point.net_contribution != curr_point.net_contribution;
-                cost_basis_changed || contribution_changed
-            } else {
-                // TRANSACTIONS mode: TWR is already cash-flow adjusted, no filtering needed
-                false
-            };
-
-            if !should_exclude {
-                daily_returns_for_risk.push(twr_period_return);
-            }
-
-            cumulative_twr_value *= one + twr_period_return;
-            cumulative_mwr_value *= one + mwr_period_return;
-
-            let cumulative_twr_to_date = cumulative_twr_value - one;
-
-            returns.push(ReturnData {
-                date: curr_point.valuation_date,
-                value: cumulative_twr_to_date.round_dp(DECIMAL_PRECISION),
-            });
-        }
-
-        let cumulative_twr = returns.last().map_or(Decimal::ZERO, |r| r.value);
-        let annualized_twr =
-            Self::calculate_annualized_return(actual_start_date, actual_end_date, cumulative_twr);
-        // Risk metrics use filtered returns:
-        // - TRANSACTIONS mode: all returns (TWR handles cash flows)
-        // - HOLDINGS mode: excludes days with detected holdings/contribution changes
-        let volatility = Self::calculate_volatility(&daily_returns_for_risk);
-        let max_drawdown = Self::calculate_max_drawdown(&daily_returns_for_risk);
-
-        let start_net_contribution = start_point.net_contribution;
-        let end_net_contribution = end_point.net_contribution;
-        let net_cash_flow = end_net_contribution - start_net_contribution;
-
-        let start_value_for_gain_calc = start_point.total_value;
-
-        let gain_loss_amount = end_point.total_value - start_value_for_gain_calc - net_cash_flow;
-
-        let simple_total_return = if start_value_for_gain_calc.is_zero() {
-            if gain_loss_amount.is_zero() {
-                Decimal::ZERO
-            } else {
-                warn!("Simple total return calculation: start_value_for_gain_calc is zero but gain_loss_amount is non-zero for account_id: {}. Returning 0.", account_id);
-                Decimal::ZERO
-            }
-        } else {
-            gain_loss_amount / start_value_for_gain_calc
-        };
-
-        let annualized_simple_return = Self::calculate_annualized_return(
-            actual_start_date,
-            actual_end_date,
-            simple_total_return,
+        let mut metrics = Self::compute_account_performance_with_flow_basis(
+            &full_history,
+            tracking_mode,
+            start_date_opt,
+            true,
+            ExternalFlowBasis::BaseCurrency,
+            PerformanceSummaryProfile::Full,
+            Self::is_cash_account_type(account_type),
+        )?;
+        metrics.scope.id = account_id.to_string();
+        let attribution_baseline = Self::attribution_baseline(
+            matches!(tracking_mode, Some(TrackingMode::Holdings)),
+            start_date_opt,
         );
-
-        let cumulative_mwr = cumulative_mwr_value - one;
-        let annualized_mwr =
-            Self::calculate_annualized_return(actual_start_date, actual_end_date, cumulative_mwr);
-
-        // SOTA calculations for HOLDINGS mode
-        // period_gain = Change in Unrealized P&L (excludes contributions)
-        // period_return = period_gain / start_investment_value (rolling) or unrealized_pnl / cost_basis (ALL time)
-        let (period_gain, period_return) = if is_holdings_mode {
-            // Unrealized P&L = Investment Market Value - Cost Basis
-            let start_unrealized_pnl = start_point.investment_market_value - start_point.cost_basis;
-            let end_unrealized_pnl = end_point.investment_market_value - end_point.cost_basis;
-            let period_gain = end_unrealized_pnl - start_unrealized_pnl;
-
-            // Determine if this is ALL time (no start_date specified) or a rolling period
-            let period_return = if start_date_opt.is_none() {
-                // ALL time: return = unrealized_pnl / cost_basis
-                if end_point.cost_basis.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    end_unrealized_pnl / end_point.cost_basis
-                }
-            } else {
-                // Rolling period: return = period_gain / start_investment_value
-                if start_point.investment_market_value.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    period_gain / start_point.investment_market_value
-                }
-            };
-
-            (period_gain, Some(period_return))
-        } else {
-            // TRANSACTIONS mode: use standard calculations
-            // Return is undefined when starting value is zero (division by zero)
-            let period_return = if start_value_for_gain_calc.is_zero() {
-                None
-            } else {
-                Some(simple_total_return)
-            };
-            (gain_loss_amount, period_return)
-        };
-
-        let result = PerformanceMetrics {
-            id: account_id.to_string(),
-            returns,
-            period_start_date: Some(actual_start_date),
-            period_end_date: Some(actual_end_date),
-            currency,
-            period_gain: period_gain.round_dp(DECIMAL_PRECISION),
-            period_return: period_return.map(|r| r.round_dp(DECIMAL_PRECISION)),
-            // For HOLDINGS mode, TWR/MWR are not meaningful (no cash flow tracking)
-            cumulative_twr: if is_holdings_mode {
-                None
-            } else {
-                Some(cumulative_twr.round_dp(DECIMAL_PRECISION))
-            },
-            gain_loss_amount: Some(gain_loss_amount.round_dp(DECIMAL_PRECISION)),
-            annualized_twr: if is_holdings_mode {
-                None
-            } else {
-                Some(annualized_twr.round_dp(DECIMAL_PRECISION))
-            },
-            simple_return: simple_total_return.round_dp(DECIMAL_PRECISION),
-            annualized_simple_return: annualized_simple_return.round_dp(DECIMAL_PRECISION),
-            cumulative_mwr: if is_holdings_mode {
-                None
-            } else {
-                Some(cumulative_mwr.round_dp(DECIMAL_PRECISION))
-            },
-            annualized_mwr: if is_holdings_mode {
-                None
-            } else {
-                Some(annualized_mwr.round_dp(DECIMAL_PRECISION))
-            },
-            volatility: volatility.round_dp(DECIMAL_PRECISION),
-            max_drawdown: max_drawdown.round_dp(DECIMAL_PRECISION),
-            is_holdings_mode,
-        };
-
-        Ok(result)
+        self.apply_external_attribution_best_effort(
+            &mut metrics,
+            &[account_id.to_string()],
+            &full_history,
+            attribution_baseline,
+        )
+        .await;
+        Ok(metrics)
     }
 
-    /// Internal function for calculating account performance (Summary)
-    /// For HOLDINGS mode accounts, uses SOTA price-based performance calculations
+    /// Summary account performance calculation. `Full` keeps the rich scalar
+    /// metrics; `Headline` keeps dashboard-visible return/P&L fields only.
     async fn calculate_account_performance_summary(
         &self,
         account_id: &str,
         start_date_opt: Option<NaiveDate>,
         end_date_opt: Option<NaiveDate>,
         tracking_mode: Option<TrackingMode>,
-    ) -> Result<PerformanceMetrics> {
-        let (start_point, end_point, actual_start_date, actual_end_date, currency): (
-            DailyAccountValuation,
-            DailyAccountValuation,
-            NaiveDate,
-            NaiveDate,
-            String,
-        ) = self.get_account_boundary_data(account_id, start_date_opt, end_date_opt)?;
+        account_type: Option<&str>,
+        profile: PerformanceSummaryProfile,
+    ) -> Result<PerformanceResult> {
+        if let (Some(start), Some(end)) = (start_date_opt, end_date_opt) {
+            if start > end {
+                return Err(errors::Error::Validation(ValidationError::InvalidInput(
+                    "Start date must be before end date".to_string(),
+                )));
+            }
+        }
 
-        let is_holdings_mode = matches!(tracking_mode, Some(TrackingMode::Holdings));
+        let full_history = self.valuation_service.get_historical_valuations(
+            account_id,
+            start_date_opt,
+            end_date_opt,
+        )?;
 
-        let start_value = start_point.total_value;
-        let end_value = end_point.total_value;
-        let start_net_contribution = start_point.net_contribution;
-        let end_net_contribution = end_point.net_contribution;
-        let net_cash_flow = end_net_contribution - start_net_contribution;
+        if full_history.len() < 2 {
+            warn!(
+                "Account '{}': Not enough history data ({} points). Returning empty performance response.",
+                account_id,
+                full_history.len()
+            );
+            let currency = full_history
+                .first()
+                .map(|point| point.base_currency.as_str())
+                .unwrap_or("");
+            let start_date = full_history
+                .first()
+                .map(|point| point.valuation_date)
+                .or(start_date_opt);
+            let end_date = full_history
+                .last()
+                .map(|point| point.valuation_date)
+                .or(end_date_opt);
+            return Ok(PerformanceService::empty_response_with_context(
+                account_id,
+                currency,
+                start_date,
+                end_date,
+                "Performance unavailable: at least two valuation points are required.",
+            ));
+        }
 
-        let gain_loss_amount = end_value - start_value - net_cash_flow;
-
-        let simple_total_return = if start_value <= Decimal::ZERO {
-            Decimal::ZERO
-        } else {
-            (end_value - start_value - net_cash_flow) / start_value
-        };
-
-        let annualized_simple_return = Self::calculate_annualized_return(
-            actual_start_date,
-            actual_end_date,
-            simple_total_return,
+        let mut metrics = Self::compute_account_performance_with_flow_basis(
+            &full_history,
+            tracking_mode,
+            start_date_opt,
+            false,
+            ExternalFlowBasis::BaseCurrency,
+            profile,
+            Self::is_cash_account_type(account_type),
+        )?;
+        metrics.scope.id = account_id.to_string();
+        let attribution_baseline = Self::attribution_baseline(
+            matches!(tracking_mode, Some(TrackingMode::Holdings)),
+            start_date_opt,
         );
+        self.apply_external_attribution_best_effort(
+            &mut metrics,
+            &[account_id.to_string()],
+            &full_history,
+            attribution_baseline,
+        )
+        .await;
+        Ok(metrics)
+    }
 
-        // SOTA calculations for HOLDINGS mode
-        let (period_gain, period_return) = if is_holdings_mode {
-            let start_unrealized_pnl = start_point.investment_market_value - start_point.cost_basis;
-            let end_unrealized_pnl = end_point.investment_market_value - end_point.cost_basis;
-            let period_gain = end_unrealized_pnl - start_unrealized_pnl;
+    async fn calculate_scoped_performance(
+        &self,
+        request: ScopedPerformanceRequest<'_>,
+    ) -> Result<PerformanceResult> {
+        let ScopedPerformanceRequest {
+            scope_id,
+            account_ids,
+            base_currency,
+            account_tracking_modes,
+            account_types,
+            start_date: start_date_opt,
+            end_date: end_date_opt,
+            include_returns_series,
+            profile,
+        } = request;
 
-            let period_return = if start_date_opt.is_none() {
-                // ALL time: return = unrealized_pnl / cost_basis
-                if end_point.cost_basis.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    end_unrealized_pnl / end_point.cost_basis
-                }
-            } else {
-                // Rolling period: return = period_gain / start_investment_value
-                if start_point.investment_market_value.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    period_gain / start_point.investment_market_value
-                }
-            };
+        if let (Some(start), Some(end)) = (start_date_opt, end_date_opt) {
+            if start > end {
+                return Err(errors::Error::Validation(ValidationError::InvalidInput(
+                    "Start date must be before end date".to_string(),
+                )));
+            }
+        }
 
-            (period_gain, Some(period_return))
+        if account_ids.is_empty() {
+            return Ok(PerformanceService::empty_response_with_context(
+                scope_id,
+                base_currency,
+                start_date_opt,
+                end_date_opt,
+                "Performance unavailable: no accounts selected.",
+            ));
+        }
+        let scoped_tracking_composition =
+            Self::scoped_tracking_composition(account_ids, account_tracking_modes);
+
+        let full_history = match self
+            .valuation_service
+            .get_historical_valuations_for_accounts(
+                scope_id,
+                account_ids,
+                base_currency,
+                start_date_opt,
+                end_date_opt,
+            ) {
+            Ok(history) => history,
+            Err(errors::Error::Calculation(error)) => {
+                let warning = format!(
+                    "Performance is partially unavailable for this scope because valuation history is incomplete: {}",
+                    error
+                );
+                warn!("{}", warning);
+                return Ok(PerformanceService::partial_response(
+                    scope_id,
+                    base_currency,
+                    start_date_opt,
+                    end_date_opt,
+                    warning,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if full_history.len() < 2 {
+            let start_date = full_history
+                .first()
+                .map(|point| point.valuation_date)
+                .or(start_date_opt);
+            let end_date = full_history
+                .last()
+                .map(|point| point.valuation_date)
+                .or(end_date_opt);
+            return Ok(PerformanceService::empty_response_with_context(
+                scope_id,
+                base_currency,
+                start_date,
+                end_date,
+                "Performance unavailable: at least two valuation points are required.",
+            ));
+        }
+
+        let mut metrics = match scoped_tracking_composition {
+            ScopedTrackingComposition::TransactionsOnly => {
+                let cash_fx_attribution_enabled =
+                    Self::all_accounts_are_cash(account_ids, account_types);
+                Self::compute_scoped_account_performance(
+                    &full_history,
+                    Some(TrackingMode::Transactions),
+                    start_date_opt,
+                    include_returns_series,
+                    profile,
+                    cash_fx_attribution_enabled,
+                )?
+            }
+            ScopedTrackingComposition::HoldingsOnly => {
+                let cash_fx_attribution_enabled =
+                    Self::all_accounts_are_cash(account_ids, account_types);
+                Self::compute_scoped_account_performance(
+                    &full_history,
+                    Some(TrackingMode::Holdings),
+                    start_date_opt,
+                    include_returns_series,
+                    profile,
+                    cash_fx_attribution_enabled,
+                )?
+            }
+            ScopedTrackingComposition::Mixed => Self::compute_mixed_scope_performance_with_profile(
+                &full_history,
+                include_returns_series,
+                profile,
+            )?,
+        };
+
+        metrics.scope.id = scope_id.to_string();
+        // Mixed scopes keep period-start attribution because their holdings-mode
+        // portion is inherently period-based.
+        let attribution_baseline = if scoped_tracking_composition
+            == ScopedTrackingComposition::TransactionsOnly
+            && start_date_opt.is_none()
+        {
+            AttributionBaseline::Inception
         } else {
-            // Return is undefined when starting value is non-positive (division by zero or sign inversion)
-            let period_return = if start_value <= Decimal::ZERO {
-                None
+            AttributionBaseline::PeriodStart
+        };
+        self.apply_scoped_unrealized_attribution_best_effort(
+            &mut metrics,
+            account_ids,
+            &full_history,
+            attribution_baseline,
+        )
+        .await;
+        self.apply_scoped_transfer_pair_attribution_best_effort(
+            &mut metrics,
+            account_ids,
+            &full_history,
+            attribution_baseline,
+        )
+        .await;
+        self.apply_external_attribution_best_effort(
+            &mut metrics,
+            account_ids,
+            &full_history,
+            attribution_baseline,
+        )
+        .await;
+        Ok(metrics)
+    }
+
+    fn scoped_tracking_composition(
+        account_ids: &[String],
+        account_tracking_modes: &HashMap<String, TrackingMode>,
+    ) -> ScopedTrackingComposition {
+        let mut has_holdings = false;
+        let mut has_transactions = false;
+
+        for account_id in account_ids {
+            if matches!(
+                account_tracking_modes.get(account_id),
+                Some(TrackingMode::Holdings)
+            ) {
+                has_holdings = true;
             } else {
-                Some(simple_total_return)
+                has_transactions = true;
+            }
+        }
+
+        match (has_transactions, has_holdings) {
+            (true, true) => ScopedTrackingComposition::Mixed,
+            (false, true) => ScopedTrackingComposition::HoldingsOnly,
+            _ => ScopedTrackingComposition::TransactionsOnly,
+        }
+    }
+
+    /// Pure computation shared by the full and summary paths. Takes a
+    /// pre-fetched valuation history and produces the same `PerformanceResult`
+    /// both call sites need.
+    ///
+    /// * `include_returns_series` — when `true`, populates `returns[]` with a
+    ///   per-day cumulative TWR.
+    ///
+    /// `id` is left empty — callers set it after.
+    ///
+    /// # Precondition
+    /// `full_history.len() >= 2`. Callers check this first so they can respond
+    /// differently to insufficient history (empty response vs. error).
+    #[cfg(test)]
+    fn compute_account_performance(
+        full_history: &[DailyAccountValuation],
+        tracking_mode: Option<TrackingMode>,
+        start_date_opt: Option<NaiveDate>,
+        include_returns_series: bool,
+    ) -> Result<PerformanceResult> {
+        Self::compute_account_performance_with_flow_basis(
+            full_history,
+            tracking_mode,
+            start_date_opt,
+            include_returns_series,
+            ExternalFlowBasis::BaseCurrency,
+            PerformanceSummaryProfile::Full,
+            false,
+        )
+    }
+
+    fn compute_scoped_account_performance(
+        full_history: &[DailyAccountValuation],
+        tracking_mode: Option<TrackingMode>,
+        start_date_opt: Option<NaiveDate>,
+        include_returns_series: bool,
+        profile: PerformanceSummaryProfile,
+        cash_fx_attribution_enabled: bool,
+    ) -> Result<PerformanceResult> {
+        Self::compute_account_performance_with_flow_basis(
+            full_history,
+            tracking_mode,
+            start_date_opt,
+            include_returns_series,
+            ExternalFlowBasis::BaseCurrency,
+            profile,
+            cash_fx_attribution_enabled,
+        )
+    }
+
+    fn compute_account_performance_with_flow_basis(
+        full_history: &[DailyAccountValuation],
+        tracking_mode: Option<TrackingMode>,
+        start_date_opt: Option<NaiveDate>,
+        include_returns_series: bool,
+        flow_basis: ExternalFlowBasis,
+        profile: PerformanceSummaryProfile,
+        cash_fx_attribution_enabled: bool,
+    ) -> Result<PerformanceResult> {
+        debug_assert!(full_history.len() >= 2);
+
+        let start_point = full_history.first().unwrap();
+        let end_point = full_history.last().unwrap();
+        let actual_start_date = start_point.valuation_date;
+        let actual_end_date = end_point.valuation_date;
+        let currency = match flow_basis {
+            ExternalFlowBasis::AccountCurrency => start_point.account_currency.clone(),
+            ExternalFlowBasis::BaseCurrency => start_point.base_currency.clone(),
+        };
+        let is_holdings_mode = matches!(tracking_mode, Some(TrackingMode::Holdings));
+        let attribution_baseline = Self::attribution_baseline(is_holdings_mode, start_date_opt);
+        let include_irr = profile == PerformanceSummaryProfile::Full;
+        let include_risk = profile == PerformanceSummaryProfile::Full;
+        let include_annualized_returns = profile == PerformanceSummaryProfile::Full;
+
+        let end_value = Self::return_total_value(end_point, flow_basis);
+        let daily_flows = Self::daily_external_flow_series(full_history, flow_basis);
+
+        let twr = if is_holdings_mode {
+            TwrComputation {
+                cumulative_twr: None,
+                samples: Vec::new(),
+                warnings: Vec::new(),
+                not_applicable_reasons: vec![
+                    "TWR unavailable for holdings-only scopes because transaction cash flows are not tracked.".to_string(),
+                ],
+            }
+        } else {
+            Self::compute_time_weighted_returns(full_history, &daily_flows, flow_basis)?
+        };
+        let irr = if is_holdings_mode && include_irr {
+            IrrComputation {
+                annualized_irr: None,
+                warnings: Vec::new(),
+                not_applicable_reasons: vec![
+                    "IRR unavailable for holdings-only scopes because transaction cash flows are not tracked.".to_string(),
+                ],
+            }
+        } else if include_irr {
+            Self::calculate_xirr(full_history, &daily_flows, flow_basis)
+        } else {
+            IrrComputation {
+                annualized_irr: None,
+                warnings: Vec::new(),
+                not_applicable_reasons: Vec::new(),
+            }
+        };
+
+        let mut risk_samples = Vec::new();
+        let mut series = Vec::new();
+        if include_returns_series {
+            series.push(ReturnData {
+                date: actual_start_date,
+                value: Decimal::ZERO,
+            });
+        }
+
+        if is_holdings_mode && (include_risk || include_returns_series) {
+            let mut cumulative_value_factor = Decimal::ONE;
+            for (index, window) in full_history.windows(2).enumerate() {
+                let prev = &window[0];
+                let curr = &window[1];
+                let prev_value = Self::return_total_value(prev, flow_basis);
+                let curr_value = Self::return_total_value(curr, flow_basis);
+                let flow = daily_flows[index];
+                let day_gain = curr_value + flow.outflow - prev_value - flow.inflow;
+                if prev_value > Decimal::ZERO {
+                    let daily_return = day_gain / prev_value;
+                    cumulative_value_factor *= Decimal::ONE + daily_return;
+                    if include_risk {
+                        risk_samples.push(RiskSample {
+                            date: curr.valuation_date,
+                            simple_return: daily_return,
+                        });
+                    }
+                    if include_returns_series {
+                        series.push(ReturnData {
+                            date: curr.valuation_date,
+                            value: (cumulative_value_factor - Decimal::ONE)
+                                .round_dp(DECIMAL_PRECISION),
+                        });
+                    }
+                } else if include_returns_series {
+                    series.push(ReturnData {
+                        date: curr.valuation_date,
+                        value: Decimal::ZERO,
+                    });
+                }
+            }
+        } else if !is_holdings_mode {
+            for (date, sample) in &twr.samples {
+                if include_risk && !sample.excluded_from_compounding {
+                    risk_samples.push(RiskSample {
+                        date: *date,
+                        simple_return: sample.twr,
+                    });
+                }
+                if include_returns_series {
+                    series.push(ReturnData {
+                        date: *date,
+                        value: sample.cumulative_twr_to_date.round_dp(DECIMAL_PRECISION),
+                    });
+                }
+            }
+        }
+
+        let risk = if include_risk {
+            Self::risk_from_samples(&risk_samples, Some(actual_start_date))
+        } else {
+            Self::empty_risk()
+        };
+
+        let (mode, value_return, value_return_not_applicable_reason) = if is_holdings_mode {
+            let (_pnl_change, ret) = Self::compute_holdings_value_return(
+                start_point,
+                end_point,
+                start_date_opt.is_none(),
+                flow_basis,
+            );
+            let reason = if ret.is_none() {
+                Some(if start_date_opt.is_none() {
+                    "Value return unavailable for holdings-only scope because ending cost basis is zero or negative."
+                        .to_string()
+                } else {
+                    "Value return unavailable for holdings-only scope because starting market value is zero or negative."
+                        .to_string()
+                })
+            } else {
+                None
             };
-            (gain_loss_amount, period_return)
+            (ReturnMethod::ValueReturn, ret, reason)
+        } else {
+            let value_return =
+                Self::compute_simple_value_return(full_history, &daily_flows, flow_basis);
+            let reason = if value_return.is_none() {
+                Some(
+                    "Value return unavailable for transaction-mode scope because starting value is zero or negative."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            (ReturnMethod::TimeWeighted, value_return, reason)
         };
 
-        let result = PerformanceMetrics {
-            id: account_id.to_string(),
-            returns: Vec::new(),
-            period_start_date: Some(actual_start_date),
-            period_end_date: Some(actual_end_date),
+        let (contributions, distributions) = Self::total_external_flows_for_attribution(
+            &daily_flows,
+            start_point,
+            flow_basis,
+            attribution_baseline,
+        );
+        let (unrealized_pnl_change, investment_fx_effect) = Self::unrealized_attribution_components(
+            start_point,
+            end_point,
+            flow_basis,
+            attribution_baseline,
+        );
+        let fx_effect = (investment_fx_effect
+            + Self::cash_only_fx_effect_from_history(
+                full_history,
+                flow_basis,
+                cash_fx_attribution_enabled,
+            ))
+        .round_dp(DECIMAL_PRECISION);
+        let delta_total_value = Self::attribution_total_value_delta(
+            start_point,
+            end_point,
+            flow_basis,
+            attribution_baseline,
+        );
+        let mut attribution = PerformanceAttribution {
+            contributions,
+            distributions,
+            unrealized_pnl_change,
+            fx_effect,
+            ..PerformanceAttribution::default()
+        };
+        attribution.residual = delta_total_value
+            - (attribution.contributions - attribution.distributions
+                + attribution.income
+                + attribution.realized_pnl
+                + attribution.unrealized_pnl_change
+                + attribution.fx_effect
+                - attribution.fees
+                - attribution.taxes);
+
+        let mut warnings = Self::external_flow_quality_warnings(&daily_flows);
+        warnings.extend(twr.warnings);
+        warnings.extend(irr.warnings);
+        let residual_threshold = Self::attribution_residual_threshold(delta_total_value, end_value);
+        if attribution.residual.abs() > residual_threshold {
+            warnings.push(Self::attribution_residual_warning(
+                attribution.residual.round_dp(DECIMAL_PRECISION),
+                residual_threshold.round_dp(DECIMAL_PRECISION),
+            ));
+        }
+        let mut not_applicable_reasons = twr.not_applicable_reasons;
+        not_applicable_reasons.extend(irr.not_applicable_reasons);
+        if let Some(reason) = value_return_not_applicable_reason {
+            not_applicable_reasons.push(reason);
+        }
+
+        Ok(Self::build_result(
+            String::new(),
             currency,
-            period_gain: period_gain.round_dp(DECIMAL_PRECISION),
-            period_return: period_return.map(|r| r.round_dp(DECIMAL_PRECISION)),
-            cumulative_twr: if is_holdings_mode {
-                None
-            } else {
-                Some(Decimal::ZERO)
+            Some(actual_start_date),
+            Some(actual_end_date),
+            mode,
+            PerformanceReturns {
+                twr: twr
+                    .cumulative_twr
+                    .map(|value| value.round_dp(DECIMAL_PRECISION)),
+                annualized_twr: if include_annualized_returns {
+                    Self::annualize_optional_return(
+                        actual_start_date,
+                        actual_end_date,
+                        twr.cumulative_twr,
+                    )
+                } else {
+                    None
+                },
+                irr: Self::period_return_from_annualized_optional(
+                    actual_start_date,
+                    actual_end_date,
+                    irr.annualized_irr,
+                ),
+                annualized_irr: if include_annualized_returns {
+                    irr.annualized_irr
+                } else {
+                    None
+                },
+                value_return: value_return.map(|value| value.round_dp(DECIMAL_PRECISION)),
+                annualized_value_return: if include_annualized_returns {
+                    Self::annualize_optional_return(
+                        actual_start_date,
+                        actual_end_date,
+                        value_return,
+                    )
+                } else {
+                    None
+                },
             },
-            gain_loss_amount: Some(gain_loss_amount.round_dp(DECIMAL_PRECISION)),
-            annualized_twr: if is_holdings_mode {
-                None
-            } else {
-                Some(Decimal::ZERO)
-            },
-            simple_return: simple_total_return.round_dp(DECIMAL_PRECISION),
-            annualized_simple_return: annualized_simple_return.round_dp(DECIMAL_PRECISION),
-            cumulative_mwr: if is_holdings_mode {
-                None
-            } else {
-                Some(Decimal::ZERO)
-            },
-            annualized_mwr: if is_holdings_mode {
-                None
-            } else {
-                Some(Decimal::ZERO)
-            },
-            volatility: Decimal::ZERO,
-            max_drawdown: Decimal::ZERO,
+            attribution,
+            risk,
+            Self::data_quality(warnings, not_applicable_reasons, false),
+            series,
             is_holdings_mode,
-        };
+            false,
+        ))
+    }
 
-        Ok(result)
+    #[cfg(test)]
+    fn compute_mixed_scope_performance(
+        full_history: &[DailyAccountValuation],
+        include_returns_series: bool,
+    ) -> Result<PerformanceResult> {
+        Self::compute_mixed_scope_performance_with_profile(
+            full_history,
+            include_returns_series,
+            PerformanceSummaryProfile::Full,
+        )
+    }
+
+    fn compute_mixed_scope_performance_with_profile(
+        full_history: &[DailyAccountValuation],
+        include_returns_series: bool,
+        profile: PerformanceSummaryProfile,
+    ) -> Result<PerformanceResult> {
+        debug_assert!(full_history.len() >= 2);
+
+        let start_point = full_history.first().unwrap();
+        let end_point = full_history.last().unwrap();
+        let actual_start_date = start_point.valuation_date;
+        let actual_end_date = end_point.valuation_date;
+        let currency = start_point.base_currency.clone();
+        let flow_basis = ExternalFlowBasis::BaseCurrency;
+        let start_value = Self::return_total_value(start_point, flow_basis);
+        let end_value = Self::return_total_value(end_point, flow_basis);
+        let daily_flows = Self::daily_external_flow_series(full_history, flow_basis);
+        let net_cash_flow: Decimal = daily_flows.iter().map(|flow| flow.net()).sum();
+        let gain_loss_amount = end_value - start_value - net_cash_flow;
+        let include_risk = profile == PerformanceSummaryProfile::Full;
+        let include_annualized_returns = profile == PerformanceSummaryProfile::Full;
+        let value_return = if start_value > Decimal::ZERO {
+            Some(gain_loss_amount / start_value)
+        } else {
+            None
+        };
+        if full_history
+            .iter()
+            .any(|point| Self::return_total_value(point, flow_basis).is_sign_negative())
+        {
+            return Err(errors::Error::Validation(ValidationError::InvalidInput(
+                "Account scope has negative portfolio value in its history. Please review the underlying transactions and holdings.".to_string(),
+            )));
+        }
+
+        let mut returns = Vec::new();
+        let mut risk_samples = Vec::new();
+
+        if include_returns_series && value_return.is_some() {
+            returns.reserve(full_history.len());
+            returns.push(ReturnData {
+                date: actual_start_date,
+                value: Decimal::ZERO,
+            });
+        }
+
+        if include_risk || include_returns_series {
+            let mut cumulative_external_flow = Decimal::ZERO;
+            for (window, flow) in full_history.windows(2).zip(daily_flows.iter()) {
+                let prev_point = &window[0];
+                let curr_point = &window[1];
+                let prev_value = Self::return_total_value(prev_point, flow_basis);
+                let curr_value = Self::return_total_value(curr_point, flow_basis);
+                if prev_value.is_sign_negative() || curr_value.is_sign_negative() {
+                    return Err(errors::Error::Validation(ValidationError::InvalidInput(
+                        "Account scope has negative portfolio value in its history. Please review the underlying transactions and holdings.".to_string(),
+                    )));
+                }
+
+                cumulative_external_flow += flow.net();
+                let cumulative_return = if start_value > Decimal::ZERO {
+                    let cumulative_gain = curr_value - start_value - cumulative_external_flow;
+                    Some(cumulative_gain / start_value)
+                } else {
+                    None
+                };
+
+                let day_gain = curr_value + flow.outflow - prev_value - flow.inflow;
+                if include_risk && prev_value > Decimal::ZERO {
+                    let daily_return = day_gain / prev_value;
+                    risk_samples.push(RiskSample {
+                        date: curr_point.valuation_date,
+                        simple_return: daily_return,
+                    });
+                }
+
+                if include_returns_series {
+                    let Some(cumulative_return) = cumulative_return else {
+                        continue;
+                    };
+                    returns.push(ReturnData {
+                        date: curr_point.valuation_date,
+                        value: cumulative_return.round_dp(DECIMAL_PRECISION),
+                    });
+                }
+            }
+        }
+
+        let (contributions, distributions) = Self::total_external_flows(&daily_flows);
+        let (unrealized_pnl_change, fx_effect) = Self::unrealized_attribution_components(
+            start_point,
+            end_point,
+            flow_basis,
+            AttributionBaseline::PeriodStart,
+        );
+        let delta_total_value = end_value - start_value;
+        let mut attribution = PerformanceAttribution {
+            contributions,
+            distributions,
+            unrealized_pnl_change,
+            fx_effect,
+            ..PerformanceAttribution::default()
+        };
+        attribution.residual = delta_total_value
+            - (attribution.contributions - attribution.distributions
+                + attribution.income
+                + attribution.realized_pnl
+                + attribution.unrealized_pnl_change
+                + attribution.fx_effect
+                - attribution.fees
+                - attribution.taxes);
+        let risk = if include_risk {
+            Self::risk_from_samples(&risk_samples, Some(actual_start_date))
+        } else {
+            Self::empty_risk()
+        };
+        let mut warnings = vec![if profile == PerformanceSummaryProfile::Full {
+            "This scope mixes transaction-mode and holdings-mode accounts, so TWR and IRR are unavailable. The return is a value return over the selected scope.".to_string()
+        } else {
+            "This scope mixes transaction-mode and holdings-mode accounts, so TWR is unavailable. The return is a value return over the selected scope.".to_string()
+        }];
+        warnings.extend(Self::external_flow_quality_warnings(&daily_flows));
+        let mut not_applicable_reasons =
+            vec!["TWR unavailable for mixed transaction and holdings scopes.".to_string()];
+        if profile == PerformanceSummaryProfile::Full {
+            not_applicable_reasons
+                .push("IRR unavailable for mixed transaction and holdings scopes.".to_string());
+        }
+        if value_return.is_none() {
+            not_applicable_reasons.push(
+                "Value return unavailable for mixed scope because starting value is zero or negative."
+                    .to_string(),
+            );
+        }
+
+        Ok(Self::build_result(
+            String::new(),
+            currency,
+            Some(actual_start_date),
+            Some(actual_end_date),
+            ReturnMethod::ValueReturn,
+            PerformanceReturns {
+                twr: None,
+                annualized_twr: None,
+                irr: None,
+                annualized_irr: None,
+                value_return: value_return.map(|value| value.round_dp(DECIMAL_PRECISION)),
+                annualized_value_return: if include_annualized_returns {
+                    Self::annualize_optional_return(
+                        actual_start_date,
+                        actual_end_date,
+                        value_return,
+                    )
+                } else {
+                    None
+                },
+            },
+            attribution,
+            risk,
+            Self::data_quality(warnings, not_applicable_reasons, false),
+            returns,
+            false,
+            true,
+        ))
     }
 
     /// Internal function for calculating symbol/benchmark performance (Full)
@@ -495,7 +2618,7 @@ impl PerformanceService {
         asset_id: &str,
         start_date_opt: Option<NaiveDate>,
         end_date_opt: Option<NaiveDate>,
-    ) -> Result<PerformanceMetrics> {
+    ) -> Result<PerformanceResult> {
         let effective_end_date = end_date_opt.unwrap_or_else(|| self.today_in_user_timezone());
         let effective_start_date =
             start_date_opt.unwrap_or_else(|| effective_end_date - chrono::Duration::days(365));
@@ -520,14 +2643,17 @@ impl PerformanceService {
                 "Asset '{}': No quote data found between {} and {}. Returning empty response.",
                 asset_id, effective_start_date, effective_end_date
             );
-            return Ok(PerformanceService::empty_response(asset_id));
+            return Ok(PerformanceService::empty_response_with_context(
+                asset_id,
+                "USD",
+                Some(effective_start_date),
+                Some(effective_end_date),
+                "Performance unavailable: no quote data found for the selected period.",
+            ));
         }
 
-        let actual_start_date = quote_history.first().unwrap().timestamp.date_naive();
-        let actual_end_date = quote_history.last().unwrap().timestamp.date_naive();
         let currency = quote_history.first().unwrap().currency.clone();
-
-        let quote_map: HashMap<NaiveDate, Decimal> = quote_history
+        let mut quote_points: Vec<(NaiveDate, Decimal)> = quote_history
             .into_iter()
             .map(|quote| {
                 (
@@ -536,121 +2662,199 @@ impl PerformanceService {
                 )
             })
             .collect();
+        quote_points.sort_by_key(|(date, _)| *date);
+        quote_points.dedup_by_key(|(date, _)| *date);
 
-        let mut current_loop_date = actual_start_date;
-        let mut prev_price = Decimal::ZERO;
-        let mut found_start_price = false;
-        while current_loop_date <= actual_end_date {
-            if let Some(price) = quote_map.get(&current_loop_date).copied() {
-                prev_price = price;
-                found_start_price = true;
-                break;
-            }
-            if let Some(next_date) = current_loop_date.succ_opt() {
-                current_loop_date = next_date;
-            } else {
-                break;
-            }
+        if quote_points.len() < 2 {
+            warn!(
+                "Asset '{}': Only one quote data point found between {} and {}. Returning empty response.",
+                asset_id, effective_start_date, effective_end_date
+            );
+            return Ok(PerformanceService::empty_response_with_context(
+                asset_id,
+                &currency,
+                Some(effective_start_date),
+                Some(effective_end_date),
+                "Performance unavailable: at least two quote points are required.",
+            ));
         }
 
-        if !found_start_price {
-            warn!("Asset '{}': Could not find starting price point within quote map. Returning empty response.", asset_id);
-            return Ok(PerformanceService::empty_response(asset_id));
+        let Some((actual_start_date, start_price)) = quote_points.first().copied() else {
+            return Ok(PerformanceService::empty_response_with_context(
+                asset_id,
+                &currency,
+                Some(effective_start_date),
+                Some(effective_end_date),
+                "Performance unavailable: no quote data found for the selected period.",
+            ));
+        };
+        let Some((actual_end_date, end_price)) = quote_points.last().copied() else {
+            return Ok(PerformanceService::empty_response_with_context(
+                asset_id,
+                &currency,
+                Some(effective_start_date),
+                Some(effective_end_date),
+                "Performance unavailable: no quote data found for the selected period.",
+            ));
+        };
+        if start_price <= Decimal::ZERO {
+            warn!(
+                "Asset '{}': starting quote price is non-positive on {}. Returning empty response.",
+                asset_id, actual_start_date
+            );
+            return Ok(PerformanceService::empty_response_with_context(
+                asset_id,
+                &currency,
+                Some(actual_start_date),
+                Some(actual_end_date),
+                "Performance unavailable: starting quote price is non-positive.",
+            ));
         }
-
-        let capacity = (actual_end_date - actual_start_date).num_days().max(0) as usize + 1;
-        let mut returns = Vec::with_capacity(capacity);
-        let mut daily_returns = Vec::with_capacity(capacity);
+        let mut returns = Vec::with_capacity(quote_points.len());
+        let mut risk_samples = Vec::with_capacity(quote_points.len().saturating_sub(1));
         let mut cumulative_value = Decimal::ONE;
-        let mut current_date = actual_start_date;
-        let mut last_known_price = prev_price;
+        let mut prev_price = start_price;
+        returns.push(ReturnData {
+            date: actual_start_date,
+            value: Decimal::ZERO,
+        });
 
-        while current_date <= actual_end_date {
-            let current_price = match quote_map.get(&current_date) {
-                Some(price) => {
-                    last_known_price = *price;
-                    *price
-                }
-                None => last_known_price,
-            };
-
-            let daily_return = if prev_price.is_zero() {
-                Decimal::ZERO
-            } else {
-                (current_price / prev_price) - Decimal::ONE
-            };
-            daily_returns.push(daily_return);
-            cumulative_value *= Decimal::ONE + daily_return;
-            let cumulative_return_to_date = cumulative_value - Decimal::ONE;
-
-            returns.push(ReturnData {
-                date: current_date,
-                value: cumulative_return_to_date.round_dp(DECIMAL_PRECISION),
+        for (date, price) in quote_points.iter().copied().skip(1) {
+            if price <= Decimal::ZERO || prev_price <= Decimal::ZERO {
+                prev_price = price;
+                continue;
+            }
+            let daily_return = (price / prev_price) - Decimal::ONE;
+            risk_samples.push(RiskSample {
+                date,
+                simple_return: daily_return,
             });
-
-            if let Some(price) = quote_map.get(&current_date) {
-                prev_price = *price;
-            }
-            if let Some(next_date) = current_date.succ_opt() {
-                current_date = next_date;
-            } else {
-                break;
-            }
+            cumulative_value *= Decimal::ONE + daily_return;
+            returns.push(ReturnData {
+                date,
+                value: (cumulative_value - Decimal::ONE).round_dp(DECIMAL_PRECISION),
+            });
+            prev_price = price;
         }
 
-        if returns.is_empty() {
-            return Ok(PerformanceService::empty_response(asset_id));
-        }
-
-        let total_return = returns.last().map_or(Decimal::ZERO, |r| r.value);
+        let total_return = if start_price.is_zero() {
+            Decimal::ZERO
+        } else {
+            (end_price / start_price) - Decimal::ONE
+        };
         let annualized_return =
             Self::calculate_annualized_return(actual_start_date, actual_end_date, total_return);
-        let volatility = Self::calculate_volatility(&daily_returns);
-        let max_drawdown = Self::calculate_max_drawdown(&daily_returns);
-
-        let result = PerformanceMetrics {
-            id: asset_id.to_string(),
-            returns,
-            period_start_date: Some(actual_start_date),
-            period_end_date: Some(actual_end_date),
+        let result = Self::build_result(
+            asset_id.to_string(),
             currency,
-            period_gain: Decimal::ZERO, // Not applicable for symbol performance
-            period_return: Some(total_return.round_dp(DECIMAL_PRECISION)),
-            cumulative_twr: Some(total_return.round_dp(DECIMAL_PRECISION)),
-            gain_loss_amount: None,
-            annualized_twr: Some(annualized_return.round_dp(DECIMAL_PRECISION)),
-            simple_return: Decimal::ZERO,
-            annualized_simple_return: Decimal::ZERO,
-            cumulative_mwr: Some(Decimal::ZERO),
-            annualized_mwr: Some(Decimal::ZERO),
-            volatility: volatility.round_dp(DECIMAL_PRECISION),
-            max_drawdown: max_drawdown.round_dp(DECIMAL_PRECISION),
-            is_holdings_mode: false,
-        };
+            Some(actual_start_date),
+            Some(actual_end_date),
+            ReturnMethod::SymbolPriceBased,
+            PerformanceReturns {
+                twr: None,
+                annualized_twr: None,
+                irr: None,
+                annualized_irr: None,
+                value_return: Some(total_return.round_dp(DECIMAL_PRECISION)),
+                annualized_value_return: Some(annualized_return.round_dp(DECIMAL_PRECISION)),
+            },
+            PerformanceAttribution::default(),
+            Self::risk_from_samples(&risk_samples, Some(actual_start_date)),
+            Self::data_quality(
+                vec!["Symbol-only performance uses price quotes only; dividends and distributions are excluded unless the quote series is total-return adjusted.".to_string()],
+                vec![
+                    "TWR unavailable for symbol-only price performance because there is no portfolio cash-flow scope.".to_string(),
+                    "IRR unavailable for symbol-only price performance because there are no user cash flows.".to_string(),
+                ],
+                false,
+            ),
+            returns,
+            false,
+            false,
+        );
 
         Ok(result)
     }
 
-    fn empty_response(id: &str) -> PerformanceMetrics {
-        PerformanceMetrics {
-            id: id.to_string(),
-            returns: Vec::new(),
-            period_start_date: None,
-            period_end_date: None,
-            currency: "".to_string(),
-            period_gain: Decimal::ZERO,
-            period_return: Some(Decimal::ZERO),
-            cumulative_twr: Some(Decimal::ZERO),
-            gain_loss_amount: None,
-            annualized_twr: Some(Decimal::ZERO),
-            simple_return: Decimal::ZERO,
-            annualized_simple_return: Decimal::ZERO,
-            cumulative_mwr: Some(Decimal::ZERO),
-            annualized_mwr: Some(Decimal::ZERO),
-            volatility: Decimal::ZERO,
-            max_drawdown: Decimal::ZERO,
-            is_holdings_mode: false,
-        }
+    fn empty_response_with_context(
+        id: &str,
+        currency: &str,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+        reason: impl Into<String>,
+    ) -> PerformanceResult {
+        Self::build_result(
+            id.to_string(),
+            currency.to_string(),
+            start_date,
+            end_date,
+            ReturnMethod::NotApplicable,
+            PerformanceReturns {
+                twr: None,
+                annualized_twr: None,
+                irr: None,
+                annualized_irr: None,
+                value_return: None,
+                annualized_value_return: None,
+            },
+            PerformanceAttribution::default(),
+            PerformanceRisk {
+                volatility: None,
+                max_drawdown: None,
+                peak_date: None,
+                trough_date: None,
+                recovery_date: None,
+                drawdown_duration_days: None,
+            },
+            PerformanceDataQuality::no_data(reason),
+            Vec::new(),
+            false,
+            false,
+        )
+    }
+
+    fn partial_response(
+        id: &str,
+        currency: &str,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+        warning: String,
+    ) -> PerformanceResult {
+        Self::build_result(
+            id.to_string(),
+            currency.to_string(),
+            start_date,
+            end_date,
+            ReturnMethod::NotApplicable,
+            PerformanceReturns {
+                twr: None,
+                annualized_twr: None,
+                irr: None,
+                annualized_irr: None,
+                value_return: None,
+                annualized_value_return: None,
+            },
+            PerformanceAttribution::default(),
+            PerformanceRisk {
+                volatility: None,
+                max_drawdown: None,
+                peak_date: None,
+                trough_date: None,
+                recovery_date: None,
+                drawdown_duration_days: None,
+            },
+            PerformanceDataQuality {
+                status: DataQualityStatus::Partial,
+                warnings: vec![warning],
+                not_applicable_reasons: vec![
+                    "Performance metrics unavailable because scoped valuation history is incomplete."
+                        .to_string(),
+                ],
+            },
+            Vec::new(),
+            false,
+            false,
+        )
     }
 
     fn calculate_annualized_return(
@@ -677,10 +2881,6 @@ impl PerformanceService {
 
         let years = Decimal::from(days) / DAYS_PER_YEAR_DECIMAL;
 
-        if years < Decimal::ONE {
-            return total_return;
-        }
-
         let base = Decimal::ONE + total_return;
 
         // This check is theoretically covered by `total_return <= dec!(-1.0)`,
@@ -695,16 +2895,73 @@ impl PerformanceService {
         base.powd(exponent) - Decimal::ONE
     }
 
-    fn calculate_volatility(daily_returns: &[Decimal]) -> Decimal {
-        if daily_returns.len() < 2 {
+    fn period_return_from_annualized_optional(
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        annualized_return: Option<Decimal>,
+    ) -> Option<Decimal> {
+        annualized_return.map(|value| {
+            Self::calculate_period_return_from_annualized(start_date, end_date, value)
+                .round_dp(DECIMAL_PRECISION)
+        })
+    }
+
+    fn calculate_period_return_from_annualized(
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        annualized_return: Decimal,
+    ) -> Decimal {
+        if start_date > end_date {
             return Decimal::ZERO;
         }
 
-        let count = Decimal::from(daily_returns.len());
-        let sum: Decimal = daily_returns.iter().sum();
+        if annualized_return <= dec!(-1.0) {
+            return dec!(-1.0);
+        }
+
+        let days = (end_date - start_date).num_days();
+
+        if days <= 0 {
+            return annualized_return;
+        }
+
+        let years = Decimal::from(days) / DAYS_PER_YEAR_DECIMAL;
+        let base = Decimal::ONE + annualized_return;
+
+        if base <= Decimal::ZERO {
+            return dec!(-1.0);
+        }
+
+        base.powd(years) - Decimal::ONE
+    }
+
+    fn calculate_volatility(daily_returns: &[Decimal]) -> Option<Decimal> {
+        if daily_returns.len() < 2 {
+            return None;
+        }
+
+        let log_returns: Vec<Decimal> = daily_returns
+            .iter()
+            .filter_map(|daily_return| {
+                let factor = Decimal::ONE + *daily_return;
+                if factor <= Decimal::ZERO {
+                    return None;
+                }
+                factor
+                    .to_f64()
+                    .and_then(|factor| Decimal::from_f64(factor.ln()))
+            })
+            .collect();
+
+        if log_returns.len() < 2 {
+            return None;
+        }
+
+        let count = Decimal::from(log_returns.len());
+        let sum: Decimal = log_returns.iter().sum();
         let mean = sum / count;
 
-        let sum_squared_diff: Decimal = daily_returns
+        let sum_squared_diff: Decimal = log_returns
             .iter()
             .map(|&r| {
                 let diff = r - mean;
@@ -714,44 +2971,76 @@ impl PerformanceService {
 
         let variance = sum_squared_diff / (count - Decimal::ONE);
         if variance.is_sign_negative() {
-            return Decimal::ZERO;
+            return None;
         }
 
         let daily_volatility = variance.sqrt().unwrap_or(Decimal::ZERO);
 
-        let annualization_factor = Decimal::from(TRADING_DAYS_PER_YEAR)
+        let annualization_factor = DAYS_PER_YEAR_DECIMAL
             .sqrt()
-            .unwrap_or(SQRT_TRADING_DAYS_APPROX);
+            .unwrap_or(SQRT_DAYS_PER_YEAR_APPROX);
 
-        daily_volatility * annualization_factor
+        Some((daily_volatility * annualization_factor).round_dp(DECIMAL_PRECISION))
     }
 
-    fn calculate_max_drawdown(daily_returns: &[Decimal]) -> Decimal {
-        if daily_returns.is_empty() {
-            return Decimal::ZERO;
+    fn calculate_max_drawdown(
+        samples: &[RiskSample],
+        opening_date: Option<NaiveDate>,
+    ) -> DrawdownComputation {
+        if samples.is_empty() {
+            return DrawdownComputation {
+                max_drawdown: None,
+                peak_date: None,
+                trough_date: None,
+                recovery_date: None,
+                duration_days: None,
+            };
         }
 
         let mut cumulative_value = Decimal::ONE;
         let mut peak_value = Decimal::ONE;
+        let mut peak_date = opening_date.unwrap_or(samples[0].date);
         let mut max_drawdown = Decimal::ZERO;
+        let mut max_peak_date = peak_date;
+        let mut trough_date = samples[0].date;
+        let mut recovery_date = None;
+        let mut in_max_drawdown = false;
 
-        for &daily_return in daily_returns {
-            cumulative_value *= Decimal::ONE + daily_return;
-            peak_value = peak_value.max(cumulative_value);
-            if peak_value.is_zero() {
-                max_drawdown = max_drawdown.max(Decimal::ONE);
-            } else {
-                let drawdown = (peak_value - cumulative_value) / peak_value;
-                max_drawdown = max_drawdown.max(drawdown);
+        for sample in samples {
+            cumulative_value *= Decimal::ONE + sample.simple_return;
+            if cumulative_value >= peak_value {
+                peak_value = cumulative_value;
+                peak_date = sample.date;
+                if in_max_drawdown && recovery_date.is_none() {
+                    recovery_date = Some(sample.date);
+                }
+            }
+
+            if peak_value > Decimal::ZERO {
+                let drawdown = (cumulative_value - peak_value) / peak_value;
+                if drawdown < max_drawdown {
+                    max_drawdown = drawdown;
+                    max_peak_date = peak_date;
+                    trough_date = sample.date;
+                    recovery_date = None;
+                    in_max_drawdown = true;
+                }
             }
         }
 
-        max_drawdown.max(Decimal::ZERO)
+        let duration_end = recovery_date.unwrap_or(trough_date);
+        DrawdownComputation {
+            max_drawdown: Some(max_drawdown.round_dp(DECIMAL_PRECISION)),
+            peak_date: Some(max_peak_date),
+            trough_date: Some(trough_date),
+            recovery_date,
+            duration_days: Some((duration_end - max_peak_date).num_days()),
+        }
     }
 
     pub fn calculate_simple_performance(
         current: &DailyAccountValuation,
-        previous: Option<&DailyAccountValuation>,
+        _previous: Option<&DailyAccountValuation>,
         total_portfolio_value_base: Option<Decimal>,
     ) -> SimplePerformanceMetrics {
         // Use self for the current valuation data
@@ -765,27 +3054,7 @@ impl PerformanceService {
             None
         };
 
-        let (day_gain_loss_amount, day_return_percent_mod_dietz) = if let Some(prev) = previous {
-            let start_value = prev.total_value;
-            let end_value = current.total_value;
-            let cash_flow_day = current.net_contribution - prev.net_contribution;
-            let gain_day = end_value - start_value - cash_flow_day;
-
-            let denominator_mod_dietz = start_value + (Decimal::new(5, 1) * cash_flow_day);
-
-            let percent_day_mod_dietz = if !denominator_mod_dietz.is_zero() {
-                Some((gain_day / denominator_mod_dietz).round_dp(4))
-            } else if gain_day.is_zero() {
-                Some(Decimal::ZERO)
-            } else {
-                None
-            };
-            (Some(gain_day.round_dp(2)), percent_day_mod_dietz)
-        } else {
-            (None, None)
-        };
-
-        let total_value_base = current.total_value * current.fx_rate_to_base;
+        let total_value_base = current.total_value_base;
         let portfolio_weight = if let Some(total_portfolio) = total_portfolio_value_base {
             if !total_portfolio.is_zero() {
                 Some(
@@ -811,8 +3080,6 @@ impl PerformanceService {
             fx_rate_to_base: Some(current.fx_rate_to_base),
             total_gain_loss_amount: Some(total_gain_loss_amount.round_dp(2)),
             cumulative_return_percent,
-            day_gain_loss_amount,
-            day_return_percent_mod_dietz,
             portfolio_weight,
         }
     }
@@ -828,11 +3095,18 @@ impl PerformanceServiceTrait for PerformanceService {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
         tracking_mode: Option<TrackingMode>,
-    ) -> Result<PerformanceMetrics> {
+        account_type: Option<&str>,
+    ) -> Result<PerformanceResult> {
         match item_type {
             "account" => {
-                self.calculate_account_performance(item_id, start_date, end_date, tracking_mode)
-                    .await
+                self.calculate_account_performance(
+                    item_id,
+                    start_date,
+                    end_date,
+                    tracking_mode,
+                    account_type,
+                )
+                .await
             }
             "symbol" => {
                 self.calculate_symbol_performance(item_id, start_date, end_date)
@@ -844,8 +3118,32 @@ impl PerformanceServiceTrait for PerformanceService {
         }
     }
 
-    /// Calculates summary performance metrics only (no returns array, vol, maxDD)
-    /// Currently only implemented for item_type = "account"
+    async fn calculate_performance_history_for_accounts(
+        &self,
+        scope_id: &str,
+        account_ids: &[String],
+        base_currency: &str,
+        account_tracking_modes: &HashMap<String, TrackingMode>,
+        account_types: &HashMap<String, String>,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+    ) -> Result<PerformanceResult> {
+        self.calculate_scoped_performance(ScopedPerformanceRequest {
+            scope_id,
+            account_ids,
+            base_currency,
+            account_tracking_modes,
+            account_types,
+            start_date,
+            end_date,
+            include_returns_series: true,
+            profile: PerformanceSummaryProfile::Full,
+        })
+        .await
+    }
+
+    /// Calculates summary performance metrics. The `Headline` profile is used by
+    /// dashboard cards to avoid unused IRR/risk work.
     async fn calculate_performance_summary(
         &self,
         item_type: &str,
@@ -853,7 +3151,9 @@ impl PerformanceServiceTrait for PerformanceService {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
         tracking_mode: Option<TrackingMode>,
-    ) -> Result<PerformanceMetrics> {
+        account_type: Option<&str>,
+        profile: PerformanceSummaryProfile,
+    ) -> Result<PerformanceResult> {
         match item_type {
             "account" => {
                 self.calculate_account_performance_summary(
@@ -861,17 +3161,45 @@ impl PerformanceServiceTrait for PerformanceService {
                     start_date,
                     end_date,
                     tracking_mode,
+                    account_type,
+                    profile,
                 )
                 .await
             }
             "symbol" => {
-                warn!("Performance summary calculation is not supported for symbols. Returning empty response.");
-                Ok(PerformanceService::empty_response(item_id))
+                self.calculate_symbol_performance(item_id, start_date, end_date)
+                    .await
             }
             _ => Err(errors::Error::Validation(ValidationError::InvalidInput(
                 "Invalid item type".to_string(),
             ))),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn calculate_performance_summary_for_accounts(
+        &self,
+        scope_id: &str,
+        account_ids: &[String],
+        base_currency: &str,
+        account_tracking_modes: &HashMap<String, TrackingMode>,
+        account_types: &HashMap<String, String>,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+        profile: PerformanceSummaryProfile,
+    ) -> Result<PerformanceResult> {
+        self.calculate_scoped_performance(ScopedPerformanceRequest {
+            scope_id,
+            account_ids,
+            base_currency,
+            account_tracking_modes,
+            account_types,
+            start_date,
+            end_date,
+            include_returns_series: false,
+            profile,
+        })
+        .await
     }
 
     fn calculate_accounts_simple_performance(
@@ -882,16 +3210,8 @@ impl PerformanceServiceTrait for PerformanceService {
             return Ok(Vec::new());
         }
 
-        // Include "TOTAL" to get the total portfolio value reference date
-        let mut ids_to_fetch = account_ids.to_vec();
-        if !account_ids.contains(&PORTFOLIO_TOTAL_ACCOUNT_ID.to_string()) {
-            ids_to_fetch.push(PORTFOLIO_TOTAL_ACCOUNT_ID.to_string());
-        }
-
         // 1. Fetch the *absolute* latest record for each account
-        let latest_daily_valuations = self
-            .valuation_service
-            .get_latest_valuations(&ids_to_fetch)?;
+        let latest_daily_valuations = self.valuation_service.get_latest_valuations(account_ids)?;
 
         let latest_daily_map: HashMap<String, DailyAccountValuation> = latest_daily_valuations
             .into_iter()
@@ -933,10 +3253,13 @@ impl PerformanceServiceTrait for PerformanceService {
             }
         }
 
-        // 4. Calculate total portfolio value using the absolute latest "TOTAL" valuation
-        let total_portfolio_value_base = latest_daily_map
-            .get(PORTFOLIO_TOTAL_ACCOUNT_ID)
-            .map(|p| p.total_value * p.fx_rate_to_base);
+        // 4. Calculate total portfolio value by summing real-account base values.
+        let total_portfolio_value_base: Decimal = account_ids
+            .iter()
+            .filter_map(|account_id| latest_daily_map.get(account_id))
+            .map(|p| p.total_value_base)
+            .sum();
+        let total_portfolio_value_base = Some(total_portfolio_value_base);
 
         // 5. Construct results using the absolute latest and previous-to-latest records
         let mut results = Vec::with_capacity(account_ids.len());
@@ -959,5 +3282,3228 @@ impl PerformanceServiceTrait for PerformanceService {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assets::{
+        Asset, AssetKind, AssetRepositoryTrait, NewAsset, ProviderProfile, QuoteMode,
+        UpdateAssetProfile,
+    };
+    use crate::fx::{ExchangeRate, FxServiceTrait, NewExchangeRate};
+    use crate::lots::{AssetLotView, LotClosure};
+    use crate::portfolio::snapshot::{AccountStateSnapshot, HoldingsCalculator, Lot, Position};
+    use crate::portfolio::valuation::{
+        ExternalFlowSource, NegativeBalanceInfo, ValuationRecalcMode,
+    };
+    use crate::quotes::{
+        FetchDividendsParams, LatestQuotePair, LatestQuoteSnapshot, ProviderInfo, Quote,
+        QuoteImport, QuoteSyncState, ResolvedQuote, SymbolSearchResult, SymbolSyncPlan, SyncMode,
+        SyncResult,
+    };
+    use chrono::{DateTime, Utc};
+    use std::collections::VecDeque;
+    use wealthfolio_market_data::DividendEvent;
+
+    fn attribution_pnl(result: &PerformanceResult) -> Decimal {
+        result.attribution.income
+            + result.attribution.realized_pnl
+            + result.attribution.unrealized_pnl_change
+            + result.attribution.fx_effect
+            - result.attribution.fees
+            - result.attribution.taxes
+            + result.attribution.residual
+    }
+
+    fn valuation(
+        date: &str,
+        total_value: Decimal,
+        net_contribution: Decimal,
+        investment_market_value: Decimal,
+        cost_basis: Decimal,
+    ) -> DailyAccountValuation {
+        DailyAccountValuation {
+            id: format!("acct-{}", date),
+            account_id: "acct".to_string(),
+            valuation_date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            account_currency: "CAD".to_string(),
+            base_currency: "CAD".to_string(),
+            fx_rate_to_base: Decimal::ONE,
+            cash_balance: total_value - investment_market_value,
+            investment_market_value,
+            total_value,
+            cost_basis,
+            net_contribution,
+            cash_balance_base: total_value - investment_market_value,
+            investment_market_value_base: investment_market_value,
+            total_value_base: total_value,
+            cost_basis_base: cost_basis,
+            net_contribution_base: net_contribution,
+            external_inflow_base: Decimal::ZERO,
+            external_outflow_base: Decimal::ZERO,
+            external_flow_source: ValuationExternalFlowSource::Unknown,
+            performance_eligible_value_base: total_value,
+            calculated_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+        }
+    }
+
+    fn lot_disposal(
+        currency: &str,
+        base_currency: &str,
+        fx_rate_to_base: &str,
+        cost_basis: &str,
+        cost_basis_base: &str,
+        realized_pnl_base: &str,
+    ) -> LotDisposal {
+        LotDisposal {
+            id: "disposal-1".to_string(),
+            lot_id: "lot-1".to_string(),
+            account_id: "acct".to_string(),
+            asset_id: "asset".to_string(),
+            disposal_activity_id: "sell-1".to_string(),
+            disposal_date: "2026-05-02".to_string(),
+            quantity: "1".to_string(),
+            proceeds: "120".to_string(),
+            cost_basis: cost_basis.to_string(),
+            realized_pnl: "20".to_string(),
+            proceeds_base: "132".to_string(),
+            cost_basis_base: cost_basis_base.to_string(),
+            realized_pnl_base: realized_pnl_base.to_string(),
+            currency: currency.to_string(),
+            base_currency: base_currency.to_string(),
+            fx_rate_to_base: fx_rate_to_base.to_string(),
+            cost_basis_method: "FIFO".to_string(),
+            created_at: "2026-05-02T00:00:00.000Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn activity_date_window_includes_user_timezone_midnight_edges() {
+        let activity_time = DateTime::parse_from_rfc3339("2026-06-02T02:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tz = parse_user_timezone_or_default("America/Toronto");
+        let local_date = activity_date_in_tz(activity_time, tz);
+        let (start_utc, end_exclusive_utc) =
+            PerformanceService::activity_query_utc_bounds(date("2026-06-01"), date("2026-06-01"));
+
+        assert_eq!(local_date, date("2026-06-01"));
+        assert!(activity_time >= start_utc);
+        assert!(activity_time < end_exclusive_utc);
+    }
+
+    #[derive(Clone)]
+    struct TestValuationService {
+        history: Vec<DailyAccountValuation>,
+    }
+
+    impl TestValuationService {
+        fn new(history: Vec<DailyAccountValuation>) -> Self {
+            Self { history }
+        }
+
+        fn filtered_history(
+            &self,
+            start_date_opt: Option<NaiveDate>,
+            end_date_opt: Option<NaiveDate>,
+        ) -> Vec<DailyAccountValuation> {
+            self.history
+                .iter()
+                .filter(|valuation| {
+                    start_date_opt.is_none_or(|start| valuation.valuation_date >= start)
+                        && end_date_opt.is_none_or(|end| valuation.valuation_date <= end)
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ValuationServiceTrait for TestValuationService {
+        async fn calculate_valuation_history(
+            &self,
+            _account_id: &str,
+            _mode: ValuationRecalcMode,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_historical_valuations(
+            &self,
+            account_id: &str,
+            start_date_opt: Option<NaiveDate>,
+            end_date_opt: Option<NaiveDate>,
+        ) -> Result<Vec<DailyAccountValuation>> {
+            Ok(self
+                .filtered_history(start_date_opt, end_date_opt)
+                .into_iter()
+                .filter(|valuation| valuation.account_id == account_id)
+                .collect())
+        }
+
+        fn get_historical_valuations_for_accounts(
+            &self,
+            _scope_id: &str,
+            account_ids: &[String],
+            _base_currency: &str,
+            start_date_opt: Option<NaiveDate>,
+            end_date_opt: Option<NaiveDate>,
+        ) -> Result<Vec<DailyAccountValuation>> {
+            Ok(self
+                .filtered_history(start_date_opt, end_date_opt)
+                .into_iter()
+                .filter(|valuation| account_ids.contains(&valuation.account_id))
+                .collect())
+        }
+
+        fn get_latest_valuations(
+            &self,
+            account_ids: &[String],
+        ) -> Result<Vec<DailyAccountValuation>> {
+            Ok(account_ids
+                .iter()
+                .filter_map(|account_id| {
+                    self.history
+                        .iter()
+                        .rev()
+                        .find(|valuation| valuation.account_id == *account_id)
+                        .cloned()
+                })
+                .collect())
+        }
+
+        fn get_valuations_on_date(
+            &self,
+            account_ids: &[String],
+            date: NaiveDate,
+        ) -> Result<Vec<DailyAccountValuation>> {
+            Ok(self
+                .history
+                .iter()
+                .filter(|valuation| {
+                    valuation.valuation_date == date && account_ids.contains(&valuation.account_id)
+                })
+                .cloned()
+                .collect())
+        }
+
+        fn get_accounts_with_negative_balance(
+            &self,
+            _account_ids: &[String],
+        ) -> Result<Vec<NegativeBalanceInfo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestQuoteService;
+
+    #[async_trait]
+    impl QuoteServiceTrait for TestQuoteService {
+        fn get_latest_quote(&self, _symbol: &str) -> Result<Quote> {
+            Err(errors::Error::Unexpected(
+                "TestQuoteService::get_latest_quote should not be called".to_string(),
+            ))
+        }
+
+        fn get_latest_quotes(&self, _symbols: &[String]) -> Result<HashMap<String, Quote>> {
+            Ok(HashMap::new())
+        }
+
+        fn get_latest_quotes_as_of(
+            &self,
+            _symbols: &[String],
+            _as_of: NaiveDate,
+        ) -> Result<HashMap<String, Quote>> {
+            Ok(HashMap::new())
+        }
+
+        fn get_latest_quotes_snapshot(
+            &self,
+            _asset_ids: &[String],
+        ) -> Result<HashMap<String, LatestQuoteSnapshot>> {
+            Ok(HashMap::new())
+        }
+
+        fn get_latest_quotes_pair(
+            &self,
+            _symbols: &[String],
+        ) -> Result<HashMap<String, LatestQuotePair>> {
+            Ok(HashMap::new())
+        }
+
+        fn get_historical_quotes(&self, _symbol: &str) -> Result<Vec<Quote>> {
+            Ok(Vec::new())
+        }
+
+        fn get_all_historical_quotes(&self) -> Result<HashMap<String, Vec<(NaiveDate, Quote)>>> {
+            Ok(HashMap::new())
+        }
+
+        fn get_quotes_in_range(
+            &self,
+            _symbols: &HashSet<String>,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            Ok(Vec::new())
+        }
+
+        fn get_quotes_in_range_filled(
+            &self,
+            _symbols: &HashSet<String>,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_daily_quotes(
+            &self,
+            _asset_ids: &HashSet<String>,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<HashMap<NaiveDate, HashMap<String, Quote>>> {
+            Ok(HashMap::new())
+        }
+
+        async fn add_quote(&self, _quote: &Quote) -> Result<Quote> {
+            Err(errors::Error::Unexpected(
+                "TestQuoteService::add_quote should not be called".to_string(),
+            ))
+        }
+
+        async fn update_quote(&self, quote: Quote) -> Result<Quote> {
+            Ok(quote)
+        }
+
+        async fn delete_quote(&self, _quote_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn bulk_upsert_quotes(&self, _quotes: Vec<Quote>) -> Result<usize> {
+            Ok(0)
+        }
+
+        async fn search_symbol(&self, _query: &str) -> Result<Vec<SymbolSearchResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn search_symbol_with_currency(
+            &self,
+            _query: &str,
+            _account_currency: Option<&str>,
+        ) -> Result<Vec<SymbolSearchResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_symbol_quote(
+            &self,
+            _symbol: &str,
+            _exchange_mic: Option<&str>,
+            _instrument_type: Option<&crate::assets::InstrumentType>,
+            _quote_ccy: Option<&str>,
+            _preferred_provider: Option<&str>,
+        ) -> Result<ResolvedQuote> {
+            Ok(ResolvedQuote::default())
+        }
+
+        async fn get_asset_profile(&self, _asset: &Asset) -> Result<ProviderProfile> {
+            Ok(ProviderProfile::default())
+        }
+
+        async fn fetch_quotes_from_provider(
+            &self,
+            _asset_id: &str,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_quotes_for_symbol(
+            &self,
+            _asset_id: &str,
+            _currency: &str,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_dividends(
+            &self,
+            _params: FetchDividendsParams,
+        ) -> Result<Vec<DividendEvent>> {
+            Ok(Vec::new())
+        }
+
+        async fn sync(
+            &self,
+            _mode: SyncMode,
+            _asset_ids: Option<Vec<String>>,
+        ) -> Result<SyncResult> {
+            Err(errors::Error::Unexpected(
+                "TestQuoteService::sync should not be called".to_string(),
+            ))
+        }
+
+        async fn resync(&self, _asset_ids: Option<Vec<String>>) -> Result<SyncResult> {
+            Err(errors::Error::Unexpected(
+                "TestQuoteService::resync should not be called".to_string(),
+            ))
+        }
+
+        async fn refresh_sync_state(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_sync_plan(&self) -> Result<Vec<SymbolSyncPlan>> {
+            Ok(Vec::new())
+        }
+
+        async fn handle_activity_created(
+            &self,
+            _symbol: &str,
+            _activity_date: NaiveDate,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn handle_activity_deleted(&self, _symbol: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_sync_state(&self, _symbol: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_symbols_needing_sync(&self) -> Result<Vec<QuoteSyncState>> {
+            Ok(Vec::new())
+        }
+
+        fn get_sync_state(&self, _symbol: &str) -> Result<Option<QuoteSyncState>> {
+            Ok(None)
+        }
+
+        async fn mark_profile_enriched(&self, _symbol: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_assets_needing_profile_enrichment(&self) -> Result<Vec<QuoteSyncState>> {
+            Ok(Vec::new())
+        }
+
+        fn get_sync_states_with_errors(&self) -> Result<Vec<QuoteSyncState>> {
+            Ok(Vec::new())
+        }
+
+        async fn reset_sync_errors(&self, _asset_ids: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reset_sync_state_for_profile_change(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn update_position_status_from_holdings(
+            &self,
+            _current_holdings: &HashMap<String, Decimal>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_providers_info(&self) -> Result<Vec<ProviderInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn update_provider_settings(
+            &self,
+            _provider_id: &str,
+            _priority: i32,
+            _enabled: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn check_quotes_import(
+            &self,
+            _content: &[u8],
+            _has_header_row: bool,
+        ) -> Result<Vec<QuoteImport>> {
+            Ok(Vec::new())
+        }
+
+        async fn import_quotes(
+            &self,
+            quotes: Vec<QuoteImport>,
+            _overwrite: bool,
+        ) -> Result<Vec<QuoteImport>> {
+            Ok(quotes)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestFxService;
+
+    #[async_trait]
+    impl FxServiceTrait for TestFxService {
+        fn initialize(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_historical_rates(
+            &self,
+            _from_currency: &str,
+            _to_currency: &str,
+            _days: i64,
+        ) -> Result<Vec<ExchangeRate>> {
+            Ok(Vec::new())
+        }
+
+        fn get_latest_exchange_rate(
+            &self,
+            from_currency: &str,
+            to_currency: &str,
+        ) -> Result<Decimal> {
+            if from_currency == to_currency {
+                Ok(Decimal::ONE)
+            } else {
+                Err(errors::Error::Unexpected(
+                    "TestFxService only supports same-currency conversion".to_string(),
+                ))
+            }
+        }
+
+        fn get_exchange_rate_for_date(
+            &self,
+            from_currency: &str,
+            to_currency: &str,
+            _date: NaiveDate,
+        ) -> Result<Decimal> {
+            self.get_latest_exchange_rate(from_currency, to_currency)
+        }
+
+        fn convert_currency(
+            &self,
+            amount: Decimal,
+            from_currency: &str,
+            to_currency: &str,
+        ) -> Result<Decimal> {
+            self.convert_currency_for_date(amount, from_currency, to_currency, date("2026-05-01"))
+        }
+
+        fn convert_currency_for_date(
+            &self,
+            amount: Decimal,
+            from_currency: &str,
+            to_currency: &str,
+            _date: NaiveDate,
+        ) -> Result<Decimal> {
+            if from_currency == to_currency {
+                Ok(amount)
+            } else {
+                Err(errors::Error::Unexpected(
+                    "TestFxService only supports same-currency conversion".to_string(),
+                ))
+            }
+        }
+
+        fn get_latest_exchange_rates(&self) -> Result<Vec<ExchangeRate>> {
+            Ok(Vec::new())
+        }
+
+        async fn add_exchange_rate(&self, _new_rate: NewExchangeRate) -> Result<ExchangeRate> {
+            Err(errors::Error::Unexpected(
+                "TestFxService::add_exchange_rate should not be called".to_string(),
+            ))
+        }
+
+        async fn update_exchange_rate(
+            &self,
+            _from_currency: &str,
+            _to_currency: &str,
+            _rate: Decimal,
+        ) -> Result<ExchangeRate> {
+            Err(errors::Error::Unexpected(
+                "TestFxService::update_exchange_rate should not be called".to_string(),
+            ))
+        }
+
+        async fn delete_exchange_rate(&self, _rate_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn register_currency_pair(
+            &self,
+            _from_currency: &str,
+            _to_currency: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn register_currency_pair_manual(
+            &self,
+            _from_currency: &str,
+            _to_currency: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_fx_pairs(&self, _pairs: Vec<(String, String)>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestAssetRepository;
+
+    #[async_trait]
+    impl AssetRepositoryTrait for TestAssetRepository {
+        async fn create(&self, _new_asset: NewAsset) -> Result<Asset> {
+            Err(errors::Error::Unexpected(
+                "TestAssetRepository::create should not be called".to_string(),
+            ))
+        }
+
+        async fn create_batch(&self, _new_assets: Vec<NewAsset>) -> Result<Vec<Asset>> {
+            Err(errors::Error::Unexpected(
+                "TestAssetRepository::create_batch should not be called".to_string(),
+            ))
+        }
+
+        async fn update_profile(
+            &self,
+            _asset_id: &str,
+            _payload: UpdateAssetProfile,
+        ) -> Result<Asset> {
+            Err(errors::Error::Unexpected(
+                "TestAssetRepository::update_profile should not be called".to_string(),
+            ))
+        }
+
+        async fn update_quote_mode(&self, _asset_id: &str, _quote_mode: &str) -> Result<Asset> {
+            Err(errors::Error::Unexpected(
+                "TestAssetRepository::update_quote_mode should not be called".to_string(),
+            ))
+        }
+
+        fn get_by_id(&self, asset_id: &str) -> Result<Asset> {
+            if asset_id == "AAPL" {
+                Ok(Asset {
+                    id: "AAPL".to_string(),
+                    display_code: Some("AAPL".to_string()),
+                    quote_ccy: "USD".to_string(),
+                    name: Some("Apple Inc.".to_string()),
+                    kind: AssetKind::Investment,
+                    quote_mode: QuoteMode::Market,
+                    created_at: Utc::now().naive_utc(),
+                    updated_at: Utc::now().naive_utc(),
+                    ..Default::default()
+                })
+            } else {
+                Err(errors::Error::Repository(format!(
+                    "Test asset not found: {}",
+                    asset_id
+                )))
+            }
+        }
+
+        fn list(&self) -> Result<Vec<Asset>> {
+            Ok(vec![self.get_by_id("AAPL")?])
+        }
+
+        fn list_by_asset_ids(&self, asset_ids: &[String]) -> Result<Vec<Asset>> {
+            Ok(asset_ids
+                .iter()
+                .filter_map(|asset_id| self.get_by_id(asset_id).ok())
+                .collect())
+        }
+
+        async fn delete(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn search_by_symbol(&self, _query: &str) -> Result<Vec<Asset>> {
+            Ok(Vec::new())
+        }
+
+        fn find_by_instrument_key(&self, _instrument_key: &str) -> Result<Option<Asset>> {
+            Ok(None)
+        }
+
+        async fn cleanup_legacy_metadata(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn deactivate(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reactivate(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn copy_user_metadata(&self, _source_id: &str, _target_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn deactivate_orphaned_investments(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestLotRepository {
+        disposals: Vec<LotDisposal>,
+    }
+
+    #[async_trait]
+    impl LotRepositoryTrait for TestLotRepository {
+        async fn replace_lots_for_account(
+            &self,
+            _account_id: &str,
+            _lots: &[LotRecord],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_open_lots_for_account(&self, _account_id: &str) -> Result<Vec<LotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_all_open_lots(&self) -> Result<Vec<LotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_lots_as_of_date(
+            &self,
+            _account_ids: &[String],
+            _date: NaiveDate,
+        ) -> Result<Vec<LotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_all_lots_for_account(&self, _account_id: &str) -> Result<Vec<LotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_lots_for_asset(&self, _asset_id: &str) -> Result<Vec<LotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_asset_lot_view(
+            &self,
+            _asset_id: &str,
+            _include_snapshot_positions: bool,
+        ) -> Result<Vec<AssetLotView>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_all_lots(&self) -> Result<Vec<LotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn sync_lots_for_account(
+            &self,
+            _account_id: &str,
+            _open_lots: &[LotRecord],
+            _closures: &[LotClosure],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_lot_disposals_for_account(
+            &self,
+            account_id: &str,
+        ) -> Result<Vec<LotDisposal>> {
+            Ok(self
+                .disposals
+                .iter()
+                .filter(|disposal| disposal.account_id == account_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_open_position_quantities(&self) -> Result<HashMap<String, Decimal>> {
+            Ok(HashMap::new())
+        }
+
+        fn count_lots(&self) -> Result<i64> {
+            Ok(0)
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestActivityRepository {
+        activities: Vec<Activity>,
+    }
+
+    impl TestActivityRepository {
+        fn new(activities: Vec<Activity>) -> Self {
+            Self { activities }
+        }
+    }
+
+    #[async_trait]
+    impl ActivityRepositoryTrait for TestActivityRepository {
+        fn get_activity(&self, activity_id: &str) -> Result<Activity> {
+            self.activities
+                .iter()
+                .find(|activity| activity.id == activity_id)
+                .cloned()
+                .ok_or_else(|| {
+                    errors::Error::Unexpected(format!("activity {} not found", activity_id))
+                })
+        }
+
+        fn find_transfer_counterpart(
+            &self,
+            group_id: &str,
+            exclude_id: &str,
+        ) -> Result<Option<Activity>> {
+            Ok(self
+                .activities
+                .iter()
+                .find(|activity| {
+                    activity.source_group_id.as_deref() == Some(group_id)
+                        && activity.id != exclude_id
+                })
+                .cloned())
+        }
+
+        fn get_activities(&self) -> Result<Vec<Activity>> {
+            Ok(self.activities.clone())
+        }
+
+        fn get_activities_by_account_id(&self, account_id: &str) -> Result<Vec<Activity>> {
+            Ok(self
+                .activities
+                .iter()
+                .filter(|activity| activity.account_id == account_id)
+                .cloned()
+                .collect())
+        }
+
+        fn get_activities_by_account_ids(&self, account_ids: &[String]) -> Result<Vec<Activity>> {
+            Ok(self
+                .activities
+                .iter()
+                .filter(|activity| account_ids.contains(&activity.account_id))
+                .cloned()
+                .collect())
+        }
+
+        fn get_trading_activities(&self) -> Result<Vec<Activity>> {
+            Ok(self
+                .activities
+                .iter()
+                .filter(|activity| {
+                    matches!(
+                        activity.effective_type(),
+                        crate::activities::ACTIVITY_TYPE_BUY
+                            | crate::activities::ACTIVITY_TYPE_SELL
+                            | crate::activities::ACTIVITY_TYPE_SPLIT
+                    )
+                })
+                .cloned()
+                .collect())
+        }
+
+        fn get_income_activities(&self) -> Result<Vec<Activity>> {
+            Ok(self
+                .activities
+                .iter()
+                .filter(|activity| {
+                    matches!(
+                        activity.effective_type(),
+                        crate::activities::ACTIVITY_TYPE_DIVIDEND
+                            | crate::activities::ACTIVITY_TYPE_INTEREST
+                    )
+                })
+                .cloned()
+                .collect())
+        }
+
+        fn get_contribution_activities(
+            &self,
+            _account_ids: &[String],
+            _start_utc: DateTime<Utc>,
+            _end_exclusive_utc: DateTime<Utc>,
+        ) -> Result<Vec<crate::limits::ContributionActivity>> {
+            Ok(Vec::new())
+        }
+
+        fn search_activities(
+            &self,
+            _page: i64,
+            _page_size: i64,
+            _account_id_filter: Option<Vec<String>>,
+            _activity_type_filter: Option<Vec<String>>,
+            _asset_id_keyword: Option<String>,
+            _sort: Option<crate::activities::Sort>,
+            _needs_review_filter: Option<bool>,
+            _date_from: Option<NaiveDate>,
+            _date_to: Option<NaiveDate>,
+            _instrument_type_filter: Option<Vec<String>>,
+        ) -> Result<crate::activities::ActivitySearchResponse> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::search_activities should not be called".to_string(),
+            ))
+        }
+
+        async fn create_activity(
+            &self,
+            _new_activity: crate::activities::NewActivity,
+        ) -> Result<Activity> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::create_activity should not be called".to_string(),
+            ))
+        }
+
+        async fn update_activity(
+            &self,
+            _activity_update: crate::activities::ActivityUpdate,
+        ) -> Result<Activity> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::update_activity should not be called".to_string(),
+            ))
+        }
+
+        async fn delete_activity(&self, _activity_id: String) -> Result<Activity> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::delete_activity should not be called".to_string(),
+            ))
+        }
+
+        async fn link_transfer_activities(
+            &self,
+            _activity_a_id: String,
+            _activity_b_id: String,
+        ) -> Result<(Activity, Activity)> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::link_transfer_activities should not be called".to_string(),
+            ))
+        }
+
+        async fn unlink_transfer_activities(
+            &self,
+            _activity_a_id: String,
+            _activity_b_id: String,
+        ) -> Result<(Activity, Activity)> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::unlink_transfer_activities should not be called"
+                    .to_string(),
+            ))
+        }
+
+        async fn bulk_mutate_activities(
+            &self,
+            _creates: Vec<crate::activities::NewActivity>,
+            _updates: Vec<crate::activities::ActivityUpdate>,
+            _delete_ids: Vec<String>,
+        ) -> Result<crate::activities::ActivityBulkMutationResult> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::bulk_mutate_activities should not be called".to_string(),
+            ))
+        }
+
+        async fn create_activities(
+            &self,
+            _activities: Vec<crate::activities::NewActivity>,
+        ) -> Result<usize> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::create_activities should not be called".to_string(),
+            ))
+        }
+
+        fn get_first_activity_date(
+            &self,
+            account_ids: Option<&[String]>,
+        ) -> Result<Option<DateTime<Utc>>> {
+            let first = self
+                .activities
+                .iter()
+                .filter(|activity| {
+                    account_ids
+                        .map(|ids| ids.contains(&activity.account_id))
+                        .unwrap_or(true)
+                })
+                .map(|activity| activity.activity_date)
+                .min();
+            Ok(first)
+        }
+
+        fn get_import_mapping(
+            &self,
+            _account_id: &str,
+            _context_kind: &str,
+        ) -> Result<Option<crate::activities::ImportMapping>> {
+            Ok(None)
+        }
+
+        async fn save_import_mapping(
+            &self,
+            _mapping: &crate::activities::ImportMapping,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn link_account_template(
+            &self,
+            _account_id: &str,
+            _template_id: &str,
+            _context_kind: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_import_templates(&self) -> Result<Vec<crate::activities::ImportTemplate>> {
+            Ok(Vec::new())
+        }
+
+        fn get_import_template(
+            &self,
+            _template_id: &str,
+        ) -> Result<Option<crate::activities::ImportTemplate>> {
+            Ok(None)
+        }
+
+        async fn save_import_template(
+            &self,
+            _template: &crate::activities::ImportTemplate,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_import_template(&self, _template_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_broker_sync_profile(
+            &self,
+            _account_id: &str,
+            _source_system: &str,
+        ) -> Result<Option<crate::activities::ImportTemplate>> {
+            Ok(None)
+        }
+
+        async fn save_broker_sync_profile(
+            &self,
+            _template: &crate::activities::ImportTemplate,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn link_broker_sync_profile(
+            &self,
+            _account_id: &str,
+            _template_id: &str,
+            _source_system: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn calculate_average_cost(&self, _account_id: &str, _asset_id: &str) -> Result<Decimal> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::calculate_average_cost should not be called".to_string(),
+            ))
+        }
+
+        fn get_income_activities_data(
+            &self,
+            _account_ids: Option<&[String]>,
+        ) -> Result<Vec<crate::activities::IncomeData>> {
+            Ok(Vec::new())
+        }
+
+        fn get_first_activity_date_overall(&self) -> Result<DateTime<Utc>> {
+            self.activities
+                .iter()
+                .map(|activity| activity.activity_date)
+                .min()
+                .ok_or_else(|| errors::Error::Unexpected("no activities".to_string()))
+        }
+
+        fn get_activity_bounds_for_assets(
+            &self,
+            _asset_ids: &[String],
+        ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>> {
+            Ok(HashMap::new())
+        }
+
+        fn get_holdings_snapshot_bounds_for_assets(
+            &self,
+            _asset_ids: &[String],
+        ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>> {
+            Ok(HashMap::new())
+        }
+
+        fn check_existing_duplicates(
+            &self,
+            _idempotency_keys: &[String],
+        ) -> Result<HashMap<String, String>> {
+            Ok(HashMap::new())
+        }
+
+        async fn bulk_upsert(
+            &self,
+            _activities: Vec<crate::activities::ActivityUpsert>,
+        ) -> Result<crate::activities::BulkUpsertResult> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::bulk_upsert should not be called".to_string(),
+            ))
+        }
+
+        async fn reassign_asset(&self, _old_asset_id: &str, _new_asset_id: &str) -> Result<u32> {
+            Err(errors::Error::Unexpected(
+                "TestActivityRepository::reassign_asset should not be called".to_string(),
+            ))
+        }
+
+        async fn get_activity_accounts_and_currencies_by_asset_id(
+            &self,
+            _asset_id: &str,
+        ) -> Result<(Vec<String>, Vec<String>)> {
+            Ok((Vec::new(), Vec::new()))
+        }
+    }
+
+    /// Build the fixture used by the divergence / invariant tests: Feb 15 seed
+    /// of 100 CAD, Mar 15 deposit of 2000 CAD + buy of 7 × 260, then a synthetic
+    /// linear drift in holdings value to 1809.16 by Apr 14. Mirrors the shape
+    /// of the user's Reproduce account that originally surfaced the bug.
+    fn fixture_small_seed_then_large_deposit() -> Vec<DailyAccountValuation> {
+        let mut history = Vec::new();
+
+        // Feb 15 → Mar 14: $100 cash, no activity.
+        let mut d = NaiveDate::parse_from_str("2026-02-15", "%Y-%m-%d").unwrap();
+        let pre_deposit_end = NaiveDate::parse_from_str("2026-03-14", "%Y-%m-%d").unwrap();
+        while d <= pre_deposit_end {
+            history.push(valuation(
+                &d.format("%Y-%m-%d").to_string(),
+                dec!(100),
+                dec!(100),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ));
+            d = d.succ_opt().unwrap();
+        }
+
+        // Mar 15: deposit 2000, buy 7 × 260 = 1820 same day. Net contribution
+        // 2100, total_value 2100 (cash 280 + holdings at cost 1820).
+        let mut deposit_day =
+            valuation("2026-03-15", dec!(2100), dec!(2100), dec!(1820), dec!(1820));
+        deposit_day.external_inflow_base = dec!(2000);
+        history.push(deposit_day);
+
+        // Mar 16 → Apr 13: holdings drift down by ~0.7/day (~$20 total over ~29 days).
+        let mut d = NaiveDate::parse_from_str("2026-03-16", "%Y-%m-%d").unwrap();
+        let drift_end = NaiveDate::parse_from_str("2026-04-13", "%Y-%m-%d").unwrap();
+        let mut imv = dec!(1820);
+        while d <= drift_end {
+            imv -= dec!(0.7);
+            history.push(valuation(
+                &d.format("%Y-%m-%d").to_string(),
+                dec!(280) + imv,
+                dec!(2100),
+                imv,
+                dec!(1820),
+            ));
+            d = d.succ_opt().unwrap();
+        }
+
+        // Apr 14: final row — value matches the dashboard screenshot.
+        history.push(valuation(
+            "2026-04-14",
+            dec!(2089.16),
+            dec!(2100),
+            dec!(1809.16),
+            dec!(1820),
+        ));
+
+        history
+    }
+
+    fn date(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn activity_time(date_str: &str) -> DateTime<Utc> {
+        date(date_str).and_hms_opt(0, 0, 0).unwrap().and_utc()
+    }
+
+    fn test_activity(
+        id: &str,
+        account_id: &str,
+        activity_type: ActivityType,
+        date_str: &str,
+    ) -> Activity {
+        let activity_time = activity_time(date_str);
+        Activity {
+            id: id.to_string(),
+            account_id: account_id.to_string(),
+            asset_id: None,
+            activity_type: activity_type.as_str().to_string(),
+            activity_type_override: None,
+            source_type: None,
+            subtype: None,
+            status: crate::activities::ActivityStatus::Posted,
+            activity_date: activity_time,
+            settlement_date: None,
+            quantity: None,
+            unit_price: None,
+            amount: None,
+            fee: Some(Decimal::ZERO),
+            currency: "USD".to_string(),
+            fx_rate: None,
+            notes: None,
+            metadata: None,
+            source_system: None,
+            source_record_id: None,
+            source_group_id: None,
+            idempotency_key: None,
+            import_run_id: None,
+            is_user_modified: false,
+            needs_review: false,
+            created_at: activity_time,
+            updated_at: activity_time,
+        }
+    }
+
+    fn sell_activity_on(
+        id: &str,
+        account_id: &str,
+        date_str: &str,
+        quantity: Decimal,
+        price: Decimal,
+    ) -> Activity {
+        let mut activity = test_activity(id, account_id, ActivityType::Sell, date_str);
+        activity.asset_id = Some("AAPL".to_string());
+        activity.quantity = Some(quantity);
+        activity.unit_price = Some(price);
+        activity
+    }
+
+    fn sell_activity(id: &str, account_id: &str, quantity: Decimal, price: Decimal) -> Activity {
+        sell_activity_on(id, account_id, "2026-05-02", quantity, price)
+    }
+
+    fn split_activity_on(id: &str, account_id: &str, date_str: &str, ratio: Decimal) -> Activity {
+        let mut activity = test_activity(id, account_id, ActivityType::Split, date_str);
+        activity.asset_id = Some("AAPL".to_string());
+        activity.amount = Some(ratio);
+        activity
+    }
+
+    fn income_activity_on(
+        id: &str,
+        account_id: &str,
+        date_str: &str,
+        activity_type: ActivityType,
+        amount: Decimal,
+    ) -> Activity {
+        let mut activity = test_activity(id, account_id, activity_type, date_str);
+        activity.amount = Some(amount);
+        activity
+    }
+
+    fn generate_fifo_sell_disposal() -> LotDisposal {
+        let account_id = "acct";
+        let start_date = date("2026-05-01");
+        let sell_date = date("2026-05-02");
+        let acquisition_time = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+
+        let mut position = Position::new(
+            account_id.to_string(),
+            "AAPL".to_string(),
+            "USD".to_string(),
+            acquisition_time,
+        );
+        position.quantity = dec!(10);
+        position.average_cost = dec!(100);
+        position.total_cost_basis = dec!(1000);
+        position.lots = VecDeque::from([Lot {
+            id: "lot-1".to_string(),
+            position_id: position.id.clone(),
+            acquisition_date: acquisition_time,
+            quantity: dec!(10),
+            original_quantity: dec!(10),
+            cost_basis: dec!(1000),
+            acquisition_price: dec!(100),
+            acquisition_fees: Decimal::ZERO,
+            original_acquisition_fees: Decimal::ZERO,
+            fx_rate_to_position: None,
+            source_activity_id: Some("buy-1".to_string()),
+            split_ratio: Decimal::ONE,
+        }]);
+
+        let previous_snapshot = AccountStateSnapshot {
+            id: AccountStateSnapshot::stable_id(account_id, start_date),
+            account_id: account_id.to_string(),
+            snapshot_date: start_date,
+            currency: "USD".to_string(),
+            positions: HashMap::from([("AAPL".to_string(), position)]),
+            cost_basis: dec!(1000),
+            net_contribution: dec!(1000),
+            net_contribution_base: dec!(1000),
+            calculated_at: start_date.and_hms_opt(0, 0, 0).unwrap(),
+            ..Default::default()
+        };
+
+        let calculator = HoldingsCalculator::new(
+            Arc::new(TestFxService),
+            Arc::new(RwLock::new("USD".to_string())),
+            Arc::new(TestAssetRepository),
+        );
+        let result = calculator
+            .calculate_next_holdings(
+                &previous_snapshot,
+                &[sell_activity("sell-1", account_id, dec!(4), dec!(120))],
+                sell_date,
+            )
+            .expect("sell should reduce FIFO lots");
+
+        let position = result
+            .snapshot
+            .positions
+            .get("AAPL")
+            .expect("remaining AAPL position should exist");
+        assert_eq!(position.quantity, dec!(6));
+        assert_eq!(position.total_cost_basis, dec!(600));
+
+        let disposals = calculator.take_lot_disposals(account_id, "FIFO");
+        assert_eq!(disposals.len(), 1);
+        disposals.into_iter().next().unwrap()
+    }
+
+    fn generate_split_sell_disposal() -> LotDisposal {
+        let account_id = "acct";
+        let start_date = date("2026-05-01");
+        let split_date = date("2026-05-02");
+        let sell_date = date("2026-05-03");
+        let acquisition_time = activity_time("2026-05-01");
+
+        let mut position = Position::new(
+            account_id.to_string(),
+            "AAPL".to_string(),
+            "USD".to_string(),
+            acquisition_time,
+        );
+        position.quantity = dec!(10);
+        position.average_cost = dec!(100);
+        position.total_cost_basis = dec!(1000);
+        position.lots = VecDeque::from([Lot {
+            id: "lot-1".to_string(),
+            position_id: position.id.clone(),
+            acquisition_date: acquisition_time,
+            quantity: dec!(10),
+            original_quantity: dec!(10),
+            cost_basis: dec!(1000),
+            acquisition_price: dec!(100),
+            acquisition_fees: Decimal::ZERO,
+            original_acquisition_fees: Decimal::ZERO,
+            fx_rate_to_position: None,
+            source_activity_id: Some("buy-1".to_string()),
+            split_ratio: Decimal::ONE,
+        }]);
+
+        let previous_snapshot = AccountStateSnapshot {
+            id: AccountStateSnapshot::stable_id(account_id, start_date),
+            account_id: account_id.to_string(),
+            snapshot_date: start_date,
+            currency: "USD".to_string(),
+            positions: HashMap::from([("AAPL".to_string(), position)]),
+            cost_basis: dec!(1000),
+            net_contribution: dec!(1000),
+            net_contribution_base: dec!(1000),
+            calculated_at: start_date.and_hms_opt(0, 0, 0).unwrap(),
+            ..Default::default()
+        };
+
+        let calculator = HoldingsCalculator::new(
+            Arc::new(TestFxService),
+            Arc::new(RwLock::new("USD".to_string())),
+            Arc::new(TestAssetRepository),
+        );
+        let split_result = calculator
+            .calculate_next_holdings(
+                &previous_snapshot,
+                &[split_activity_on(
+                    "split-1",
+                    account_id,
+                    "2026-05-02",
+                    dec!(2),
+                )],
+                split_date,
+            )
+            .expect("split should adjust the open lot");
+        let split_position = split_result
+            .snapshot
+            .positions
+            .get("AAPL")
+            .expect("split AAPL position should exist");
+        assert_eq!(split_position.quantity, dec!(20));
+        assert_eq!(split_position.average_cost, dec!(50));
+        assert_eq!(split_position.total_cost_basis, dec!(1000));
+        assert_eq!(split_position.lots[0].quantity, dec!(10));
+        assert_eq!(split_position.lots[0].split_ratio, dec!(2));
+
+        let sell_result = calculator
+            .calculate_next_holdings(
+                &split_result.snapshot,
+                &[sell_activity_on(
+                    "sell-split-1",
+                    account_id,
+                    "2026-05-03",
+                    dec!(6),
+                    dec!(70),
+                )],
+                sell_date,
+            )
+            .expect("post-split sell should reduce FIFO lots");
+        let position = sell_result
+            .snapshot
+            .positions
+            .get("AAPL")
+            .expect("remaining AAPL position should exist");
+        assert_eq!(position.quantity, dec!(14));
+        assert_eq!(position.average_cost, dec!(50));
+        assert_eq!(position.total_cost_basis, dec!(700));
+        assert_eq!(position.lots[0].quantity, dec!(7));
+        assert_eq!(position.lots[0].split_ratio, dec!(2));
+
+        let disposals = calculator.take_lot_disposals(account_id, "FIFO");
+        assert_eq!(disposals.len(), 1);
+        disposals.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn sell_lot_disposal_feeds_realized_pnl_and_cashflow_into_performance() {
+        let disposal = generate_fifo_sell_disposal();
+        assert_eq!(disposal.disposal_activity_id, "sell-1");
+        assert_eq!(disposal.cost_basis_method, "FIFO");
+        assert_eq!(Decimal::from_str(&disposal.proceeds).unwrap(), dec!(480));
+        assert_eq!(Decimal::from_str(&disposal.cost_basis).unwrap(), dec!(400));
+        assert_eq!(Decimal::from_str(&disposal.realized_pnl).unwrap(), dec!(80));
+        assert_eq!(
+            Decimal::from_str(&disposal.proceeds_base).unwrap(),
+            dec!(480)
+        );
+        assert_eq!(
+            Decimal::from_str(&disposal.cost_basis_base).unwrap(),
+            dec!(400)
+        );
+        assert_eq!(
+            Decimal::from_str(&disposal.realized_pnl_base).unwrap(),
+            dec!(80)
+        );
+
+        let mut start = valuation("2026-05-01", dec!(1000), dec!(1000), dec!(1000), dec!(1000));
+        start.account_currency = "USD".to_string();
+        start.base_currency = "USD".to_string();
+        start.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let mut after_sell = valuation("2026-05-02", dec!(1200), dec!(1000), dec!(720), dec!(600));
+        after_sell.account_currency = "USD".to_string();
+        after_sell.base_currency = "USD".to_string();
+        after_sell.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let mut after_withdrawal =
+            valuation("2026-05-03", dec!(1000), dec!(800), dec!(720), dec!(600));
+        after_withdrawal.account_currency = "USD".to_string();
+        after_withdrawal.base_currency = "USD".to_string();
+        after_withdrawal.external_outflow_base = dec!(200);
+        after_withdrawal.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let valuation_service = Arc::new(TestValuationService::new(vec![
+            start,
+            after_sell,
+            after_withdrawal,
+        ]));
+        let performance_service =
+            PerformanceService::new(valuation_service, Arc::new(TestQuoteService))
+                .with_lot_repository(Arc::new(TestLotRepository {
+                    disposals: vec![disposal],
+                }));
+        let account_ids = vec!["acct".to_string()];
+
+        let performance = performance_service
+            .calculate_performance_history_for_accounts(
+                "scope:acct",
+                &account_ids,
+                "USD",
+                &HashMap::new(),
+                &HashMap::new(),
+                Some(date("2026-05-01")),
+                Some(date("2026-05-03")),
+            )
+            .await
+            .expect("performance should include lot disposal attribution");
+
+        assert_eq!(performance.attribution.contributions, Decimal::ZERO);
+        assert_eq!(performance.attribution.distributions, dec!(200));
+        assert_eq!(performance.attribution.realized_pnl, dec!(80));
+        assert_eq!(performance.attribution.unrealized_pnl_change, dec!(120));
+        assert_eq!(performance.attribution.residual, Decimal::ZERO);
+        assert_eq!(attribution_pnl(&performance), dec!(200));
+        assert_eq!(performance.returns.twr.unwrap().round_dp(4), dec!(0.2));
+        assert_eq!(
+            performance.returns.value_return.unwrap().round_dp(4),
+            dec!(0.2)
+        );
+        assert_eq!(
+            performance.series.last().unwrap().value.round_dp(4),
+            dec!(0.2)
+        );
+    }
+
+    #[tokio::test]
+    async fn split_sell_disposal_dividend_and_interest_feed_performance_attribution() {
+        let disposal = generate_split_sell_disposal();
+        assert_eq!(disposal.disposal_activity_id, "sell-split-1");
+        assert_eq!(disposal.cost_basis_method, "FIFO");
+        assert_eq!(Decimal::from_str(&disposal.quantity).unwrap(), dec!(6));
+        assert_eq!(Decimal::from_str(&disposal.proceeds).unwrap(), dec!(420));
+        assert_eq!(Decimal::from_str(&disposal.cost_basis).unwrap(), dec!(300));
+        assert_eq!(
+            Decimal::from_str(&disposal.realized_pnl).unwrap(),
+            dec!(120)
+        );
+        assert_eq!(
+            Decimal::from_str(&disposal.proceeds_base).unwrap(),
+            dec!(420)
+        );
+        assert_eq!(
+            Decimal::from_str(&disposal.cost_basis_base).unwrap(),
+            dec!(300)
+        );
+        assert_eq!(
+            Decimal::from_str(&disposal.realized_pnl_base).unwrap(),
+            dec!(120)
+        );
+
+        let mut start = valuation("2026-05-01", dec!(1000), dec!(1000), dec!(1000), dec!(1000));
+        start.account_currency = "USD".to_string();
+        start.base_currency = "USD".to_string();
+        start.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let mut after_split =
+            valuation("2026-05-02", dec!(1000), dec!(1000), dec!(1000), dec!(1000));
+        after_split.account_currency = "USD".to_string();
+        after_split.base_currency = "USD".to_string();
+        after_split.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let mut after_sell = valuation("2026-05-03", dec!(1470), dec!(1000), dec!(1050), dec!(700));
+        after_sell.account_currency = "USD".to_string();
+        after_sell.base_currency = "USD".to_string();
+        after_sell.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let mut after_income_withdrawal =
+            valuation("2026-05-04", dec!(1420), dec!(900), dec!(1050), dec!(700));
+        after_income_withdrawal.account_currency = "USD".to_string();
+        after_income_withdrawal.base_currency = "USD".to_string();
+        after_income_withdrawal.external_outflow_base = dec!(100);
+        after_income_withdrawal.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let valuation_service = Arc::new(TestValuationService::new(vec![
+            start,
+            after_split,
+            after_sell,
+            after_income_withdrawal,
+        ]));
+        let activity_repo = Arc::new(TestActivityRepository::new(vec![
+            split_activity_on("split-1", "acct", "2026-05-02", dec!(2)),
+            sell_activity_on("sell-split-1", "acct", "2026-05-03", dec!(6), dec!(70)),
+            income_activity_on(
+                "dividend-1",
+                "acct",
+                "2026-05-04",
+                ActivityType::Dividend,
+                dec!(30),
+            ),
+            income_activity_on(
+                "interest-1",
+                "acct",
+                "2026-05-04",
+                ActivityType::Interest,
+                dec!(20),
+            ),
+        ]));
+        let performance_service =
+            PerformanceService::new(valuation_service, Arc::new(TestQuoteService))
+                .with_lot_repository(Arc::new(TestLotRepository {
+                    disposals: vec![disposal],
+                }))
+                .with_activity_repository(activity_repo, Arc::new(TestFxService));
+        let account_ids = vec!["acct".to_string()];
+
+        let performance = performance_service
+            .calculate_performance_history_for_accounts(
+                "scope:acct",
+                &account_ids,
+                "USD",
+                &HashMap::new(),
+                &HashMap::new(),
+                Some(date("2026-05-01")),
+                Some(date("2026-05-04")),
+            )
+            .await
+            .expect("performance should include split-aware disposal and income attribution");
+
+        assert_eq!(performance.attribution.contributions, Decimal::ZERO);
+        assert_eq!(performance.attribution.distributions, dec!(100));
+        assert_eq!(performance.attribution.income, dec!(50));
+        assert_eq!(performance.attribution.realized_pnl, dec!(120));
+        assert_eq!(performance.attribution.unrealized_pnl_change, dec!(350));
+        assert_eq!(performance.attribution.fees, Decimal::ZERO);
+        assert_eq!(performance.attribution.taxes, Decimal::ZERO);
+        assert_eq!(performance.attribution.residual, Decimal::ZERO);
+        assert_eq!(attribution_pnl(&performance), dec!(520));
+        assert_eq!(performance.returns.twr.unwrap().round_dp(4), dec!(0.52));
+        assert_eq!(
+            performance.returns.value_return.unwrap().round_dp(4),
+            dec!(0.52)
+        );
+        assert_eq!(
+            performance.series.last().unwrap().value.round_dp(4),
+            dec!(0.52)
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_attribution_uses_configured_timezone_for_period_window() {
+        let mut start = valuation("2026-05-31", dec!(1000), dec!(1000), dec!(1000), dec!(1000));
+        start.account_id = "acct".to_string();
+        start.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let mut end = valuation("2026-06-01", dec!(1020), dec!(1000), dec!(1000), dec!(1000));
+        end.account_id = "acct".to_string();
+        end.external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let activity_time = DateTime::parse_from_rfc3339("2026-06-02T02:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut dividend = income_activity_on(
+            "dividend-midnight",
+            "acct",
+            "2026-06-02",
+            ActivityType::Dividend,
+            dec!(20),
+        );
+        dividend.activity_date = activity_time;
+        dividend.created_at = activity_time;
+        dividend.updated_at = activity_time;
+        dividend.currency = "CAD".to_string();
+
+        let valuation_service = Arc::new(TestValuationService::new(vec![start, end]));
+        let activity_repo = Arc::new(TestActivityRepository::new(vec![dividend]));
+        let timezone = Arc::new(RwLock::new("America/Toronto".to_string()));
+        let performance_service = PerformanceService::new_with_timezone(
+            valuation_service,
+            Arc::new(TestQuoteService),
+            timezone,
+        )
+        .with_activity_repository(activity_repo, Arc::new(TestFxService));
+
+        let performance = performance_service
+            .calculate_account_performance(
+                "acct",
+                Some(date("2026-05-31")),
+                Some(date("2026-06-01")),
+                Some(TrackingMode::Transactions),
+                Some(account_types::SECURITIES),
+            )
+            .await
+            .expect("performance should include local-date dividend attribution");
+
+        assert_eq!(performance.attribution.income, dec!(20));
+        assert_eq!(performance.attribution.residual, Decimal::ZERO);
+    }
+
+    fn activity_fixture(activity_type: ActivityType, amount: Decimal, fee: Decimal) -> Activity {
+        let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        Activity {
+            id: format!("activity-{}", activity_type.as_str()),
+            account_id: "acct".to_string(),
+            asset_id: None,
+            activity_type: activity_type.as_str().to_string(),
+            activity_type_override: None,
+            source_type: None,
+            subtype: None,
+            status: crate::activities::ActivityStatus::Posted,
+            activity_date: now,
+            settlement_date: None,
+            quantity: None,
+            unit_price: None,
+            amount: Some(amount),
+            fee: Some(fee),
+            currency: "CAD".to_string(),
+            fx_rate: None,
+            notes: None,
+            metadata: None,
+            source_system: None,
+            source_record_id: None,
+            source_group_id: None,
+            idempotency_key: None,
+            import_run_id: None,
+            is_user_modified: false,
+            needs_review: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn activity_attribution_components_separate_income_fees_and_taxes() {
+        let dividend = activity_fixture(ActivityType::Dividend, dec!(50), dec!(2));
+        assert_eq!(
+            PerformanceService::activity_attribution_components(&dividend, &ActivityType::Dividend),
+            (dec!(50), dec!(2), Decimal::ZERO)
+        );
+
+        let explicit_fee = activity_fixture(ActivityType::Fee, dec!(4), Decimal::ZERO);
+        assert_eq!(
+            PerformanceService::activity_attribution_components(&explicit_fee, &ActivityType::Fee),
+            (Decimal::ZERO, dec!(4), Decimal::ZERO)
+        );
+
+        let tax = activity_fixture(ActivityType::Tax, dec!(7), Decimal::ZERO);
+        assert_eq!(
+            PerformanceService::activity_attribution_components(&tax, &ActivityType::Tax),
+            (Decimal::ZERO, Decimal::ZERO, dec!(7))
+        );
+
+        let buy = activity_fixture(ActivityType::Buy, dec!(100), dec!(1));
+        assert_eq!(
+            PerformanceService::activity_attribution_components(&buy, &ActivityType::Buy),
+            (Decimal::ZERO, dec!(1), Decimal::ZERO)
+        );
+    }
+
+    /// Regression test for the reporter's bug. Pre-fix, the headline return was
+    /// `gain / start_value` = -10.84/100 = -10.84%. Post-fix, it's daily-linked
+    /// TWR — should end up near zero, dominated by the synthetic ~1.1% AAPL
+    /// drift between Mar 15 and Apr 14.
+    #[test]
+    fn perf_does_not_explode_when_start_value_tiny_vs_cash_flow() {
+        let history = fixture_small_seed_then_large_deposit();
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            Some(date("2026-01-01")),
+            false, // summary path — matches the dashboard
+        )
+        .expect("summary should compute");
+
+        let twr = result.returns.twr.expect("TWR should be Some");
+
+        // Old formula: -0.1084. New: small (market-drift-dominated). Bounds are
+        // wide — the fixture uses synthetic linear drift and exact precision
+        // isn't what we're testing; we're testing that the percentage is sane.
+        assert!(
+            twr > dec!(-0.05),
+            "TWR = {} should be > -5% (was -10.84% with the old formula)",
+            twr
+        );
+        assert!(
+            twr < dec!(0.01),
+            "TWR = {} should be < 1% (asset drifted down slightly)",
+            twr
+        );
+
+        // $ gain is unchanged — end - start - cash_flow = 2089.16 - 100 - 2000.
+        assert_eq!(attribution_pnl(&result), dec!(-10.84));
+        assert_eq!(
+            result.returns.value_return.unwrap().round_dp(4),
+            dec!(-0.1084)
+        );
+        assert!(!result
+            .data_quality
+            .not_applicable_reasons
+            .iter()
+            .any(|reason| reason.contains("transaction-mode")));
+        assert!(result.returns.twr.is_some());
+    }
+
+    /// Invariant: summary and full paths must agree on headline returns. This is
+    /// the core guarantee the refactor is meant to enforce — the dashboard card
+    /// and account-detail page showing different percentages for the same
+    /// account / range was the original user complaint.
+    #[test]
+    fn perf_full_and_summary_paths_agree_on_headline_return() {
+        let history = fixture_small_seed_then_large_deposit();
+        let start = Some(date("2026-01-01"));
+
+        let full = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            start,
+            true,
+        )
+        .expect("full should compute");
+
+        let summary = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            start,
+            false,
+        )
+        .expect("summary should compute");
+        let headline = PerformanceService::compute_account_performance_with_flow_basis(
+            &history,
+            Some(TrackingMode::Transactions),
+            start,
+            false,
+            ExternalFlowBasis::BaseCurrency,
+            PerformanceSummaryProfile::Headline,
+            false,
+        )
+        .expect("headline should compute");
+
+        // Headline percentage must match exactly — that's the user-visible
+        // invariant. Everything else (returns series, risk metrics) is summary
+        // vs full differentiation.
+        assert_eq!(full.returns.irr, summary.returns.irr);
+        assert_eq!(full.mode, ReturnMethod::TimeWeighted);
+        assert_eq!(summary.mode, ReturnMethod::TimeWeighted);
+        assert_eq!(full.returns.twr, summary.returns.twr);
+        assert_eq!(full.returns.twr, headline.returns.twr);
+        assert_eq!(attribution_pnl(&full), attribution_pnl(&summary));
+        assert_eq!(attribution_pnl(&full), attribution_pnl(&headline));
+        assert_eq!(full.returns.value_return, summary.returns.value_return);
+        assert_eq!(full.returns.value_return, headline.returns.value_return);
+
+        // Differentiation: full path populates returns[] and risk metrics;
+        // summary stays empty/zero to save allocation on the dashboard.
+        assert!(!full.series.is_empty());
+        assert!(summary.series.is_empty());
+        assert!(full.risk.volatility.unwrap() > Decimal::ZERO);
+        assert!(summary.risk.volatility.is_some());
+        assert!(headline.returns.irr.is_none());
+        assert!(headline.returns.annualized_twr.is_none());
+        assert!(headline.risk.volatility.is_none());
+    }
+
+    /// Well-formed account (`start_value == net_contribution`) stays sane —
+    /// the common case shouldn't regress.
+    #[test]
+    fn perf_well_formed_account_remains_sane() {
+        let history = vec![
+            valuation(
+                "2026-02-15",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-02-16",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation("2026-04-14", dec!(999.48), dec!(1000), dec!(259), dec!(260)),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            Some(date("2026-01-01")),
+            false,
+        )
+        .expect("summary should compute");
+
+        let twr = result.returns.twr.expect("TWR should be Some");
+        assert!(
+            twr.abs() < dec!(0.01),
+            "TWR = {} should be small for well-formed account",
+            twr
+        );
+        assert_eq!(attribution_pnl(&result).round_dp(2), dec!(-0.52));
+    }
+
+    #[test]
+    fn perf_all_time_transactions_pnl_uses_inception_baseline() {
+        let history = vec![
+            valuation("2026-01-10", dec!(1015), dec!(1000), dec!(915), dec!(900)),
+            valuation("2026-01-11", dec!(1025), dec!(1000), dec!(925), dec!(900)),
+            valuation("2026-01-12", dec!(1040), dec!(1000), dec!(940), dec!(900)),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("all-time performance should compute");
+
+        assert_eq!(result.mode, ReturnMethod::TimeWeighted);
+        assert_eq!(result.attribution.contributions, dec!(1000));
+        assert_eq!(result.attribution.distributions, Decimal::ZERO);
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(40));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(attribution_pnl(&result), dec!(40));
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.0246));
+        assert!(!result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| PerformanceService::is_attribution_residual_warning(warning)));
+    }
+
+    #[test]
+    fn perf_all_time_recompute_preserves_inception_baseline_after_attribution_enrichment() {
+        let history = vec![
+            valuation("2026-01-10", dec!(1015), dec!(1000), dec!(915), dec!(900)),
+            valuation("2026-01-12", dec!(1040), dec!(1000), dec!(940), dec!(900)),
+        ];
+
+        let mut result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("all-time performance should compute");
+
+        result.attribution.income = dec!(5);
+        result.attribution.unrealized_pnl_change -= dec!(5);
+        PerformanceService::recompute_attribution_residual(
+            &mut result,
+            &history,
+            ExternalFlowBasis::BaseCurrency,
+            AttributionBaseline::Inception,
+        );
+
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(attribution_pnl(&result), dec!(40));
+    }
+
+    #[test]
+    fn attribution_residual_tolerance_uses_two_tenths_percent() {
+        let history = vec![
+            valuation(
+                "2026-05-01",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(1001.5),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.attribution.residual, dec!(1.5));
+        assert!(!result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| PerformanceService::is_attribution_residual_warning(warning)));
+    }
+
+    #[test]
+    fn attribution_residual_warning_uses_user_facing_message() {
+        let history = vec![
+            valuation(
+                "2026-05-01",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(1003),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.attribution.residual, dec!(3));
+        assert!(result.data_quality.warnings.iter().any(|warning| {
+            warning.starts_with("Performance attribution is incomplete for this period")
+                && warning.contains("Difference: 3")
+                && warning.contains("Review Health Center")
+        }));
+    }
+
+    #[test]
+    fn perf_bounded_transactions_pnl_keeps_period_start_baseline() {
+        let history = vec![
+            valuation("2026-01-10", dec!(1015), dec!(1000), dec!(915), dec!(900)),
+            valuation("2026-01-11", dec!(1025), dec!(1000), dec!(925), dec!(900)),
+            valuation("2026-01-12", dec!(1040), dec!(1000), dec!(940), dec!(900)),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            Some(date("2026-01-10")),
+            false,
+        )
+        .expect("bounded performance should compute");
+
+        assert_eq!(result.attribution.contributions, Decimal::ZERO);
+        assert_eq!(result.attribution.distributions, Decimal::ZERO);
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(25));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(attribution_pnl(&result), dec!(25));
+    }
+
+    #[test]
+    fn perf_all_time_transactions_with_negative_net_contribution_keeps_lifetime_pnl() {
+        let history = vec![
+            valuation("2026-02-01", dec!(1030), dec!(1000), dec!(930), dec!(900)),
+            valuation("2026-02-10", dec!(1400), dec!(1000), dec!(1200), dec!(900)),
+            valuation("2026-02-20", dec!(50), dec!(-400), dec!(50), Decimal::ZERO),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("all-time performance should compute");
+
+        assert_eq!(result.attribution.contributions, dec!(1000));
+        assert_eq!(result.attribution.distributions, dec!(1400));
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(50));
+        assert_eq!(result.attribution.residual, dec!(400));
+        assert_eq!(attribution_pnl(&result), dec!(450));
+    }
+
+    #[test]
+    fn twr_uses_start_of_day_inflow_convention() {
+        let history = vec![
+            valuation(
+                "2026-05-01",
+                dec!(100),
+                dec!(100),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(210),
+                dec!(200),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.05));
+    }
+
+    #[test]
+    fn twr_uses_end_of_day_outflow_convention() {
+        let history = vec![
+            valuation(
+                "2026-05-01",
+                dec!(200),
+                dec!(200),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(110),
+                dec!(100),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.05));
+    }
+
+    #[test]
+    fn twr_and_irr_handle_zero_start_then_early_deposit() {
+        let mut history = vec![
+            valuation(
+                "2026-05-01",
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(100),
+                dec!(100),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2027-05-02",
+                dec!(110),
+                dec!(100),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        history[1].external_inflow_base = dec!(100);
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.1));
+        assert!(result.returns.irr.is_some());
+        assert!(result.returns.value_return.is_none());
+        assert!(result
+            .data_quality
+            .not_applicable_reasons
+            .iter()
+            .any(|reason| reason.contains("starting value is zero or negative")));
+        assert_eq!(result.series.last().unwrap().value.round_dp(4), dec!(0.1));
+    }
+
+    #[test]
+    fn twr_and_irr_keep_same_day_deposit_and_withdrawal_gross() {
+        let mut history = vec![
+            valuation(
+                "2026-05-01",
+                dec!(100),
+                dec!(100),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2027-05-01",
+                dec!(168),
+                dec!(160),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        history[1].external_inflow_base = dec!(100);
+        history[1].external_outflow_base = dec!(40);
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        let daily_flows = PerformanceService::daily_external_flow_series(
+            &history,
+            ExternalFlowBasis::BaseCurrency,
+        );
+        let (contributions, distributions) = PerformanceService::total_external_flows(&daily_flows);
+        assert_eq!(contributions, dec!(100));
+        assert_eq!(distributions, dec!(40));
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.04));
+        assert!(result.returns.irr.is_some());
+        assert!(!result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("inferred from net contribution")));
+    }
+
+    #[test]
+    fn net_flow_fallback_is_shared_by_twr_irr_value_return_and_attribution() {
+        let history = vec![
+            valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2027-05-01", dec!(160), dec!(150), dec!(160), dec!(150)),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.attribution.contributions, dec!(150));
+        assert_eq!(result.attribution.distributions, Decimal::ZERO);
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(10));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.0667));
+        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.1));
+        assert!(result.returns.irr.is_some());
+        assert!(result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("inferred from net contribution")));
+    }
+
+    #[test]
+    fn zero_net_fallback_flow_warns_across_account_return_paths() {
+        let mut history = vec![
+            valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2027-05-01", dec!(110), dec!(100), dec!(110), dec!(100)),
+        ];
+        history[1].external_flow_source = ExternalFlowSource::NetContributionFallback;
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.attribution.contributions, dec!(100));
+        assert_eq!(result.attribution.distributions, Decimal::ZERO);
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(10));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.1));
+        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.1));
+        assert!(result.returns.irr.is_some());
+        assert!(result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("inferred from net contribution")));
+    }
+
+    #[test]
+    fn explicit_gross_same_day_flows_feed_all_account_return_paths() {
+        let mut history = vec![
+            valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2027-05-01", dec!(120), dec!(100), dec!(120), dec!(100)),
+        ];
+        history[1].external_inflow_base = dec!(100);
+        history[1].external_outflow_base = dec!(100);
+        history[1].external_flow_source = ExternalFlowSource::ActivityDerived;
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.attribution.contributions, dec!(200));
+        assert_eq!(result.attribution.distributions, dec!(100));
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(20));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.1));
+        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.2));
+        assert!(result.returns.irr.is_some());
+        assert!(!result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("inferred from net contribution")));
+    }
+
+    #[test]
+    fn account_performance_reports_period_irr_and_annualized_xirr() {
+        let history = vec![
+            valuation("2026-01-01", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2026-07-02", dec!(110), dec!(100), dec!(110), dec!(100)),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        let irr = result.returns.irr.expect("period IRR should be present");
+        let annualized_irr = result
+            .returns
+            .annualized_irr
+            .expect("annualized XIRR should be present");
+        let expected_annualized = PerformanceService::calculate_annualized_return(
+            date("2026-01-01"),
+            date("2026-07-02"),
+            dec!(0.1),
+        );
+
+        assert_eq!(irr.round_dp(4), dec!(0.1));
+        assert_eq!(annualized_irr.round_dp(4), expected_annualized.round_dp(4));
+        assert!(annualized_irr > irr);
+    }
+
+    #[test]
+    fn realized_pnl_attribution_warns_when_acquisition_fx_is_missing() {
+        let disposal = lot_disposal("USD", "CAD", "1.1", "100", "0", "0");
+
+        let warning = PerformanceService::realized_pnl_base_from_disposal(&disposal)
+            .expect_err("missing acquisition FX should make base realized P&L unusable");
+
+        assert!(warning.contains("acquisition FX conversion was unavailable"));
+    }
+
+    #[test]
+    fn realized_pnl_attribution_accepts_complete_base_disposal() {
+        let disposal = lot_disposal("USD", "CAD", "1.1", "100", "110", "22");
+
+        let realized_pnl_base = PerformanceService::realized_pnl_base_from_disposal(&disposal)
+            .expect("complete FX facts should be usable");
+
+        assert_eq!(realized_pnl_base, dec!(22));
+    }
+
+    #[test]
+    fn irr_returns_none_when_cash_flows_have_no_sign_change() {
+        let mut history = vec![
+            valuation(
+                "2026-05-01",
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(10),
+                dec!(-10),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        history[1].external_outflow_base = dec!(10);
+
+        let daily_flows = PerformanceService::daily_external_flow_series(
+            &history,
+            ExternalFlowBasis::BaseCurrency,
+        );
+        let irr = PerformanceService::calculate_xirr(
+            &history,
+            &daily_flows,
+            ExternalFlowBasis::BaseCurrency,
+        );
+
+        assert!(irr.annualized_irr.is_none());
+        assert!(irr
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("do not change sign")));
+    }
+
+    #[test]
+    fn irr_returns_none_when_solver_does_not_converge() {
+        let history = vec![
+            valuation("2026-05-01", dec!(1), dec!(1), Decimal::ZERO, Decimal::ZERO),
+            valuation(
+                "2026-05-02",
+                dec!(1000000000000),
+                dec!(1),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+
+        let daily_flows = PerformanceService::daily_external_flow_series(
+            &history,
+            ExternalFlowBasis::BaseCurrency,
+        );
+        let irr = PerformanceService::calculate_xirr(
+            &history,
+            &daily_flows,
+            ExternalFlowBasis::BaseCurrency,
+        );
+
+        assert!(irr.annualized_irr.is_none());
+        assert!(irr
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("did not converge")));
+    }
+
+    #[test]
+    fn return_period_with_non_positive_denominator_is_excluded() {
+        let history = vec![
+            valuation(
+                "2026-05-01",
+                dec!(0.5),
+                dec!(0.5),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(0.5),
+                dec!(0.5),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert!(result.returns.twr.is_none());
+        assert_eq!(result.series.last().unwrap().value, Decimal::ZERO);
+        assert!(!result.data_quality.not_applicable_reasons.is_empty());
+    }
+
+    #[test]
+    fn twr_tiny_denominator_before_chain_makes_result_not_applicable() {
+        let mut history = vec![
+            valuation(
+                "2026-05-01",
+                dec!(0.5),
+                dec!(0.5),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-05-02",
+                dec!(0.5),
+                dec!(0.5),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation("2026-05-03", dec!(2), dec!(2), Decimal::ZERO, Decimal::ZERO),
+        ];
+        history[2].external_inflow_base = dec!(1.5);
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert!(result.returns.twr.is_none());
+        assert!(result
+            .data_quality
+            .not_applicable_reasons
+            .iter()
+            .any(|reason| reason.contains("below 1 base currency unit")));
+    }
+
+    #[test]
+    fn attribution_separates_account_currency_fx_from_unrealized_pnl() {
+        let mut start = valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100));
+        start.account_currency = "USD".to_string();
+        start.base_currency = "CAD".to_string();
+        start.fx_rate_to_base = dec!(1.3);
+        start.total_value_base = dec!(130);
+        start.investment_market_value_base = dec!(130);
+        start.cost_basis_base = dec!(130);
+        start.net_contribution_base = dec!(130);
+
+        let mut end = valuation("2026-05-02", dec!(100), dec!(100), dec!(100), dec!(100));
+        end.account_currency = "USD".to_string();
+        end.base_currency = "CAD".to_string();
+        end.fx_rate_to_base = dec!(1.4);
+        end.total_value_base = dec!(140);
+        end.investment_market_value_base = dec!(140);
+        end.cost_basis_base = dec!(130);
+        end.net_contribution_base = dec!(130);
+
+        let result = PerformanceService::compute_account_performance(
+            &[start, end],
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.attribution.unrealized_pnl_change, Decimal::ZERO);
+        assert_eq!(result.attribution.fx_effect, dec!(10));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+    }
+
+    #[test]
+    fn attribution_includes_foreign_cash_fx_effect() {
+        let mut start = valuation(
+            "2026-05-01",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        start.account_currency = "USD".to_string();
+        start.base_currency = "CAD".to_string();
+        start.fx_rate_to_base = dec!(1.3);
+        start.cash_balance_base = dec!(1300);
+        start.total_value_base = dec!(1300);
+        start.net_contribution_base = dec!(1300);
+        start.performance_eligible_value_base = dec!(1300);
+
+        let mut end = valuation(
+            "2026-05-02",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        end.account_currency = "USD".to_string();
+        end.base_currency = "CAD".to_string();
+        end.fx_rate_to_base = dec!(1.4);
+        end.cash_balance_base = dec!(1400);
+        end.total_value_base = dec!(1400);
+        end.net_contribution_base = dec!(1300);
+        end.performance_eligible_value_base = dec!(1400);
+
+        let result = PerformanceService::compute_account_performance_with_flow_basis(
+            &[start, end],
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+            ExternalFlowBasis::BaseCurrency,
+            PerformanceSummaryProfile::Full,
+            true,
+        )
+        .expect("foreign cash performance should compute");
+
+        assert_eq!(result.attribution.contributions, dec!(1300));
+        assert_eq!(result.attribution.fx_effect, dec!(100));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(attribution_pnl(&result), dec!(100));
+        assert!(!result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| PerformanceService::is_attribution_residual_warning(warning)));
+    }
+
+    #[test]
+    fn cash_shaped_non_cash_account_does_not_apply_cash_fx_reconciliation() {
+        let mut start = valuation(
+            "2026-05-01",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        start.account_currency = "USD".to_string();
+        start.base_currency = "CAD".to_string();
+        start.fx_rate_to_base = dec!(1.3);
+        start.cash_balance_base = dec!(1300);
+        start.total_value_base = dec!(1300);
+        start.net_contribution_base = dec!(1300);
+        start.performance_eligible_value_base = dec!(1300);
+
+        let mut end = valuation(
+            "2026-05-02",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        end.account_currency = "USD".to_string();
+        end.base_currency = "CAD".to_string();
+        end.fx_rate_to_base = dec!(1.4);
+        end.cash_balance_base = dec!(1400);
+        end.total_value_base = dec!(1400);
+        end.net_contribution_base = dec!(1300);
+        end.performance_eligible_value_base = dec!(1400);
+
+        let result = PerformanceService::compute_account_performance(
+            &[start, end],
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("performance should compute");
+
+        assert_eq!(result.attribution.fx_effect, Decimal::ZERO);
+        assert_eq!(result.attribution.residual, dec!(100));
+    }
+
+    #[test]
+    fn attribution_includes_cash_fx_after_period_deposit() {
+        let mut start = valuation(
+            "2026-05-01",
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        start.account_currency = "USD".to_string();
+        start.base_currency = "CAD".to_string();
+        start.fx_rate_to_base = dec!(1.3);
+
+        let mut funded = valuation(
+            "2026-05-02",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        funded.account_currency = "USD".to_string();
+        funded.base_currency = "CAD".to_string();
+        funded.fx_rate_to_base = dec!(1.3);
+        funded.cash_balance_base = dec!(1300);
+        funded.total_value_base = dec!(1300);
+        funded.net_contribution_base = dec!(1300);
+        funded.external_inflow_base = dec!(1300);
+        funded.external_flow_source = ExternalFlowSource::ActivityDerived;
+        funded.performance_eligible_value_base = dec!(1300);
+
+        let mut end = valuation(
+            "2026-05-03",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        end.account_currency = "USD".to_string();
+        end.base_currency = "CAD".to_string();
+        end.fx_rate_to_base = dec!(1.4);
+        end.cash_balance_base = dec!(1400);
+        end.total_value_base = dec!(1400);
+        end.net_contribution_base = dec!(1300);
+        end.performance_eligible_value_base = dec!(1400);
+
+        let result = PerformanceService::compute_account_performance_with_flow_basis(
+            &[start, funded, end],
+            Some(TrackingMode::Transactions),
+            Some(date("2026-05-01")),
+            false,
+            ExternalFlowBasis::BaseCurrency,
+            PerformanceSummaryProfile::Full,
+            true,
+        )
+        .expect("foreign cash performance should compute");
+
+        assert_eq!(result.attribution.contributions, dec!(1300));
+        assert_eq!(result.attribution.fx_effect, dec!(100));
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert_eq!(attribution_pnl(&result), dec!(100));
+    }
+
+    #[test]
+    fn securities_attribution_does_not_apply_cash_only_fx_reconciliation() {
+        let mut start = valuation("2026-05-01", dec!(1500), dec!(1500), dec!(500), dec!(500));
+        start.account_currency = "USD".to_string();
+        start.base_currency = "CAD".to_string();
+        start.fx_rate_to_base = dec!(1.3);
+        start.cash_balance_base = dec!(1300);
+        start.investment_market_value_base = dec!(650);
+        start.cost_basis_base = dec!(650);
+        start.total_value_base = dec!(1950);
+        start.net_contribution_base = dec!(2100);
+        start.performance_eligible_value_base = dec!(1950);
+
+        let mut end = valuation("2026-05-02", dec!(1500), dec!(1500), dec!(500), dec!(500));
+        end.account_currency = "USD".to_string();
+        end.base_currency = "CAD".to_string();
+        end.fx_rate_to_base = dec!(1.4);
+        end.cash_balance_base = dec!(1400);
+        end.investment_market_value_base = dec!(700);
+        end.cost_basis_base = dec!(700);
+        end.total_value_base = dec!(2100);
+        end.net_contribution_base = dec!(2100);
+        end.performance_eligible_value_base = dec!(2100);
+
+        let result = PerformanceService::compute_account_performance(
+            &[start, end],
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("securities performance should compute");
+
+        assert_eq!(result.attribution.fx_effect, Decimal::ZERO);
+        assert_eq!(result.attribution.residual, Decimal::ZERO);
+        assert!(!result
+            .data_quality
+            .warnings
+            .iter()
+            .any(|warning| PerformanceService::is_attribution_residual_warning(warning)));
+    }
+
+    #[test]
+    fn scoped_attribution_separates_fx_per_account_before_aggregation() {
+        let mut usd_start = valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100));
+        usd_start.account_id = "usd".to_string();
+        usd_start.account_currency = "USD".to_string();
+        usd_start.base_currency = "CAD".to_string();
+        usd_start.fx_rate_to_base = dec!(1.3);
+        usd_start.total_value_base = dec!(130);
+        usd_start.investment_market_value_base = dec!(130);
+        usd_start.cost_basis_base = dec!(130);
+        usd_start.net_contribution_base = dec!(130);
+
+        let mut usd_end = valuation("2026-05-02", dec!(110), dec!(100), dec!(110), dec!(100));
+        usd_end.account_id = "usd".to_string();
+        usd_end.account_currency = "USD".to_string();
+        usd_end.base_currency = "CAD".to_string();
+        usd_end.fx_rate_to_base = dec!(1.4);
+        usd_end.total_value_base = dec!(154);
+        usd_end.investment_market_value_base = dec!(154);
+        usd_end.cost_basis_base = dec!(130);
+        usd_end.net_contribution_base = dec!(130);
+
+        let mut cad_start = valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100));
+        cad_start.account_id = "cad".to_string();
+        let mut cad_end = valuation("2026-05-02", dec!(120), dec!(100), dec!(120), dec!(100));
+        cad_end.account_id = "cad".to_string();
+
+        let attribution = PerformanceService::scoped_unrealized_attribution_components(
+            &[vec![usd_start, usd_end], vec![cad_start, cad_end]],
+            date("2026-05-01"),
+            date("2026-05-02"),
+            AttributionBaseline::PeriodStart,
+        );
+
+        assert!(attribution.complete);
+        assert_eq!(attribution.unrealized_pnl_change, dec!(34));
+        assert_eq!(attribution.fx_effect, dec!(10));
+    }
+
+    #[test]
+    fn scoped_attribution_does_not_add_foreign_cash_fx() {
+        let mut start = valuation(
+            "2026-05-01",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        start.account_id = "usd".to_string();
+        start.account_currency = "USD".to_string();
+        start.base_currency = "CAD".to_string();
+        start.fx_rate_to_base = dec!(1.3);
+        start.cash_balance_base = dec!(1300);
+        start.total_value_base = dec!(1300);
+        start.net_contribution_base = dec!(1300);
+        start.performance_eligible_value_base = dec!(1300);
+
+        let mut end = valuation(
+            "2026-05-02",
+            dec!(1000),
+            dec!(1000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        end.account_id = "usd".to_string();
+        end.account_currency = "USD".to_string();
+        end.base_currency = "CAD".to_string();
+        end.fx_rate_to_base = dec!(1.4);
+        end.cash_balance_base = dec!(1400);
+        end.total_value_base = dec!(1400);
+        end.net_contribution_base = dec!(1300);
+        end.performance_eligible_value_base = dec!(1400);
+
+        let attribution = PerformanceService::scoped_unrealized_attribution_components(
+            &[vec![start, end]],
+            date("2026-05-01"),
+            date("2026-05-02"),
+            AttributionBaseline::PeriodStart,
+        );
+
+        assert!(attribution.complete);
+        assert_eq!(attribution.unrealized_pnl_change, Decimal::ZERO);
+        assert_eq!(attribution.fx_effect, Decimal::ZERO);
+    }
+
+    #[test]
+    fn scoped_attribution_uses_inception_unrealized_pnl_for_all_time_transactions() {
+        let history = vec![
+            valuation("2026-01-10", dec!(1015), dec!(1000), dec!(915), dec!(900)),
+            valuation("2026-01-12", dec!(1040), dec!(1000), dec!(940), dec!(900)),
+        ];
+
+        let all_time = PerformanceService::scoped_unrealized_attribution_components(
+            std::slice::from_ref(&history),
+            date("2026-01-10"),
+            date("2026-01-12"),
+            AttributionBaseline::Inception,
+        );
+        let bounded = PerformanceService::scoped_unrealized_attribution_components(
+            &[history],
+            date("2026-01-10"),
+            date("2026-01-12"),
+            AttributionBaseline::PeriodStart,
+        );
+
+        assert!(all_time.complete);
+        assert_eq!(all_time.unrealized_pnl_change, dec!(40));
+        assert_eq!(all_time.fx_effect, Decimal::ZERO);
+        assert!(bounded.complete);
+        assert_eq!(bounded.unrealized_pnl_change, dec!(25));
+        assert_eq!(bounded.fx_effect, Decimal::ZERO);
+    }
+
+    /// Negative portfolio value (like TEST's unfunded-BUY shape) surfaces as a
+    /// validation error in both paths — downstream percentages are meaningless
+    /// when the underlying data is broken.
+    #[test]
+    fn perf_rejects_negative_portfolio_value() {
+        let history = vec![
+            valuation(
+                "2026-04-01",
+                dec!(100),
+                dec!(100),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation("2026-04-02", dec!(-50), dec!(100), dec!(-50), Decimal::ZERO),
+        ];
+
+        for include_series in [true, false] {
+            let err = PerformanceService::compute_account_performance(
+                &history,
+                Some(TrackingMode::Transactions),
+                None,
+                include_series,
+            )
+            .expect_err("should error on negative portfolio value");
+
+            assert!(
+                format!("{}", err).contains("negative portfolio value"),
+                "expected 'negative portfolio value' in error (include_series={}), got: {}",
+                include_series,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_perf_uses_explicit_base_flows_for_foreign_currency_accounts() {
+        let mut prev = valuation("2026-04-01", dec!(100), dec!(100), dec!(100), dec!(100));
+        let mut curr = valuation("2026-04-02", dec!(210), dec!(200), dec!(210), dec!(200));
+        prev.account_currency = "EUR".to_string();
+        prev.base_currency = "USD".to_string();
+        prev.fx_rate_to_base = dec!(1.1);
+        prev.total_value_base = dec!(110);
+        prev.net_contribution_base = dec!(110);
+        curr.account_currency = "EUR".to_string();
+        curr.base_currency = "USD".to_string();
+        curr.fx_rate_to_base = dec!(1.1);
+        curr.total_value_base = dec!(231);
+        curr.net_contribution_base = dec!(220);
+        curr.external_inflow_base = dec!(110);
+
+        let flow =
+            PerformanceService::daily_external_flows(&prev, &curr, ExternalFlowBasis::BaseCurrency);
+
+        assert_eq!(flow.inflow, dec!(110));
+        assert_eq!(flow.outflow, Decimal::ZERO);
+        assert_eq!(flow.source, ExternalFlowSource::StoredGross);
+    }
+
+    #[test]
+    fn account_perf_uses_account_currency_flows_for_foreign_currency_accounts() {
+        let mut prev = valuation("2026-04-01", dec!(100), dec!(100), dec!(100), dec!(100));
+        let mut curr = valuation("2026-04-02", dec!(210), dec!(200), dec!(210), dec!(200));
+        prev.account_currency = "EUR".to_string();
+        prev.base_currency = "USD".to_string();
+        prev.fx_rate_to_base = dec!(1.1);
+        prev.total_value_base = dec!(110);
+        prev.net_contribution_base = dec!(110);
+        curr.account_currency = "EUR".to_string();
+        curr.base_currency = "USD".to_string();
+        curr.fx_rate_to_base = dec!(1.1);
+        curr.total_value_base = dec!(231);
+        curr.net_contribution_base = dec!(220);
+        curr.external_inflow_base = dec!(110);
+
+        let result = PerformanceService::compute_account_performance(
+            &[prev, curr],
+            Some(TrackingMode::Transactions),
+            None,
+            false,
+        )
+        .expect("foreign-currency account performance should compute");
+
+        assert_eq!(result.scope.currency, "USD");
+        assert_eq!(attribution_pnl(&result), dec!(11));
+        assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.05));
+    }
+
+    /// HOLDINGS mode uses the cost-basis formula in both paths. TWR/IRR are
+    /// returned as `None` because they aren't meaningful without per-transaction
+    /// cash-flow tracking.
+    #[test]
+    fn perf_holdings_mode_uses_cost_basis_formula() {
+        let history = vec![
+            valuation("2026-02-15", dec!(1000), dec!(1000), dec!(1000), dec!(1000)),
+            valuation("2026-04-14", dec!(900), dec!(1000), dec!(900), dec!(1000)),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Holdings),
+            None, // ALL-time branch
+            false,
+        )
+        .expect("holdings should compute");
+
+        // end_unrealized_pnl = 900 - 1000 = -100; return = -100 / 1000 = -0.10.
+        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(-0.1));
+        assert!(result.returns.twr.is_none());
+        assert!(result.returns.irr.is_none());
+        assert!(result.is_holdings_mode);
+    }
+
+    #[test]
+    fn perf_holdings_mode_omits_value_return_when_denominator_is_undefined() {
+        let history = vec![
+            valuation(
+                "2026-02-15",
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-04-14",
+                dec!(50),
+                Decimal::ZERO,
+                dec!(50),
+                Decimal::ZERO,
+            ),
+        ];
+
+        let all_time = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Holdings),
+            None,
+            false,
+        )
+        .expect("holdings should compute");
+
+        assert!(all_time.returns.value_return.is_none());
+        assert!(all_time
+            .data_quality
+            .not_applicable_reasons
+            .iter()
+            .any(|reason| reason.contains("ending cost basis")));
+
+        let period = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Holdings),
+            Some(date("2026-02-01")),
+            false,
+        )
+        .expect("holdings should compute");
+
+        assert!(period.returns.value_return.is_none());
+        assert!(period
+            .data_quality
+            .not_applicable_reasons
+            .iter()
+            .any(|reason| reason.contains("starting market value")));
+    }
+
+    #[test]
+    fn scoped_performance_uses_mixed_mode_without_dropping_holdings_accounts() {
+        let account_ids = vec!["tx".to_string(), "holdings".to_string()];
+        let mut modes = HashMap::new();
+        modes.insert("tx".to_string(), TrackingMode::Transactions);
+        modes.insert("holdings".to_string(), TrackingMode::Holdings);
+
+        let composition = PerformanceService::scoped_tracking_composition(&account_ids, &modes);
+
+        assert_eq!(composition, ScopedTrackingComposition::Mixed);
+    }
+
+    #[test]
+    fn scoped_performance_uses_holdings_mode_when_all_accounts_are_holdings_mode() {
+        let account_ids = vec!["holdings-a".to_string(), "holdings-b".to_string()];
+        let mut modes = HashMap::new();
+        modes.insert("holdings-a".to_string(), TrackingMode::Holdings);
+        modes.insert("holdings-b".to_string(), TrackingMode::Holdings);
+
+        let composition = PerformanceService::scoped_tracking_composition(&account_ids, &modes);
+
+        assert_eq!(composition, ScopedTrackingComposition::HoldingsOnly);
+    }
+
+    #[test]
+    fn mixed_scope_performance_is_value_complete_simple_return() {
+        let mut history = vec![
+            valuation("2026-05-01", dec!(1500), dec!(1500), dec!(1500), dec!(1500)),
+            valuation("2026-05-02", dec!(1660), dec!(1600), dec!(1660), dec!(1600)),
+        ];
+        history[1].external_inflow_base = dec!(100);
+
+        let result = PerformanceService::compute_mixed_scope_performance(&history, true)
+            .expect("mixed scope should compute");
+
+        assert!(result.is_mixed_tracking_mode);
+        assert_eq!(result.mode, ReturnMethod::ValueReturn);
+        assert_eq!(attribution_pnl(&result), dec!(60));
+        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.04));
+        assert_eq!(result.series.last().unwrap().value.round_dp(4), dec!(0.04));
+        assert!(result.returns.twr.is_none());
+        assert!(result.returns.irr.is_none());
+        assert!(!result.data_quality.warnings.is_empty());
+    }
+
+    #[test]
+    fn mixed_scope_performance_uses_base_currency_values() {
+        let mut history = vec![
+            valuation("2026-05-01", dec!(50), dec!(50), dec!(50), dec!(50)),
+            valuation("2027-05-01", dec!(80), dec!(60), dec!(80), dec!(60)),
+        ];
+        history[0].base_currency = "CAD".to_string();
+        history[0].total_value_base = dec!(100);
+        history[0].investment_market_value_base = dec!(100);
+        history[0].cost_basis_base = dec!(100);
+        history[0].net_contribution_base = dec!(100);
+        history[1].base_currency = "CAD".to_string();
+        history[1].total_value_base = dec!(130);
+        history[1].investment_market_value_base = dec!(130);
+        history[1].cost_basis_base = dec!(110);
+        history[1].net_contribution_base = dec!(110);
+        history[1].external_inflow_base = dec!(10);
+
+        let result = PerformanceService::compute_mixed_scope_performance(&history, true)
+            .expect("mixed scope should compute from base values");
+
+        assert_eq!(result.scope.currency, "CAD");
+        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.2));
+        assert_eq!(result.series.last().unwrap().value.round_dp(4), dec!(0.2));
+        assert_eq!(result.attribution.contributions, dec!(10));
+    }
+
+    #[test]
+    fn mixed_scope_rejects_negative_portfolio_value_without_series() {
+        let history = vec![
+            valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2026-05-02", dec!(-50), dec!(100), dec!(-50), dec!(100)),
+        ];
+
+        for include_series in [true, false] {
+            let err = PerformanceService::compute_mixed_scope_performance(&history, include_series)
+                .expect_err("mixed scope should reject negative portfolio value");
+
+            assert!(
+                format!("{}", err).contains("negative portfolio value"),
+                "expected 'negative portfolio value' in error (include_series={}), got: {}",
+                include_series,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_scope_with_zero_start_value_returns_not_applicable_value_return() {
+        let mut history = vec![
+            valuation(
+                "2026-05-01",
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation("2026-05-02", dec!(100), dec!(100), dec!(100), dec!(100)),
+        ];
+        history[1].external_inflow_base = dec!(100);
+
+        let result = PerformanceService::compute_mixed_scope_performance(&history, true)
+            .expect("mixed scope should compute P&L without a percentage denominator");
+
+        assert!(result.returns.value_return.is_none());
+        assert!(result.returns.annualized_value_return.is_none());
+        assert!(result.series.is_empty());
+        assert!(result
+            .data_quality
+            .not_applicable_reasons
+            .iter()
+            .any(|reason| reason.contains("starting value is zero or negative")));
+    }
+
+    #[test]
+    fn drawdown_reports_unrecovered_decline_with_dates() {
+        let samples = vec![
+            RiskSample {
+                date: date("2026-05-01"),
+                simple_return: dec!(0.1),
+            },
+            RiskSample {
+                date: date("2026-05-02"),
+                simple_return: dec!(-0.2),
+            },
+            RiskSample {
+                date: date("2026-05-03"),
+                simple_return: dec!(-0.1),
+            },
+        ];
+
+        let drawdown =
+            PerformanceService::calculate_max_drawdown(&samples, Some(date("2026-04-30")));
+
+        assert_eq!(drawdown.max_drawdown.unwrap().round_dp(4), dec!(-0.28));
+        assert_eq!(drawdown.peak_date, Some(date("2026-05-01")));
+        assert_eq!(drawdown.trough_date, Some(date("2026-05-03")));
+        assert_eq!(drawdown.recovery_date, None);
+        assert_eq!(drawdown.duration_days, Some(2));
+    }
+
+    #[test]
+    fn drawdown_reports_recovery_date() {
+        let samples = vec![
+            RiskSample {
+                date: date("2026-05-01"),
+                simple_return: dec!(0.1),
+            },
+            RiskSample {
+                date: date("2026-05-02"),
+                simple_return: dec!(-0.1),
+            },
+            RiskSample {
+                date: date("2026-05-03"),
+                simple_return: dec!(0.12),
+            },
+        ];
+
+        let drawdown =
+            PerformanceService::calculate_max_drawdown(&samples, Some(date("2026-05-01")));
+
+        assert_eq!(drawdown.max_drawdown.unwrap().round_dp(4), dec!(-0.1));
+        assert_eq!(drawdown.peak_date, Some(date("2026-05-01")));
+        assert_eq!(drawdown.trough_date, Some(date("2026-05-02")));
+        assert_eq!(drawdown.recovery_date, Some(date("2026-05-03")));
+        assert_eq!(drawdown.duration_days, Some(2));
+    }
+
+    #[test]
+    fn drawdown_uses_opening_date_when_first_sample_declines() {
+        let samples = vec![
+            RiskSample {
+                date: date("2026-05-02"),
+                simple_return: dec!(-0.1),
+            },
+            RiskSample {
+                date: date("2026-05-03"),
+                simple_return: dec!(0.05),
+            },
+        ];
+
+        let drawdown =
+            PerformanceService::calculate_max_drawdown(&samples, Some(date("2026-05-01")));
+
+        assert_eq!(drawdown.max_drawdown.unwrap().round_dp(4), dec!(-0.1));
+        assert_eq!(drawdown.peak_date, Some(date("2026-05-01")));
+        assert_eq!(drawdown.trough_date, Some(date("2026-05-02")));
+        assert_eq!(drawdown.duration_days, Some(1));
+    }
+
+    #[test]
+    fn risk_handles_flat_and_missing_series() {
+        let empty_risk = PerformanceService::risk_from_samples(&[], None);
+        assert!(empty_risk.volatility.is_none());
+        assert!(empty_risk.max_drawdown.is_none());
+
+        let flat_samples = vec![
+            RiskSample {
+                date: date("2026-05-01"),
+                simple_return: Decimal::ZERO,
+            },
+            RiskSample {
+                date: date("2026-05-02"),
+                simple_return: Decimal::ZERO,
+            },
+        ];
+        let flat_risk =
+            PerformanceService::risk_from_samples(&flat_samples, Some(date("2026-05-01")));
+        assert_eq!(flat_risk.volatility, Some(Decimal::ZERO));
+        assert_eq!(flat_risk.max_drawdown, Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn volatility_annualizes_calendar_daily_returns() {
+        let volatility = PerformanceService::calculate_volatility(&[dec!(0), dec!(0.1)]);
+
+        assert_eq!(volatility, Some(dec!(1.2880105)));
+    }
+
+    #[test]
+    fn account_performance_keeps_zero_return_days_for_risk() {
+        let history = vec![
+            valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2026-05-02", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2026-05-03", dec!(100), dec!(100), dec!(100), dec!(100)),
+        ];
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("flat performance should compute");
+
+        assert_eq!(result.risk.volatility, Some(Decimal::ZERO));
+        assert_eq!(result.risk.max_drawdown, Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn volatility_methodology_note_is_not_a_data_quality_warning() {
+        let mut history = vec![
+            valuation("2026-05-01", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2026-05-02", dec!(100), dec!(100), dec!(100), dec!(100)),
+            valuation("2026-05-03", dec!(100), dec!(100), dec!(100), dec!(100)),
+        ];
+        for point in &mut history {
+            point.external_flow_source = ExternalFlowSource::ActivityDerived;
+        }
+
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Transactions),
+            None,
+            true,
+        )
+        .expect("performance should compute");
+
+        assert!(result.risk.volatility.is_some());
+        assert!(result.data_quality.warnings.is_empty());
+        assert_eq!(result.data_quality.status, DataQualityStatus::Ok);
     }
 }

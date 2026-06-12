@@ -57,6 +57,8 @@ async fn run_health_checks_internal(
             state.asset_service(),
             state.taxonomy_service(),
             state.valuation_service(),
+            state.activity_service(),
+            state.lots_repository.clone(),
             Some(configured_timezone.as_str()),
             client_timezone,
         )
@@ -126,6 +128,9 @@ pub async fn execute_health_fix(
     if action.id == "sync_prices" || action.id == "retry_sync" {
         let asset_ids: Vec<String> = serde_json::from_value(action.payload.clone())
             .map_err(|e| format!("Failed to parse asset IDs: {}", e))?;
+        if asset_ids.is_empty() {
+            return Err("No assets selected for price sync".to_string());
+        }
 
         info!(
             "Syncing market data for {} assets: {:?}",
@@ -155,8 +160,14 @@ pub async fn execute_health_fix(
                         result.failures.iter().map(|(s, _)| s.as_str()).collect();
                     warn!("Some assets failed to sync: {:?}", failed_symbols);
                 }
+                let skipped_reasons = result
+                    .skipped_reasons
+                    .into_iter()
+                    .map(|(asset_id, reason)| (asset_id, reason.to_string()))
+                    .collect();
                 let result_payload = MarketSyncResult {
                     failed_syncs: result.failures,
+                    skipped_reasons,
                 };
                 if let Err(e) = app_handle.emit(MARKET_SYNC_COMPLETE, &result_payload) {
                     error!("Failed to emit market:sync-complete event: {}", e);

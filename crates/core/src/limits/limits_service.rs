@@ -305,6 +305,13 @@ mod tests {
         fn get_activity(&self, _: &str) -> Result<Activity> {
             unimplemented!()
         }
+        fn find_transfer_counterpart(
+            &self,
+            _group_id: &str,
+            _exclude_id: &str,
+        ) -> Result<Option<Activity>> {
+            Ok(None)
+        }
         fn get_activities(&self) -> Result<Vec<Activity>> {
             unimplemented!()
         }
@@ -342,6 +349,20 @@ mod tests {
             unimplemented!()
         }
         async fn delete_activity(&self, _: String) -> Result<Activity> {
+            unimplemented!()
+        }
+        async fn link_transfer_activities(
+            &self,
+            _: String,
+            _: String,
+        ) -> Result<(Activity, Activity)> {
+            unimplemented!()
+        }
+        async fn unlink_transfer_activities(
+            &self,
+            _: String,
+            _: String,
+        ) -> Result<(Activity, Activity)> {
             unimplemented!()
         }
         async fn bulk_mutate_activities(
@@ -418,13 +439,22 @@ mod tests {
         fn calculate_average_cost(&self, _: &str, _: &str) -> Result<Decimal> {
             unimplemented!()
         }
-        fn get_income_activities_data(&self, _account_id: Option<&str>) -> Result<Vec<IncomeData>> {
+        fn get_income_activities_data(
+            &self,
+            _account_ids: Option<&[String]>,
+        ) -> Result<Vec<IncomeData>> {
             unimplemented!()
         }
         fn get_first_activity_date_overall(&self) -> Result<DateTime<Utc>> {
             unimplemented!()
         }
         fn get_activity_bounds_for_assets(
+            &self,
+            _: &[String],
+        ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>> {
+            unimplemented!()
+        }
+        fn get_holdings_snapshot_bounds_for_assets(
             &self,
             _: &[String],
         ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>> {

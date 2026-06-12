@@ -10,6 +10,8 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   Icons,
+  quoteCurrencies,
+  quoteUnitCurrencies,
   worldCurrencies,
 } from "@wealthfolio/ui";
 import { useAccounts } from "@/hooks/use-accounts";
@@ -54,7 +56,7 @@ export function ImportToolbar({
 
   // Filter currencies based on search
   const filteredCurrencies = currencySearch
-    ? worldCurrencies.filter(
+    ? quoteCurrencies.filter(
         (c) =>
           c.value.toLowerCase().includes(currencySearch.toLowerCase()) ||
           c.label.toLowerCase().includes(currencySearch.toLowerCase()),
@@ -67,11 +69,11 @@ export function ImportToolbar({
 
   return (
     <div
-      className="bg-muted/50 flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2"
+      className="bg-muted/50 flex items-center gap-2 overflow-x-auto rounded-md border px-3 py-2"
       onMouseDown={handleMouseDown}
     >
       {/* Selection info */}
-      <div className="text-muted-foreground flex items-center gap-2 text-sm">
+      <div className="text-muted-foreground flex shrink-0 items-center gap-2 text-sm">
         <Icons.CheckSquare className="h-4 w-4" />
         <span className="font-medium">
           {selectedCount} row{selectedCount === 1 ? "" : "s"} selected
@@ -79,7 +81,7 @@ export function ImportToolbar({
       </div>
 
       {/* Action buttons */}
-      <div className="flex items-center gap-1.5">
+      <div className="flex shrink-0 items-center gap-1.5">
         {/* Skip button */}
         <Button
           variant="outline"
@@ -160,6 +162,24 @@ export function ImportToolbar({
                     }}
                   >
                     <span className="font-mono">{code}</span>
+                  </DropdownMenuItem>
+                ))}
+                <DropdownMenuSeparator />
+                <div className="text-muted-foreground px-2 py-1 text-xs font-medium">
+                  Quote Units
+                </div>
+                {quoteUnitCurrencies.map((currency) => (
+                  <DropdownMenuItem
+                    key={currency.value}
+                    onSelect={() => {
+                      onSetCurrency(currency.value);
+                      setCurrencySearch("");
+                    }}
+                  >
+                    <span className="font-mono">{currency.value}</span>
+                    <span className="text-muted-foreground ml-2 truncate text-xs">
+                      {currency.label.replace(` (${currency.value})`, "")}
+                    </span>
                   </DropdownMenuItem>
                 ))}
                 <DropdownMenuSeparator />

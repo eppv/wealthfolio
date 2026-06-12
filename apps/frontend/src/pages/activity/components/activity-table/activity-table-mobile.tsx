@@ -8,6 +8,7 @@ import {
   isCashTransfer,
   isFeeActivity,
   isIncomeActivity,
+  isSecuritiesTransfer,
   isSplitActivity,
 } from "@/lib/activity-utils";
 import { ActivityType, ActivityTypeNames } from "@/lib/constants";
@@ -15,7 +16,7 @@ import { parseOccSymbol } from "@/lib/occ-symbol";
 import { useSettingsContext } from "@/lib/settings-provider";
 import { ActivityDetails } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
-import { formatAmount, Separator } from "@wealthfolio/ui";
+import { Button, EmptyPlaceholder, formatAmount, Icons, Separator } from "@wealthfolio/ui";
 import { Link } from "react-router-dom";
 import { ActivityOperations } from "../activity-operations";
 import { ActivityTypeBadge } from "../activity-type-badge";
@@ -26,6 +27,11 @@ interface ActivityTableMobileProps {
   handleEdit: (activity?: ActivityDetails) => void;
   handleDelete: (activity: ActivityDetails) => void;
   onDuplicate: (activity: ActivityDetails) => Promise<void>;
+  onLinkTransfer?: (activity: ActivityDetails) => void;
+  onUnlinkTransfer?: (activity: ActivityDetails) => void;
+  filtersActive?: boolean;
+  onAdd?: () => void;
+  onClearFilters?: () => void;
 }
 
 export const ActivityTableMobile = ({
@@ -34,18 +40,38 @@ export const ActivityTableMobile = ({
   handleEdit,
   handleDelete,
   onDuplicate,
+  onLinkTransfer,
+  onUnlinkTransfer,
+  filtersActive = false,
+  onAdd,
+  onClearFilters,
 }: ActivityTableMobileProps) => {
   const { settings } = useSettingsContext();
   const appTimezone = settings?.timezone?.trim() || undefined;
 
   if (activities.length === 0) {
     return (
-      <div className="flex h-48 flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center">
-        <h3 className="text-lg font-medium">No activities found</h3>
-        <p className="text-muted-foreground text-sm">
-          Try adjusting your search or filter criteria.
-        </p>
-      </div>
+      <EmptyPlaceholder>
+        <EmptyPlaceholder.Icon name="Activity" />
+        <EmptyPlaceholder.Title>No activities</EmptyPlaceholder.Title>
+        <EmptyPlaceholder.Description>
+          {filtersActive
+            ? "No activities match your filters."
+            : "Add your first activity to get started."}
+        </EmptyPlaceholder.Description>
+        {filtersActive ? (
+          onClearFilters ? (
+            <Button variant="outline" onClick={onClearFilters}>
+              Clear filters
+            </Button>
+          ) : null
+        ) : onAdd ? (
+          <Button onClick={onAdd}>
+            <Icons.Plus className="mr-2 h-4 w-4" aria-hidden="true" />
+            Add Activity
+          </Button>
+        ) : null}
+      </EmptyPlaceholder>
     );
   }
 
@@ -61,10 +87,10 @@ export const ActivityTableMobile = ({
           symbol,
           activity.assetId,
         );
-        const hasAsset = Boolean(activity.assetId?.trim());
         const isCash = isTransferActivity
-          ? !hasAsset || isCashTransfer(activityType, symbol)
+          ? isCashTransfer(activityType, symbol, activity.assetId)
           : isCashActivity(activityType) && !isAssetBackedIncome;
+        const hasAsset = Boolean(activity.assetId?.trim());
         const isOptionActivity = activity.instrumentType === "OPTION";
         const parsedOption = isOptionActivity ? parseOccSymbol(symbol) : null;
         const displaySymbol = isCash ? "Cash" : parsedOption ? parsedOption.underlying : symbol;
@@ -133,6 +159,8 @@ export const ActivityTableMobile = ({
                   onEdit={handleEdit}
                   onDelete={handleDelete}
                   onDuplicate={onDuplicate}
+                  onLinkTransfer={onLinkTransfer}
+                  onUnlinkTransfer={onUnlinkTransfer}
                 />
               </div>
             </Card>
@@ -173,6 +201,8 @@ export const ActivityTableMobile = ({
                   onEdit={handleEdit}
                   onDelete={handleDelete}
                   onDuplicate={onDuplicate}
+                  onLinkTransfer={onLinkTransfer}
+                  onUnlinkTransfer={onUnlinkTransfer}
                 />
               </div>
 
@@ -191,7 +221,11 @@ export const ActivityTableMobile = ({
 
                 <div className="flex items-center justify-between">
                   <span className="text-muted-foreground">Type</span>
-                  <ActivityTypeBadge type={activity.activityType} className="text-xs font-normal" />
+                  <ActivityTypeBadge
+                    type={activity.activityType}
+                    subtype={activity.subtype}
+                    className="text-xs font-normal"
+                  />
                 </div>
 
                 {/* Quantity (if applicable) */}
@@ -213,8 +247,14 @@ export const ActivityTableMobile = ({
                   <span className="text-muted-foreground">
                     {activity.activityType === "SPLIT"
                       ? "Ratio"
-                      : (isCashActivity(activity.activityType) && !isAssetBackedIncome) ||
-                          isCashTransfer(activity.activityType, symbol) ||
+                      : (isCashActivity(activity.activityType) &&
+                            !isAssetBackedIncome &&
+                            !isSecuritiesTransfer(
+                              activity.activityType,
+                              symbol,
+                              activity.assetId,
+                            )) ||
+                          isCashTransfer(activity.activityType, symbol, activity.assetId) ||
                           (isIncomeActivity(activity.activityType) && !isAssetBackedIncome)
                         ? "Amount"
                         : isOptionActivity
@@ -226,8 +266,14 @@ export const ActivityTableMobile = ({
                       ? "-"
                       : activity.activityType === "SPLIT"
                         ? formatSplitRatio(Number(activity.amount))
-                        : (isCashActivity(activity.activityType) && !isAssetBackedIncome) ||
-                            isCashTransfer(activity.activityType, symbol) ||
+                        : (isCashActivity(activity.activityType) &&
+                              !isAssetBackedIncome &&
+                              !isSecuritiesTransfer(
+                                activity.activityType,
+                                symbol,
+                                activity.assetId,
+                              )) ||
+                            isCashTransfer(activity.activityType, symbol, activity.assetId) ||
                             (isIncomeActivity(activity.activityType) && !isAssetBackedIncome)
                           ? formatAmount(Number(activity.amount), activity.currency)
                           : formatAmount(Number(activity.unitPrice), activity.currency)}

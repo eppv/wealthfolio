@@ -34,6 +34,11 @@ export interface Logger {
   trace: (...args: unknown[]) => void;
 }
 
+export interface DataExportResult {
+  status: "saved" | "empty" | "canceled";
+  filename?: string;
+}
+
 // Addon types from SDK, re-exported with Tauri serialization adjustments
 import type {
   AddonInstallResult,
@@ -272,7 +277,7 @@ export interface BackendSyncReconcileReadyResult {
   };
   status: "ok" | "skipped_not_ready" | "error";
   message: string;
-  bootstrapStatus: "applied" | "skipped" | "requested" | "not_attempted";
+  bootstrapStatus: "applied" | "skipped" | "skipped_not_ready" | "requested" | "not_attempted";
   bootstrapMessage: string | null;
   bootstrapSnapshotId: string | null;
   cycleStatus: string | null;

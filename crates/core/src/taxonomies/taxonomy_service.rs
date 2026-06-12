@@ -1,7 +1,7 @@
 //! Taxonomy service implementation.
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
 
 use crate::errors::{DatabaseError, ValidationError};
@@ -47,6 +47,7 @@ impl TaxonomyService {
                 color: cat.color.clone(),
                 description: cat.description.clone(),
                 sort_order: current_sort,
+                icon: None,
             });
 
             // Recurse for children
@@ -102,6 +103,86 @@ impl TaxonomyService {
                 children: self.build_category_tree(children_map, Some(cat.id.clone())),
             })
             .collect()
+    }
+
+    fn validate_asset_assignment_replacement(
+        &self,
+        asset_id: &str,
+        taxonomy_id: &str,
+        assignments: &[NewAssetTaxonomyAssignment],
+    ) -> Result<()> {
+        let taxonomy_with_categories =
+            self.repository
+                .get_taxonomy_with_categories(taxonomy_id)?
+                .ok_or_else(|| DatabaseError::NotFound("Taxonomy not found".to_string()))?;
+        let category_ids = taxonomy_with_categories
+            .categories
+            .iter()
+            .map(|category| category.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut seen_categories = HashSet::new();
+        let mut total_weight = 0;
+
+        for assignment in assignments {
+            if assignment.asset_id != asset_id {
+                return Err(ValidationError::InvalidInput(
+                    "Assignment asset_id must match the replacement asset".to_string(),
+                )
+                .into());
+            }
+            if assignment.taxonomy_id != taxonomy_id {
+                return Err(ValidationError::InvalidInput(
+                    "Assignment taxonomy_id must match the replacement taxonomy".to_string(),
+                )
+                .into());
+            }
+            if !(1..=10000).contains(&assignment.weight) {
+                return Err(ValidationError::InvalidInput(format!(
+                    "Weight for category '{}' must be between 1 and 10000 basis points",
+                    assignment.category_id
+                ))
+                .into());
+            }
+            if !category_ids.contains(assignment.category_id.as_str()) {
+                return Err(ValidationError::InvalidInput(format!(
+                    "Category '{}' does not belong to taxonomy '{}'",
+                    assignment.category_id, taxonomy_id
+                ))
+                .into());
+            }
+            if !seen_categories.insert(assignment.category_id.as_str()) {
+                return Err(ValidationError::InvalidInput(format!(
+                    "Duplicate category ID '{}'",
+                    assignment.category_id
+                ))
+                .into());
+            }
+            total_weight += assignment.weight;
+        }
+
+        if taxonomy_with_categories.taxonomy.is_single_select && assignments.len() > 1 {
+            return Err(ValidationError::InvalidInput(
+                "Single-select taxonomies allow only one category".to_string(),
+            )
+            .into());
+        }
+        if taxonomy_with_categories.taxonomy.is_single_select {
+            if let Some(assignment) = assignments.first() {
+                if assignment.weight != 10000 {
+                    return Err(ValidationError::InvalidInput(
+                        "Single-select taxonomies require 10000 basis points".to_string(),
+                    )
+                    .into());
+                }
+            }
+        } else if total_weight > 10000 {
+            return Err(ValidationError::InvalidInput(
+                "Asset taxonomy assignments cannot exceed 10000 basis points".to_string(),
+            )
+            .into());
+        }
+
+        Ok(())
     }
 }
 
@@ -172,6 +253,26 @@ impl TaxonomyServiceTrait for TaxonomyService {
             ))
             .into());
         }
+        let spending_references = self
+            .repository
+            .get_category_spending_reference_count(taxonomy_id, category_id)?;
+        if spending_references > 0 {
+            return Err(ValidationError::InvalidInput(format!(
+                "Cannot delete category with {} spending references",
+                spending_references
+            ))
+            .into());
+        }
+        let allocation_target_references = self
+            .repository
+            .get_category_allocation_target_weight_count(taxonomy_id, category_id)?;
+        if allocation_target_references > 0 {
+            return Err(ValidationError::InvalidInput(format!(
+                "Cannot delete category with {} allocation target references",
+                allocation_target_references
+            ))
+            .into());
+        }
 
         self.repository
             .delete_category(taxonomy_id, category_id)
@@ -214,6 +315,7 @@ impl TaxonomyServiceTrait for TaxonomyService {
                 is_system: false,
                 is_single_select: false,
                 sort_order: 0,
+                scope: "asset".to_string(),
             })
             .await?;
 
@@ -255,6 +357,13 @@ impl TaxonomyServiceTrait for TaxonomyService {
         self.repository.get_asset_assignments(asset_id)
     }
 
+    fn get_asset_assignments_for_assets(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<Vec<AssetTaxonomyAssignment>> {
+        self.repository.get_asset_assignments_for_assets(asset_ids)
+    }
+
     fn get_category_assignments(
         &self,
         taxonomy_id: &str,
@@ -279,6 +388,18 @@ impl TaxonomyServiceTrait for TaxonomyService {
         }
 
         self.repository.upsert_assignment(assignment).await
+    }
+
+    async fn replace_asset_taxonomy_assignments(
+        &self,
+        asset_id: &str,
+        taxonomy_id: &str,
+        assignments: Vec<NewAssetTaxonomyAssignment>,
+    ) -> Result<Vec<AssetTaxonomyAssignment>> {
+        self.validate_asset_assignment_replacement(asset_id, taxonomy_id, &assignments)?;
+        self.repository
+            .replace_asset_assignments(asset_id, taxonomy_id, assignments)
+            .await
     }
 
     async fn remove_asset_assignment(&self, id: &str) -> Result<usize> {

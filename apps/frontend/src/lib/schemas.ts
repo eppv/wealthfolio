@@ -1,5 +1,11 @@
 import * as z from "zod";
-import { accountTypeSchema, ActivityType, activityTypeSchema, quoteModeSchema } from "./constants";
+import {
+  AccountType,
+  accountTypeSchema,
+  ActivityType,
+  activityTypeSchema,
+  quoteModeSchema,
+} from "./constants";
 import { tryParseDate } from "./utils";
 import {
   isCashActivity,
@@ -66,6 +72,8 @@ export const importMappingSchema = z.object({
         quoteCcy: z.string().optional(),
         instrumentType: z.string().optional(),
         quoteMode: quoteModeSchema.optional(),
+        providerId: z.string().optional(),
+        providerSymbol: z.string().optional(),
       }),
     )
     .optional(),
@@ -75,28 +83,44 @@ export const importMappingSchema = z.object({
 
 export const trackingModeSchema = z.enum(["TRANSACTIONS", "HOLDINGS", "NOT_SET"]);
 
-export const newAccountSchema = z.object({
-  id: z.string().uuid().optional(),
-  name: z
-    .string()
-    .min(2, {
-      message: "Name must be at least 2 characters.",
-    })
-    .max(50, {
-      message: "Name must not be longer than 50 characters.",
-    }),
-  group: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  isActive: z.boolean().optional(),
-  isArchived: z.boolean().optional().default(false),
-  accountType: accountTypeSchema,
-  currency: z.string({ required_error: "Please select a currency." }),
-  trackingMode: trackingModeSchema.optional().default("NOT_SET"),
-  meta: z.string().nullable().optional(),
-});
+export const newAccountSchema = z
+  .object({
+    id: z.string().uuid().optional(),
+    name: z
+      .string()
+      .min(2, {
+        message: "Name must be at least 2 characters.",
+      })
+      .max(50, {
+        message: "Name must not be longer than 50 characters.",
+      }),
+    group: z.string().optional(),
+    isDefault: z.boolean().optional(),
+    isActive: z.boolean().optional(),
+    isArchived: z.boolean().optional().default(false),
+    accountType: accountTypeSchema,
+    currency: z.string({ required_error: "Please select a currency." }),
+    trackingMode: trackingModeSchema.optional().default("NOT_SET"),
+    meta: z.string().nullable().optional(),
+  })
+  .refine(
+    (data) => data.accountType !== AccountType.CREDIT_CARD || data.trackingMode !== "HOLDINGS",
+    {
+      message: "Credit card accounts cannot use holdings tracking mode.",
+      path: ["trackingMode"],
+    },
+  );
 
 export const newGoalSchema = z.object({
   id: z.string().uuid().optional(),
+  goalType: z.enum([
+    "retirement",
+    "education",
+    "wedding",
+    "home",
+    "emergency_fund",
+    "custom_save_up",
+  ]),
   title: z.string(),
   description: z.string().optional(),
   targetAmount: z.coerce
@@ -105,7 +129,10 @@ export const newGoalSchema = z.object({
       invalid_type_error: "Target amount must be a positive number.",
     })
     .min(0, { message: "Target amount must be a positive number." }),
-  isAchieved: z.boolean().optional(),
+  coverImageKey: z.string().optional(),
+  currency: z.string().optional(),
+  startDate: z.string().optional(),
+  targetDate: z.string().optional(),
 });
 
 const parseNumberLike = (value: unknown): number | undefined => {
@@ -170,6 +197,10 @@ export const importActivitySchema = z
     instrumentType: z.string().optional(),
     /** Optional quote mode hint (e.g., MANUAL, MARKET). */
     quoteMode: quoteModeSchema.optional(),
+    /** Market data provider that resolved this import row, if selected. */
+    providerId: z.string().optional(),
+    /** Provider-native symbol/code selected by search/import. */
+    providerSymbol: z.string().optional(),
     /** ISIN identifier from the CSV (e.g. GB0007188757). Used for unambiguous exchange resolution. */
     isin: z.string().optional(),
     errors: z.record(z.string(), z.array(z.string())).optional(),
@@ -184,6 +215,9 @@ export const importActivitySchema = z
     fxRate: decimalLikeSchema.nullable().optional(),
     subtype: z.string().optional(),
     forceImport: z.boolean().default(false),
+    /** True when a TRANSFER_IN/OUT crosses the tracked-account boundary
+     * (e.g. RSU grant deposit). Persisted as `metadata.flow.is_external` on the activity. */
+    isExternal: z.boolean().optional(),
   })
   .refine(
     (data) => {
@@ -292,6 +326,20 @@ export const importActivitySchema = z
     {
       message: "Unit price must be positive for buy/sell activities",
       path: ["unitPrice"],
+    },
+  )
+  .refine(
+    (data) => {
+      const activityType = data.activityType;
+      if (isSplitActivity(activityType)) {
+        const amount = parseNumberLike(data.amount);
+        return amount !== undefined && amount > 0;
+      }
+      return true;
+    },
+    {
+      message: "Split ratio must be greater than 0",
+      path: ["amount"],
     },
   )
   .refine(

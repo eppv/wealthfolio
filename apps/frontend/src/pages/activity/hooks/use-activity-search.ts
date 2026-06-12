@@ -9,10 +9,13 @@ import { useMemo } from "react";
 export type ActivityStatusFilter = "all" | "pending" | "validated";
 
 export interface ActivitySearchFilters {
-  accountIds: string[];
+  accountIds?: string[];
   activityTypes: ActivityType[];
   instrumentTypes?: string[];
   status?: ActivityStatusFilter;
+  /** Inclusive date bounds (YYYY-MM-DD) — used by Health Center deeplinks. */
+  dateFrom?: string;
+  dateTo?: string;
 }
 
 interface BaseOptions {
@@ -65,6 +68,7 @@ export type UseActivitySearchResult =
 
 const DEFAULT_SORT = { id: "date", desc: true };
 const DEFAULT_PAGE_SIZE = 50;
+const EMPTY_RESPONSE: ActivitySearchResponse = { data: [], meta: { totalRowCount: 0 } };
 
 export function useActivitySearch(
   options: UseActivitySearchInfiniteOptions,
@@ -76,6 +80,7 @@ export function useActivitySearch(options: UseActivitySearchOptions): UseActivit
   const { filters, searchQuery, sorting, pageSize = DEFAULT_PAGE_SIZE } = options;
   const mode = options.mode ?? "infinite";
   const pageIndex = "pageIndex" in options ? options.pageIndex : 0;
+  const hasClosedAccountScope = filters.accountIds?.length === 0;
 
   const normalizedFilters = useMemo(() => {
     // Convert status filter to needsReview boolean
@@ -85,23 +90,35 @@ export function useActivitySearch(options: UseActivitySearchOptions): UseActivit
     } else if (filters.status === "validated") {
       needsReview = false;
     }
-    // "all" or undefined means no filter
+    // Undefined means all accounts; an empty array means a closed-empty scope.
 
     return {
-      accountIds: filters.accountIds.length > 0 ? filters.accountIds : undefined,
+      accountIds: filters.accountIds,
       activityTypes: filters.activityTypes.length > 0 ? filters.activityTypes : undefined,
       instrumentTypes: filters.instrumentTypes?.length ? filters.instrumentTypes : undefined,
       needsReview,
+      dateFrom: filters.dateFrom,
+      dateTo: filters.dateTo,
     } as Record<string, unknown>;
-  }, [filters.accountIds, filters.activityTypes, filters.instrumentTypes, filters.status]);
+  }, [
+    filters.accountIds,
+    filters.activityTypes,
+    filters.instrumentTypes,
+    filters.status,
+    filters.dateFrom,
+    filters.dateTo,
+  ]);
 
-  const primarySort =
-    sorting.length > 0 && sorting[0]?.id
-      ? ({ id: sorting[0].id, desc: sorting[0].desc ?? false } as {
-          id: string;
-          desc: boolean;
-        })
-      : DEFAULT_SORT;
+  const primarySort = useMemo(
+    () =>
+      sorting.length > 0 && sorting[0]?.id
+        ? ({ id: sorting[0].id, desc: sorting[0].desc ?? false } as {
+            id: string;
+            desc: boolean;
+          })
+        : DEFAULT_SORT,
+    [sorting],
+  );
 
   // Infinite query for "load more" mode
   const infiniteQuery = useInfiniteQuery<ActivitySearchResponse, Error>({
@@ -110,12 +127,13 @@ export function useActivitySearch(options: UseActivitySearchOptions): UseActivit
       "infinite",
       normalizedFilters,
       searchQuery,
-      primarySort.id,
-      primarySort.desc,
+      hasClosedAccountScope,
+      primarySort,
       pageSize,
     ],
     initialPageParam: 0,
     queryFn: async ({ pageParam }) => {
+      if (hasClosedAccountScope) return EMPTY_RESPONSE;
       const page = typeof pageParam === "number" ? pageParam : 0;
       return searchActivities(page, pageSize, normalizedFilters, searchQuery, primarySort);
     },
@@ -133,12 +151,13 @@ export function useActivitySearch(options: UseActivitySearchOptions): UseActivit
       "paginated",
       normalizedFilters,
       searchQuery,
-      primarySort.id,
-      primarySort.desc,
+      hasClosedAccountScope,
+      primarySort,
       pageIndex,
       pageSize,
     ],
     queryFn: async () => {
+      if (hasClosedAccountScope) return EMPTY_RESPONSE;
       return searchActivities(pageIndex, pageSize, normalizedFilters, searchQuery, primarySort);
     },
     enabled: mode === "paginated",

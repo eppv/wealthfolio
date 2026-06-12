@@ -12,6 +12,7 @@ import {
 } from "@wealthfolio/ui/components/ui/sheet";
 import type { ActivityDetails } from "@/lib/types";
 import { restrictionAllowsType } from "@/lib/activity-restrictions";
+import { isLiabilityAccountType } from "@/lib/constants";
 import { useState, useCallback, useMemo } from "react";
 import { ActivityTypePicker } from "./activity-type-picker";
 import { ActivityFormRenderer } from "./activity-form-renderer";
@@ -23,14 +24,36 @@ import type { PickerActivityType } from "../config/activity-form-config";
 // Re-export for consumers
 export type { AccountSelectOption };
 
+function transferAllowsAccount(account: AccountSelectOption): boolean {
+  return (
+    restrictionAllowsType(account.restrictionLevel, "TRANSFER") ||
+    isLiabilityAccountType(account.accountType)
+  );
+}
+
 interface ActivityFormProps {
   accounts: AccountSelectOption[];
+  /**
+   * Full active-account list for the Transfer form's From/To selectors. Unlike
+   * `accounts` (which the Spending split may narrow to investment accounts), a
+   * transfer can target any account, so its counterparties are drawn from this.
+   */
+  transferAccounts?: AccountSelectOption[];
   activity?: Partial<ActivityDetails>;
   open?: boolean;
   onClose?: () => void;
+  /** When true, hides the activity type picker (use when type is already determined) */
+  hidePicker?: boolean;
 }
 
-export function ActivityForm({ accounts, activity, open, onClose }: ActivityFormProps) {
+export function ActivityForm({
+  accounts,
+  transferAccounts,
+  activity,
+  open,
+  onClose,
+  hidePicker,
+}: ActivityFormProps) {
   // Derive the editing state and initial type from activity prop
   const isEditing = !!activity?.id;
   const initialType = mapActivityTypeToPicker(activity?.activityType);
@@ -41,13 +64,17 @@ export function ActivityForm({ accounts, activity, open, onClose }: ActivityForm
   // For editing, always use the activity's type; for new, use local state
   const effectiveSelectedType = isEditing ? initialType : selectedType;
 
-  // Filter accounts by selected activity type (exclude HOLDINGS accounts for unsupported types)
+  // Filter accounts by selected activity type (exclude HOLDINGS accounts for unsupported types).
+  // Transfers use the full account list so spending/saving accounts are valid counterparties.
   const filteredAccounts = useMemo(() => {
-    if (!effectiveSelectedType) return accounts;
-    return accounts.filter((acc) =>
-      restrictionAllowsType(acc.restrictionLevel, effectiveSelectedType),
-    );
-  }, [accounts, effectiveSelectedType]);
+    const base =
+      effectiveSelectedType === "TRANSFER" && transferAccounts ? transferAccounts : accounts;
+    if (!effectiveSelectedType) return base;
+    if (effectiveSelectedType === "TRANSFER") {
+      return base.filter(transferAllowsAccount);
+    }
+    return base.filter((acc) => restrictionAllowsType(acc.restrictionLevel, effectiveSelectedType));
+  }, [accounts, transferAccounts, effectiveSelectedType]);
 
   // Use the activity form hook with the effective type
   const { defaultValues, isLoading, isError, error, handleSubmit } = useActivityForm({
@@ -88,8 +115,8 @@ export function ActivityForm({ accounts, activity, open, onClose }: ActivityForm
         </SheetHeader>
 
         <div className="flex-1 space-y-6 overflow-y-auto py-4">
-          {/* Activity Type Picker - only show when creating new activity */}
-          {!isEditing && (
+          {/* Activity Type Picker - only show when creating new activity and not locked to a type */}
+          {!isEditing && !hidePicker && (
             <ActivityTypePicker value={effectiveSelectedType} onSelect={setSelectedType} />
           )}
 

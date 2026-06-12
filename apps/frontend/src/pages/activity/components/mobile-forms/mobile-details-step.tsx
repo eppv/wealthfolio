@@ -1,7 +1,7 @@
 import { ScrollArea } from "@wealthfolio/ui/components/ui/scroll-area";
 import { Textarea } from "@wealthfolio/ui/components/ui/textarea";
 import { AnimatedToggleGroup } from "@wealthfolio/ui/components/ui/animated-toggle-group";
-import { ACTIVITY_SUBTYPES, QuoteMode, type ActivityType } from "@/lib/constants";
+import { ACTIVITY_SUBTYPES, ActivityType, QuoteMode } from "@/lib/constants";
 import { useSettingsContext } from "@/lib/settings-provider";
 import {
   AdvancedOptionsSection,
@@ -30,10 +30,14 @@ import {
   SheetDescription,
   SheetHeader,
   SheetTitle,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
 } from "@wealthfolio/ui";
 import { useEffect, useMemo, useState } from "react";
 import { useFormContext } from "react-hook-form";
 import { restrictionAllowsType } from "@/lib/activity-restrictions";
+import { roundDecimal } from "@/lib/utils";
 import type { NewActivityFormValues } from "../forms/schemas";
 
 interface MobileDetailsStepProps {
@@ -42,13 +46,73 @@ interface MobileDetailsStepProps {
   isEditing?: boolean;
 }
 
+const FMV_PER_UNIT_HELP_TEXT =
+  "Fair market value per share or token at the time you received it. Used to calculate income amount and cost basis.";
+const INCOME_MODE_CASH = "CASH";
+const TRADE_ACTIVITY_TYPES: readonly string[] = [ActivityType.BUY, ActivityType.SELL];
+const TRANSFER_ACTIVITY_TYPES: readonly string[] = [
+  ActivityType.TRANSFER_IN,
+  ActivityType.TRANSFER_OUT,
+];
+const SYMBOL_FIELD_ACTIVITY_TYPES: readonly string[] = [
+  ActivityType.BUY,
+  ActivityType.SELL,
+  ActivityType.DIVIDEND,
+  ActivityType.SPLIT,
+  ActivityType.ADJUSTMENT,
+];
+const AMOUNT_FIELD_ACTIVITY_TYPES: readonly string[] = [
+  ActivityType.DEPOSIT,
+  ActivityType.WITHDRAWAL,
+  ActivityType.DIVIDEND,
+  ActivityType.INTEREST,
+  ActivityType.TAX,
+  ActivityType.CREDIT,
+];
+const FEE_FIELD_ACTIVITY_TYPES: readonly string[] = [
+  ActivityType.BUY,
+  ActivityType.SELL,
+  ActivityType.DEPOSIT,
+  ActivityType.WITHDRAWAL,
+  ActivityType.TRANSFER_IN,
+  ActivityType.TRANSFER_OUT,
+  ActivityType.INTEREST,
+];
+
+function FmvPerUnitLabel() {
+  return (
+    <div className="flex items-center gap-1.5">
+      <FormLabel className="text-base font-medium">FMV per unit</FormLabel>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            className="text-muted-foreground/70 hover:text-foreground inline-flex rounded-full transition-colors"
+            aria-label="More info about FMV per unit"
+          >
+            <Icons.Info className="h-3.5 w-3.5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs text-xs">{FMV_PER_UNIT_HELP_TEXT}</TooltipContent>
+      </Tooltip>
+    </div>
+  );
+}
+
 export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileDetailsStepProps) {
   const { control, getFieldState, getValues, watch, setValue, register } =
     useFormContext<NewActivityFormValues>();
   const { settings } = useSettingsContext();
   const isManualAsset = watch("quoteMode") === QuoteMode.MANUAL;
   const accountId = watch("accountId");
+  const toAccountId = watch("toAccountId" as any) as string | undefined;
   const currency = watch("currency");
+  const quantity = watch("quantity");
+  const unitPrice = watch("unitPrice");
+  const sourceAmount = watch("sourceAmount" as any) as number | null | undefined;
+  const fxRate = watch("fxRate" as any) as number | null | undefined;
+  const sourceCurrency = watch("sourceCurrency" as any) as string | undefined;
+  const destinationCurrency = watch("destinationCurrency" as any) as string | undefined;
 
   // Filter accounts by activity type (exclude HOLDINGS accounts for unsupported types)
   const filteredAccounts = useMemo(
@@ -59,7 +123,7 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
   const [accountSheetOpen, setAccountSheetOpen] = useState(false);
 
   // BUY/SELL asset type (stock/option/bond)
-  const isBuyOrSell = ["BUY", "SELL"].includes(activityType);
+  const isBuyOrSell = TRADE_ACTIVITY_TYPES.includes(activityType);
   const assetType = isBuyOrSell ? ((watch("assetType" as any) as string) ?? "stock") : "stock";
   const isOption = assetType === "option";
   const isBond = assetType === "bond";
@@ -77,11 +141,11 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
     const p = Number(optUnitPrice) || 0;
     const f = Number(optFee) || 0;
     const m = Number(optMultiplier) || 100;
-    return activityType === "BUY" ? q * p * m + f : q * p * m - f;
+    return activityType === ActivityType.BUY ? q * p * m + f : q * p * m - f;
   }, [isOption, optQuantity, optUnitPrice, optFee, optMultiplier, activityType]);
 
   // Transfer state
-  const isTransfer = ["TRANSFER_IN", "TRANSFER_OUT"].includes(activityType);
+  const isTransfer = TRANSFER_ACTIVITY_TYPES.includes(activityType);
   const transferMode = isTransfer ? ((watch("transferMode" as any) as string) ?? "cash") : null;
   const isExternal = isTransfer ? ((watch("isExternal" as any) as boolean) ?? false) : false;
   const direction = isTransfer ? ((watch("direction" as any) as string) ?? "out") : null;
@@ -90,40 +154,75 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
   const [toAccountSheetOpen, setToAccountSheetOpen] = useState(false);
 
   const subtype = watch("subtype");
-  const isDrip = activityType === "DIVIDEND" && subtype === ACTIVITY_SUBTYPES.DRIP;
+  const isDividendActivity = activityType === ActivityType.DIVIDEND;
+  const isInterestActivity = activityType === ActivityType.INTEREST;
+  const isDividendAssetIncome =
+    isDividendActivity &&
+    (subtype === ACTIVITY_SUBTYPES.DRIP || subtype === ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND);
+  const isStakingReward = isInterestActivity && subtype === ACTIVITY_SUBTYPES.STAKING_REWARD;
+  const isAssetBackedIncome = isDividendAssetIncome || isStakingReward;
+  const incomeMode = subtype ?? INCOME_MODE_CASH;
 
-  const isFeeActivity = activityType === "FEE";
-  const isTaxActivity = activityType === "TAX";
+  const isCreditActivity = activityType === ActivityType.CREDIT;
+  const isAdjustmentActivity = activityType === ActivityType.ADJUSTMENT;
+  const isFeeActivity = activityType === ActivityType.FEE;
+  const isTaxActivity = activityType === ActivityType.TAX;
   const needsAssetSymbol =
-    ["BUY", "SELL", "DIVIDEND", "SPLIT"].includes(activityType) || isSecuritiesTransfer;
-  const needsQuantity = ["BUY", "SELL"].includes(activityType) || isSecuritiesTransfer;
+    SYMBOL_FIELD_ACTIVITY_TYPES.includes(activityType) || isStakingReward || isSecuritiesTransfer;
+  const needsQuantity =
+    TRADE_ACTIVITY_TYPES.includes(activityType) ||
+    isSecuritiesTransfer ||
+    isAdjustmentActivity ||
+    isAssetBackedIncome;
   const needsUnitPrice =
-    ["BUY", "SELL"].includes(activityType) ||
+    TRADE_ACTIVITY_TYPES.includes(activityType) ||
+    isAssetBackedIncome ||
     (isSecuritiesTransfer && isExternal && direction === "in");
+  const needsInternalCashTransferAmounts = isCashTransfer && !isExternal;
   const needsAmount =
-    ["DEPOSIT", "WITHDRAWAL", "DIVIDEND", "INTEREST", "TAX"].includes(activityType) ||
-    isCashTransfer;
-  const needsFee = [
-    "BUY",
-    "SELL",
-    "DEPOSIT",
-    "WITHDRAWAL",
-    "TRANSFER_IN",
-    "TRANSFER_OUT",
-    "INTEREST",
-  ].includes(activityType);
+    AMOUNT_FIELD_ACTIVITY_TYPES.includes(activityType) ||
+    (isCashTransfer && !needsInternalCashTransferAmounts);
+  const needsFee =
+    FEE_FIELD_ACTIVITY_TYPES.includes(activityType) && !needsInternalCashTransferAmounts;
 
-  const needsSplitRatio = activityType === "SPLIT";
+  const needsSplitRatio = activityType === ActivityType.SPLIT;
 
   const transferModeItems = [
     { value: "cash" as const, label: "Cash" },
     { value: "securities" as const, label: "Securities" },
   ];
 
+  const dividendModeItems = [
+    { value: INCOME_MODE_CASH, label: "Cash" },
+    { value: ACTIVITY_SUBTYPES.DRIP, label: "DRIP" },
+    { value: ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND, label: "In kind" },
+  ];
+
+  const interestModeItems = [
+    { value: INCOME_MODE_CASH, label: "Cash" },
+    { value: ACTIVITY_SUBTYPES.STAKING_REWARD, label: "Staking reward" },
+  ];
+
+  const handleIncomeModeChange = (mode: string) => {
+    setValue("subtype" as any, mode === INCOME_MODE_CASH ? null : mode, {
+      shouldDirty: true,
+      shouldValidate: true,
+    });
+    if (mode === INCOME_MODE_CASH) {
+      setValue("quantity" as any, undefined, { shouldDirty: true, shouldValidate: false });
+      setValue("unitPrice" as any, undefined, { shouldDirty: true, shouldValidate: false });
+    }
+  };
+
   const handleTransferModeChange = (mode: string) => {
     setValue("transferMode" as any, mode, { shouldValidate: false });
     if (mode === "cash") {
       setValue("assetId" as any, null);
+      setValue("existingAssetId" as any, undefined);
+      setValue("exchangeMic" as any, undefined);
+      setValue("symbolQuoteCcy" as any, undefined);
+      setValue("symbolInstrumentType" as any, undefined);
+      setValue("assetMetadata" as any, undefined);
       setValue("quantity" as any, null);
       setValue("unitPrice" as any, null);
     } else {
@@ -134,23 +233,32 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
   const handleExternalChange = (checked: boolean) => {
     setValue("isExternal" as any, checked, { shouldValidate: false });
     if (checked) {
-      // Copy current account to accountId for external
-      if (accountId) {
-        setValue("accountId", accountId);
+      const externalAccountId =
+        direction === "in" ? toAccountId || accountId : accountId || toAccountId;
+      if (externalAccountId) {
+        setValue("accountId", externalAccountId);
       }
       setValue("toAccountId" as any, "");
     } else {
-      // Internal: use accountId as fromAccountId
-      setValue("toAccountId" as any, "");
+      if (direction === "in") {
+        if (accountId) {
+          setValue("toAccountId" as any, accountId);
+        }
+        setValue("accountId", "");
+      } else {
+        setValue("toAccountId" as any, "");
+      }
     }
   };
 
   const handleDirectionChange = (value: string) => {
     setValue("direction" as any, value, { shouldValidate: false });
     // Update activityType based on direction
-    setValue("activityType", value === "in" ? ("TRANSFER_IN" as any) : ("TRANSFER_OUT" as any), {
-      shouldValidate: false,
-    });
+    setValue(
+      "activityType",
+      value === "in" ? (ActivityType.TRANSFER_IN as any) : (ActivityType.TRANSFER_OUT as any),
+      { shouldValidate: false },
+    );
   };
 
   const handleAssetTypeChange = (value: AssetType) => {
@@ -165,13 +273,27 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
       setValue("assetKind" as any, undefined);
     }
     setValue("assetId" as any, "");
+    setValue("existingAssetId" as any, undefined);
+    setValue("exchangeMic" as any, undefined);
+    setValue("symbolQuoteCcy" as any, undefined);
+    setValue("symbolInstrumentType" as any, undefined);
+    setValue("assetMetadata" as any, undefined);
   };
 
   // Filter destination accounts to exclude source account (for internal transfers)
   const toAccountOptions = filteredAccounts.filter((acc) => acc.value !== accountId);
 
   const selectedAccount = filteredAccounts.find((acc) => acc.value === accountId);
+  const destinationAccount = filteredAccounts.find((acc) => acc.value === toAccountId);
   const accountCurrency = selectedAccount?.currency;
+  const effectiveSourceCurrency = sourceCurrency || accountCurrency || currency;
+  const effectiveDestinationCurrency =
+    destinationCurrency || destinationAccount?.currency || effectiveSourceCurrency;
+  const isCrossCurrencyInternalCash =
+    needsInternalCashTransferAmounts &&
+    Boolean(effectiveSourceCurrency) &&
+    Boolean(effectiveDestinationCurrency) &&
+    effectiveSourceCurrency !== effectiveDestinationCurrency;
   const baseCurrency = settings?.baseCurrency;
   const displayAccountText = selectedAccount
     ? `${selectedAccount.label} (${selectedAccount.currency})`
@@ -193,11 +315,120 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
       shouldDirty: false,
       shouldValidate: true,
     });
-  }, [accountId, currency, filteredAccounts, getFieldState, setValue]);
+    if (!isExternal) {
+      setValue("sourceCurrency" as any, selected.currency, {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+    }
+  }, [accountId, currency, filteredAccounts, getFieldState, isExternal, setValue]);
+
+  useEffect(() => {
+    if (!destinationAccount?.currency) return;
+    setValue("destinationCurrency" as any, destinationAccount.currency, {
+      shouldDirty: false,
+      shouldValidate: false,
+    });
+  }, [destinationAccount?.currency, setValue]);
+
+  useEffect(() => {
+    if (!needsInternalCashTransferAmounts || isCrossCurrencyInternalCash) return;
+    if (sourceAmount != null && sourceAmount > 0) {
+      setValue("destinationAmount" as any, sourceAmount, {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+      setValue("amount" as any, sourceAmount, {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+    }
+  }, [isCrossCurrencyInternalCash, needsInternalCashTransferAmounts, setValue, sourceAmount]);
+
+  const roundTransferValue = (value: number, precision = 6) =>
+    Number(Number(value).toFixed(precision));
+
+  const handleSourceAmountChange = (value: number | null | undefined) => {
+    setValue("sourceAmount" as any, value, { shouldDirty: true, shouldValidate: false });
+    setValue("amount" as any, value, { shouldDirty: true, shouldValidate: false });
+    if (!value || value <= 0) return;
+    if (isCrossCurrencyInternalCash) {
+      const rate = Number(fxRate);
+      if (rate > 0) {
+        setValue("destinationAmount" as any, roundTransferValue(value * rate), {
+          shouldDirty: true,
+          shouldValidate: false,
+        });
+      }
+    } else {
+      setValue("destinationAmount" as any, value, {
+        shouldDirty: true,
+        shouldValidate: false,
+      });
+    }
+  };
+
+  const handleDestinationAmountChange = (value: number | null | undefined) => {
+    setValue("destinationAmount" as any, value, { shouldDirty: true, shouldValidate: false });
+    const sent = Number(sourceAmount);
+    const received = Number(value);
+    if (sent > 0 && received > 0) {
+      setValue("fxRate" as any, roundTransferValue(received / sent, 8), {
+        shouldDirty: true,
+        shouldValidate: false,
+      });
+    }
+  };
+
+  const handleFxRateChange = (value: number | null | undefined) => {
+    setValue("fxRate" as any, value ?? undefined, { shouldDirty: true, shouldValidate: false });
+    const sent = Number(sourceAmount);
+    const rate = Number(value);
+    if (sent > 0 && rate > 0) {
+      setValue("destinationAmount" as any, roundTransferValue(sent * rate), {
+        shouldDirty: true,
+        shouldValidate: false,
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!isAssetBackedIncome) return;
+    const q = Number(quantity);
+    const p = Number(unitPrice);
+    const currentAmount = Number(getValues("amount"));
+    const quantityIsDirty = getFieldState("quantity").isDirty;
+    const unitPriceIsDirty = getFieldState("unitPrice").isDirty;
+    const shouldAutoSetAmount =
+      quantityIsDirty || unitPriceIsDirty || !(Number.isFinite(currentAmount) && currentAmount > 0);
+    if (q > 0 && p > 0 && shouldAutoSetAmount) {
+      const computedAmount = roundDecimal(q * p);
+      if (currentAmount !== computedAmount) {
+        setValue("amount" as any, computedAmount, {
+          shouldDirty: quantityIsDirty || unitPriceIsDirty,
+          shouldValidate: false,
+        });
+      }
+    }
+  }, [getFieldState, getValues, isAssetBackedIncome, quantity, setValue, unitPrice]);
 
   // Quantity label adapts to asset type
-  const quantityLabel = isOption ? "Contracts" : isBond ? "Bonds" : "Shares";
-  const priceLabel = isOption ? "Premium/Share" : isSecuritiesTransfer ? "Cost Basis" : "Price";
+  const quantityLabel = isAssetBackedIncome
+    ? "Received quantity"
+    : isOption
+      ? "Contracts"
+      : isBond
+        ? "Bonds"
+        : "Shares";
+  const priceLabel = isAssetBackedIncome
+    ? subtype === ACTIVITY_SUBTYPES.DRIP
+      ? "Reinvestment price"
+      : "FMV per unit"
+    : isOption
+      ? "Premium/Share"
+      : isSecuritiesTransfer
+        ? "Cost Basis"
+        : "Price";
 
   return (
     <div className="flex h-full flex-col">
@@ -269,6 +500,52 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
               name={"assetType" as any}
               onValueChange={handleAssetTypeChange}
             />
+          )}
+
+          {isDividendActivity && (
+            <div className="space-y-2">
+              <FormLabel className="text-base font-medium">Dividend type</FormLabel>
+              <RadioGroup
+                value={incomeMode}
+                onValueChange={handleIncomeModeChange}
+                className="flex flex-wrap gap-4"
+              >
+                {dividendModeItems.map((item) => {
+                  const id = `mobile-dividend-type-${item.value.toLowerCase().replaceAll("_", "-")}`;
+                  return (
+                    <div key={item.value} className="flex items-center space-x-2">
+                      <RadioGroupItem value={item.value} id={id} />
+                      <Label htmlFor={id} className="cursor-pointer text-sm font-normal">
+                        {item.label}
+                      </Label>
+                    </div>
+                  );
+                })}
+              </RadioGroup>
+            </div>
+          )}
+
+          {isInterestActivity && (
+            <div className="space-y-2">
+              <FormLabel className="text-base font-medium">Interest type</FormLabel>
+              <RadioGroup
+                value={incomeMode}
+                onValueChange={handleIncomeModeChange}
+                className="flex flex-wrap gap-4"
+              >
+                {interestModeItems.map((item) => {
+                  const id = `mobile-interest-type-${item.value.toLowerCase().replaceAll("_", "-")}`;
+                  return (
+                    <div key={item.value} className="flex items-center space-x-2">
+                      <RadioGroupItem value={item.value} id={id} />
+                      <Label htmlFor={id} className="cursor-pointer text-sm font-normal">
+                        {item.label}
+                      </Label>
+                    </div>
+                  );
+                })}
+              </RadioGroup>
+            </div>
           )}
 
           {/* Account — for transfers, label changes based on external/direction */}
@@ -376,13 +653,14 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
             ) : (
               <SymbolSearch
                 name="assetId"
-                label="Symbol"
+                label={isStakingReward ? "Reward asset" : "Symbol"}
                 isManualAsset={isManualForType}
                 exchangeMicName="exchangeMic"
                 quoteModeName="quoteMode"
                 currencyName="currency"
                 quoteCcyName="symbolQuoteCcy"
                 instrumentTypeName="symbolInstrumentType"
+                existingAssetIdName="existingAssetId"
                 assetMetadataName="assetMetadata"
                 defaultCurrency={accountCurrency}
               />
@@ -411,7 +689,11 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
                     name="unitPrice"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel className="text-base font-medium">{priceLabel}</FormLabel>
+                        {priceLabel === "FMV per unit" ? (
+                          <FmvPerUnitLabel />
+                        ) : (
+                          <FormLabel className="text-base font-medium">{priceLabel}</FormLabel>
+                        )}
                         <FormControl>
                           <MoneyInput {...field} />
                         </FormControl>
@@ -445,14 +727,14 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
               <div className="flex items-center justify-between">
                 <div className="min-w-0 flex-1">
                   <span className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
-                    {activityType === "BUY" ? "Total Debit" : "Total Credit"}
+                    {activityType === ActivityType.BUY ? "Total Debit" : "Total Credit"}
                   </span>
                   <p className="text-muted-foreground mt-0.5 truncate text-xs tabular-nums">
                     {Number(optQuantity)} × {Number(optUnitPrice)} × {Number(optMultiplier) || 100}
                     {Number(optFee) > 0 && (
                       <>
                         {" "}
-                        {activityType === "BUY" ? "+" : "−"} {Number(optFee)}
+                        {activityType === ActivityType.BUY ? "+" : "−"} {Number(optFee)}
                       </>
                     )}
                   </p>
@@ -477,13 +759,15 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
               render={({ field }) => (
                 <FormItem>
                   <FormLabel className="text-base font-medium">
-                    {activityType === "DIVIDEND"
+                    {activityType === ActivityType.DIVIDEND
                       ? "Dividend Amount"
-                      : activityType === "INTEREST"
+                      : activityType === ActivityType.INTEREST
                         ? "Interest Amount"
                         : isTaxActivity
                           ? "Tax Amount"
-                          : "Amount"}
+                          : isCreditActivity
+                            ? "Credit Amount"
+                            : "Amount"}
                   </FormLabel>
                   <FormControl>
                     <MoneyInput {...field} />
@@ -492,6 +776,99 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
                 </FormItem>
               )}
             />
+          )}
+
+          {needsInternalCashTransferAmounts && (
+            <div className="space-y-3">
+              {isCrossCurrencyInternalCash ? (
+                <>
+                  <FormField
+                    control={control}
+                    name={"sourceAmount" as any}
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-base font-medium">
+                          Sent ({effectiveSourceCurrency})
+                        </FormLabel>
+                        <FormControl>
+                          <MoneyInput
+                            {...field}
+                            onValueChange={handleSourceAmountChange}
+                            aria-label="Sent amount"
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={control}
+                    name={"destinationAmount" as any}
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-base font-medium">
+                          Received ({effectiveDestinationCurrency})
+                        </FormLabel>
+                        <FormControl>
+                          <MoneyInput
+                            {...field}
+                            onValueChange={handleDestinationAmountChange}
+                            aria-label="Received amount"
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </>
+              ) : (
+                <FormField
+                  control={control}
+                  name={"sourceAmount" as any}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-base font-medium">Amount</FormLabel>
+                      <FormControl>
+                        <MoneyInput
+                          {...field}
+                          onValueChange={handleSourceAmountChange}
+                          aria-label="Amount"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              )}
+
+              {isCrossCurrencyInternalCash && (
+                <FormField
+                  control={control}
+                  name={"fxRate" as any}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-base font-medium">
+                        FX Rate
+                        <span className="text-muted-foreground ml-2 text-xs font-normal">
+                          1 {effectiveSourceCurrency} ={" "}
+                          {Number(field.value) > 0 ? field.value : "?"}{" "}
+                          {effectiveDestinationCurrency}
+                        </span>
+                      </FormLabel>
+                      <FormControl>
+                        <MoneyInput
+                          {...field}
+                          onValueChange={handleFxRateChange}
+                          maxDecimalPlaces={8}
+                          aria-label="FX Rate"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              )}
+            </div>
           )}
 
           {/* Split Ratio */}
@@ -556,56 +933,10 @@ export function MobileDetailsStep({ accounts, activityType, isEditing }: MobileD
             assetCurrency={assetCurrency}
             accountCurrency={accountCurrency}
             baseCurrency={baseCurrency}
-            defaultOpen={isDrip}
+            showSubtype={!isDividendActivity && !isInterestActivity}
+            showCurrency={!isTransfer || isExternal}
+            showFxRate={!isTransfer || isExternal}
           />
-
-          {/* DRIP: Price & Quantity of reinvested shares */}
-          {isDrip && (
-            <div className="grid grid-cols-1 gap-4">
-              <FormField
-                control={control}
-                name="unitPrice"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel className="text-base font-medium">Price</FormLabel>
-                    <FormControl>
-                      <MoneyInput
-                        ref={field.ref}
-                        name={field.name}
-                        value={field.value}
-                        onValueChange={field.onChange}
-                        placeholder="0.00"
-                        maxDecimalPlaces={4}
-                        className="h-12 text-base sm:text-sm"
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={control}
-                name="quantity"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel className="text-base font-medium">Quantity</FormLabel>
-                    <FormControl>
-                      <QuantityInput
-                        ref={field.ref}
-                        name={field.name}
-                        value={field.value}
-                        onValueChange={field.onChange}
-                        placeholder="0.00"
-                        maxDecimalPlaces={8}
-                        className="h-12 text-base sm:text-sm"
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            </div>
-          )}
 
           {/* Comment */}
           <FormField

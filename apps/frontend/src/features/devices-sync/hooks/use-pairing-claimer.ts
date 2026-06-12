@@ -1,10 +1,15 @@
 // usePairingClaimer
 // Self-contained hook for the claimer (new device) pairing flow.
 // Uses backend-owned pairing flow coordinator for the post-SAS phase.
-// Overwrite consent is handled by the auto-bootstrap AlertDialog after pairing.
 // ================================================================
 
-import { logger, beginPairingConfirm, getPairingFlowState, cancelPairingFlow } from "@/adapters";
+import {
+  logger,
+  beginPairingConfirm,
+  getPairingFlowState,
+  cancelPairingFlow,
+  approvePairingOverwrite,
+} from "@/adapters";
 import type { PairingFlowPhase } from "@/adapters";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -13,15 +18,30 @@ import { syncService } from "../services/sync-service";
 import { syncStorage } from "../storage/keyring";
 import type { ClaimerSession, KeyBundlePayload } from "../types";
 
-type ClaimerPhase = "idle" | "connecting" | "claimed" | "flow_active" | "complete" | "error";
+type ClaimerPhase =
+  | "idle"
+  | "connecting"
+  | "claimed"
+  | "flow_active"
+  | "overwrite_required"
+  | "complete"
+  | "error";
+
+export interface PairingOverwriteInfo {
+  localRows: number;
+  nonEmptyTables: { table: string; rows: number }[];
+}
 
 export type ClaimerStep =
   | "enter_code"
   | "connecting"
   | "waiting_keys"
+  | "overwrite_required"
   | "syncing"
   | "success"
   | "error";
+
+export type PairingBootstrapState = "idle" | "active" | "failed";
 
 export function usePairingClaimer() {
   const queryClient = useQueryClient();
@@ -29,6 +49,8 @@ export function usePairingClaimer() {
   const [session, setSession] = useState<ClaimerSession | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [flowId, setFlowId] = useState<string | null>(null);
+  const [overwriteInfo, setOverwriteInfo] = useState<PairingOverwriteInfo | null>(null);
+  const [isApprovingOverwrite, setIsApprovingOverwrite] = useState(false);
 
   // Guard against auto-proceed firing twice
   const autoProceedFired = useRef(false);
@@ -67,6 +89,7 @@ export function usePairingClaimer() {
   const step: ClaimerStep = useMemo(() => {
     if (phase === "error") return "error";
     if (phase === "complete") return "success";
+    if (phase === "overwrite_required") return "overwrite_required";
     if (phase === "flow_active") {
       if (flowPoll.error) return "error";
       return "syncing";
@@ -90,6 +113,46 @@ export function usePairingClaimer() {
     }
     return null;
   }, [error, keyPoll.error, flowPoll.error]);
+
+  const bootstrapFlowState = useMemo<PairingBootstrapState>(() => {
+    if (flowId !== null && (phase === "error" || flowPoll.error)) {
+      return "failed";
+    }
+    if (
+      phase === "flow_active" ||
+      phase === "overwrite_required" ||
+      (flowId !== null && phase !== "idle")
+    ) {
+      return "active";
+    }
+    return "idle";
+  }, [flowId, phase, flowPoll.error]);
+
+  const processFlowPhase = useCallback(
+    (flowPhase: PairingFlowPhase) => {
+      switch (flowPhase.phase) {
+        case "overwrite_required":
+          setOverwriteInfo(flowPhase.info);
+          setPhase("overwrite_required");
+          break;
+        case "syncing":
+          setOverwriteInfo(null);
+          setPhase("flow_active");
+          break;
+        case "success":
+          setOverwriteInfo(null);
+          setPhase("complete");
+          queryClient.invalidateQueries({ queryKey: ["sync"] });
+          break;
+        case "error":
+          setOverwriteInfo(null);
+          setError(flowPhase.message);
+          setPhase("error");
+          break;
+      }
+    },
+    [queryClient],
+  );
 
   // Auto-proceed: when key bundle received, store credentials + call beginPairingConfirm
   useEffect(() => {
@@ -126,7 +189,7 @@ export function usePairingClaimer() {
         setPhase("error");
       }
     })();
-  }, [phase, keyPoll.data, session]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase, keyPoll.data, session, processFlowPhase]);
 
   // Process flow poll results
   useEffect(() => {
@@ -134,25 +197,7 @@ export function usePairingClaimer() {
     const data = flowPoll.data;
     if (!data) return;
     processFlowPhase(data.phase);
-  }, [phase, flowPoll.data]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  function processFlowPhase(flowPhase: PairingFlowPhase) {
-    switch (flowPhase.phase) {
-      case "overwrite_required":
-        // Backend no longer sends this during pairing — treat as syncing
-        break;
-      case "syncing":
-        break;
-      case "success":
-        setPhase("complete");
-        queryClient.invalidateQueries({ queryKey: ["sync"] });
-        break;
-      case "error":
-        setError(flowPhase.message);
-        setPhase("error");
-        break;
-    }
-  }
+  }, [phase, flowPoll.data, processFlowPhase]);
 
   const submitCode = useCallback(async (code: string) => {
     logger.info(`[usePairingClaimer] Submitting code`);
@@ -163,6 +208,7 @@ export function usePairingClaimer() {
       const s = await syncService.claimPairingSession(code);
       logger.info(`[usePairingClaimer] Session claimed, pairingId=${s.pairingId}`);
       setSession(s);
+      setOverwriteInfo(null);
       setPhase("claimed");
     } catch (err) {
       logger.error(`[usePairingClaimer] Claim error: ${err}`);
@@ -171,15 +217,42 @@ export function usePairingClaimer() {
     }
   }, []);
 
-  const cancel = useCallback(async () => {
-    if (flowId) {
-      await cancelPairingFlow(flowId).catch(() => {});
+  const approveOverwrite = useCallback(async () => {
+    if (!flowId || isApprovingOverwrite) return;
+    setError(null);
+    setIsApprovingOverwrite(true);
+    try {
+      const result = await approvePairingOverwrite(flowId);
+      setFlowId(result.flowId);
+      processFlowPhase(result.phase);
+    } catch (err) {
+      logger.error(`[usePairingClaimer] Overwrite approval error: ${err}`);
+      setError(err instanceof Error ? err.message : String(err));
+      setPhase("error");
+    } finally {
+      setIsApprovingOverwrite(false);
     }
-    if (session) {
+  }, [flowId, isApprovingOverwrite, processFlowPhase]);
+
+  const cancel = useCallback(async () => {
+    const hadConfirmedFlow = !!flowId;
+    if (flowId) {
+      await cancelPairingFlow(flowId).catch((err) => {
+        logger.warn(`[usePairingClaimer] Failed to cancel pairing flow: ${err}`);
+      });
+    } else if (session) {
       await syncService.cancelPairing(session.pairingId).catch(() => {});
+    }
+    if (hadConfirmedFlow) {
+      await syncService.clearSyncData().catch((err) => {
+        logger.warn(
+          `[usePairingClaimer] Failed to clear local sync data after pairing cancel: ${err}`,
+        );
+      });
     }
     setSession(null);
     setFlowId(null);
+    setOverwriteInfo(null);
     setPhase("idle");
     setError(null);
     autoProceedFired.current = false;
@@ -188,6 +261,7 @@ export function usePairingClaimer() {
   const retry = useCallback(() => {
     setSession(null);
     setFlowId(null);
+    setOverwriteInfo(null);
     setPhase("idle");
     setError(null);
     autoProceedFired.current = false;
@@ -197,7 +271,11 @@ export function usePairingClaimer() {
     step,
     error: errorMessage,
     sas: sasQuery.data ?? null,
+    overwriteInfo,
+    isApprovingOverwrite,
+    bootstrapFlowState,
     submitCode,
+    approveOverwrite,
     cancel,
     retry,
   };

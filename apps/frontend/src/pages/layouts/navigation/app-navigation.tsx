@@ -46,13 +46,13 @@ const staticNavigation: NavigationProps = {
       keywords: ["transactions", "trades", "history"],
       label: "View Activities",
     },
-    // {
-    //   icon: <Icons.Target className="size-6" />,
-    //   title: "FIRE Planner",
-    //   href: "/fire-planner",
-    //   keywords: ["fire", "retire", "retirement", "financial independence", "planner"],
-    //   label: "FIRE Planner",
-    // },
+    {
+      icon: <Icons.Goals className="size-6" />,
+      title: "Goals",
+      href: "/goals",
+      keywords: ["goals", "fire", "retire", "retirement", "savings", "planner"],
+      label: "Goals",
+    },
     {
       icon: <Icons.Sparkles className="size-6" />,
       title: "Assistant",
@@ -92,9 +92,12 @@ export function useNavigation() {
     };
   }, []);
 
-  // Combine static navigation items with addons grouped separately
+  // Spending lives entirely on the dashboard tab (and its deep-linked pages);
+  // no top-level nav entry. Combine static navigation items with addons.
+  const primary = [...staticNavigation.primary];
+
   const navigation: NavigationProps = {
-    primary: staticNavigation.primary,
+    primary,
     secondary: staticNavigation.secondary,
     addons: dynamicItems,
   };

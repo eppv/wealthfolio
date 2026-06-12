@@ -1,18 +1,120 @@
+use super::activities_constants::{ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT};
 use super::activities_model::*;
 use crate::limits::ContributionActivity;
 use crate::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Trait defining the contract for Activity repository operations.
 #[async_trait]
 pub trait ActivityRepositoryTrait: Send + Sync {
     fn get_activity(&self, activity_id: &str) -> Result<Activity>;
+    /// Returns the other activity sharing `group_id`, excluding `exclude_id`.
+    fn find_transfer_counterpart(
+        &self,
+        group_id: &str,
+        exclude_id: &str,
+    ) -> Result<Option<Activity>>;
     fn get_activities(&self) -> Result<Vec<Activity>>;
+    fn get_activities_by_ids(&self, activity_ids: &[String]) -> Result<Vec<Activity>> {
+        if activity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested: HashSet<&str> = activity_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities()?;
+        activities.retain(|activity| requested.contains(activity.id.as_str()));
+        Ok(activities)
+    }
+    fn get_activities_by_source_group_id(&self, source_group_id: &str) -> Result<Vec<Activity>> {
+        let group_id = source_group_id.trim();
+        if group_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut activities = self.get_activities()?;
+        activities.retain(|activity| activity.source_group_id.as_deref() == Some(group_id));
+        Ok(activities)
+    }
     fn get_activities_by_account_id(&self, account_id: &str) -> Result<Vec<Activity>>;
     fn get_activities_by_account_ids(&self, account_ids: &[String]) -> Result<Vec<Activity>>;
+    fn get_activities_by_account_ids_in_date_range(
+        &self,
+        account_ids: &[String],
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<Vec<Activity>> {
+        let requested_accounts: HashSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities()?;
+        activities.retain(|activity| {
+            requested_accounts.contains(activity.account_id.as_str())
+                && activity.activity_date >= start_utc
+                && activity.activity_date <= end_utc
+        });
+        Ok(activities)
+    }
+    fn get_transfer_activities_touching_account_ids_in_date_range(
+        &self,
+        account_ids: &[String],
+        start_utc: Option<DateTime<Utc>>,
+        end_exclusive_utc: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Activity>> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested_accounts: HashSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let mut scoped_transfers = self.get_activities()?;
+        scoped_transfers.retain(|activity| {
+            requested_accounts.contains(activity.account_id.as_str())
+                && activity.is_posted()
+                && matches!(
+                    activity.effective_type(),
+                    ACTIVITY_TYPE_TRANSFER_IN | ACTIVITY_TYPE_TRANSFER_OUT
+                )
+                && start_utc
+                    .map(|start| activity.activity_date >= start)
+                    .unwrap_or(true)
+                && end_exclusive_utc
+                    .map(|end| activity.activity_date < end)
+                    .unwrap_or(true)
+        });
+
+        let group_ids: HashSet<String> = scoped_transfers
+            .iter()
+            .filter_map(|activity| activity.source_group_id.clone())
+            .collect();
+        let mut by_id: HashMap<String, Activity> = scoped_transfers
+            .into_iter()
+            .map(|activity| (activity.id.clone(), activity))
+            .collect();
+
+        if !group_ids.is_empty() {
+            for activity in self.get_activities()? {
+                if !activity.is_posted()
+                    || !matches!(
+                        activity.effective_type(),
+                        ACTIVITY_TYPE_TRANSFER_IN | ACTIVITY_TYPE_TRANSFER_OUT
+                    )
+                {
+                    continue;
+                }
+                if activity
+                    .source_group_id
+                    .as_ref()
+                    .is_some_and(|group_id| group_ids.contains(group_id))
+                {
+                    by_id.entry(activity.id.clone()).or_insert(activity);
+                }
+            }
+        }
+
+        let mut activities: Vec<Activity> = by_id.into_values().collect();
+        activities.sort_by_key(|activity| activity.activity_date);
+        Ok(activities)
+    }
     fn get_trading_activities(&self) -> Result<Vec<Activity>>;
     fn get_income_activities(&self) -> Result<Vec<Activity>>;
     /// Fetches contribution-eligible activities (DEPOSIT, TRANSFER_IN, TRANSFER_OUT, CREDIT)
@@ -37,9 +139,55 @@ pub trait ActivityRepositoryTrait: Send + Sync {
         date_to: Option<NaiveDate>,
         instrument_type_filter: Option<Vec<String>>,
     ) -> Result<ActivitySearchResponse>;
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities_in_utc_range(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from_utc: Option<DateTime<Utc>>,
+        date_to_utc_exclusive: Option<DateTime<Utc>>,
+        instrument_type_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse> {
+        let date_from = date_from_utc.map(|dt| dt.date_naive());
+        let date_to =
+            date_to_utc_exclusive.map(|dt| (dt - chrono::Duration::seconds(1)).date_naive());
+
+        self.search_activities(
+            page,
+            page_size,
+            account_id_filter,
+            activity_type_filter,
+            asset_id_keyword,
+            sort,
+            needs_review_filter,
+            date_from,
+            date_to,
+            instrument_type_filter,
+        )
+    }
     async fn create_activity(&self, new_activity: NewActivity) -> Result<Activity>;
     async fn update_activity(&self, activity_update: ActivityUpdate) -> Result<Activity>;
     async fn delete_activity(&self, activity_id: String) -> Result<Activity>;
+    /// Pairs two existing transfer activities by writing a shared `source_group_id`
+    /// and clearing `metadata.flow.is_external` on both. Order of `activity_a_id` /
+    /// `activity_b_id` is irrelevant; the impl resolves which is IN vs OUT.
+    async fn link_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
+    /// Unpairs two linked transfer activities by clearing their shared `source_group_id`
+    /// and marking `metadata.flow.is_external` as true on both rows.
+    async fn unlink_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
     async fn bulk_mutate_activities(
         &self,
         creates: Vec<NewActivity>,
@@ -81,7 +229,8 @@ pub trait ActivityRepositoryTrait: Send + Sync {
     ) -> Result<()>;
     // Add other repository methods if necessary, e.g., calculate_average_cost, get_deposit_activities
     fn calculate_average_cost(&self, account_id: &str, asset_id: &str) -> Result<Decimal>;
-    fn get_income_activities_data(&self, account_id: Option<&str>) -> Result<Vec<IncomeData>>;
+    fn get_income_activities_data(&self, account_ids: Option<&[String]>)
+        -> Result<Vec<IncomeData>>;
     fn get_first_activity_date_overall(&self) -> Result<DateTime<Utc>>;
 
     /// Gets the first and last activity dates for each asset in the provided list.
@@ -95,6 +244,17 @@ pub trait ActivityRepositoryTrait: Send + Sync {
     /// Both dates may be None if no activities exist for the asset.
     #[allow(clippy::type_complexity)]
     fn get_activity_bounds_for_assets(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>>;
+
+    /// Gets the first and last non-archived holdings snapshot dates where each
+    /// asset appears.
+    ///
+    /// Holdings-mode assets can have historical valuation exposure without any
+    /// activity rows, so quote planning must include these bounds too.
+    #[allow(clippy::type_complexity)]
+    fn get_holdings_snapshot_bounds_for_assets(
         &self,
         asset_ids: &[String],
     ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>>;
@@ -152,6 +312,37 @@ pub trait ActivityServiceTrait: Send + Sync {
         date_to: Option<NaiveDate>,
         instrument_type_filter: Option<Vec<String>>,
     ) -> Result<ActivitySearchResponse>;
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities_in_utc_range(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from_utc: Option<DateTime<Utc>>,
+        date_to_utc_exclusive: Option<DateTime<Utc>>,
+        instrument_type_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse> {
+        let date_from = date_from_utc.map(|dt| dt.date_naive());
+        let date_to =
+            date_to_utc_exclusive.map(|dt| (dt - chrono::Duration::seconds(1)).date_naive());
+
+        self.search_activities(
+            page,
+            page_size,
+            account_id_filter,
+            activity_type_filter,
+            asset_id_keyword,
+            sort,
+            needs_review_filter,
+            date_from,
+            date_to,
+            instrument_type_filter,
+        )
+    }
     fn get_first_activity_date(
         &self,
         account_ids: Option<&[String]>,
@@ -166,6 +357,28 @@ pub trait ActivityServiceTrait: Send + Sync {
     async fn create_activity(&self, activity: NewActivity) -> Result<Activity>;
     async fn update_activity(&self, activity: ActivityUpdate) -> Result<Activity>;
     async fn delete_activity(&self, activity_id: String) -> Result<Activity>;
+    fn get_transfer_pair_for_activity(
+        &self,
+        activity_id: String,
+    ) -> Result<InternalTransferPairResponse>;
+    fn find_transfer_match_candidates(
+        &self,
+        request: TransferMatchCandidateRequest,
+    ) -> Result<Vec<TransferMatchCandidate>>;
+    async fn save_internal_transfer_pair(
+        &self,
+        request: InternalTransferPairRequest,
+    ) -> Result<InternalTransferPairResponse>;
+    async fn link_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
+    async fn unlink_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
     async fn bulk_mutate_activities(
         &self,
         request: ActivityBulkMutationRequest,

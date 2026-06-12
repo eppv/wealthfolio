@@ -106,7 +106,20 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
                     }
                 }
             }
-            DomainEvent::AssetsMerged { .. } | DomainEvent::TrackingModeChanged { .. } => {}
+            DomainEvent::TrackingModeChanged {
+                account_id,
+                old_mode,
+                new_mode,
+                ..
+            } => {
+                if *old_mode == TrackingMode::Holdings && *new_mode == TrackingMode::Transactions {
+                    if !account_id.is_empty() {
+                        account_ids.insert(account_id.clone());
+                    }
+                    has_recalc_event = true;
+                }
+            }
+            DomainEvent::AssetsMerged { .. } => {}
         }
     }
 
@@ -176,6 +189,30 @@ pub fn plan_broker_sync(events: &[DomainEvent]) -> Vec<String> {
     }
 
     account_ids
+}
+
+/// Plans an auto-categorization pass over spending accounts touched by this
+/// batch. Returns the unique set of opted-in spending account IDs that
+/// appeared in any `ActivitiesChanged` event. Empty result means no work.
+///
+/// Other events (DeviceSyncPullComplete, asset events, holdings events,
+/// account / tracking-mode events) are intentionally ignored — sync already
+/// propagates assignments, and the other events don't touch spend activities.
+pub fn plan_categorization_job(
+    events: &[DomainEvent],
+    opted_in_accounts: &HashSet<String>,
+) -> Vec<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for event in events {
+        if let DomainEvent::ActivitiesChanged { account_ids, .. } = event {
+            for id in account_ids {
+                if opted_in_accounts.contains(id) {
+                    out.insert(id.clone());
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Plans asset enrichment for AssetsCreated events.
@@ -322,6 +359,31 @@ mod tests {
         } else {
             panic!("Expected Incremental mode");
         }
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_holdings_to_transactions_triggers_recalc() {
+        let events = vec![DomainEvent::TrackingModeChanged {
+            account_id: "acc1".to_string(),
+            old_mode: TrackingMode::Holdings,
+            new_mode: TrackingMode::Transactions,
+            is_connected: true,
+        }];
+
+        let config = plan_portfolio_job(&events, "UTC").unwrap();
+        assert_eq!(config.account_ids, Some(vec!["acc1".to_string()]));
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_transactions_to_holdings_does_not_trigger_recalc() {
+        let events = vec![DomainEvent::TrackingModeChanged {
+            account_id: "acc1".to_string(),
+            old_mode: TrackingMode::Transactions,
+            new_mode: TrackingMode::Holdings,
+            is_connected: true,
+        }];
+
+        assert!(plan_portfolio_job(&events, "UTC").is_none());
     }
 
     #[test]

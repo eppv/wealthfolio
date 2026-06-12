@@ -12,9 +12,11 @@ use anyhow::anyhow;
 use chrono::NaiveDate;
 use serde_json::json;
 use wealthfolio_core::{
-    accounts::AccountServiceTrait,
-    constants::PORTFOLIO_TOTAL_ACCOUNT_ID,
-    portfolio::{snapshot::SnapshotRecalcMode, valuation::ValuationRecalcMode},
+    accounts::{account_supports_purpose, AccountPurpose, AccountServiceTrait},
+    portfolio::{
+        snapshot::{reconcile_quote_sync_from_latest_account_snapshots, SnapshotRecalcMode},
+        valuation::ValuationRecalcMode,
+    },
     quotes::MarketSyncMode,
 };
 
@@ -36,9 +38,14 @@ pub fn parse_date_optional(
     date_str.map(|s| parse_date(&s, field_name)).transpose()
 }
 
-/// Normalize file paths by stripping file:// prefix
-pub fn normalize_file_path(path: &str) -> String {
-    path.strip_prefix("file://").unwrap_or(path).to_string()
+pub fn holdings_account_ids(state: &AppState, account_ids: &[String]) -> ApiResult<Vec<String>> {
+    Ok(state
+        .account_service
+        .get_accounts_by_ids(account_ids)?
+        .into_iter()
+        .filter(|account| account_supports_purpose(&account.account_type, AccountPurpose::Holdings))
+        .map(|account| account.id)
+        .collect())
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -130,8 +137,41 @@ pub async fn process_portfolio_job(
         .map(ValuationRecalcMode::SinceDate)
         .unwrap_or_else(|| config.valuation_mode.clone());
 
+    let accounts_for_scope = state
+        .account_service
+        .get_non_archived_accounts()
+        .map_err(|err| {
+            let err_msg = format!("Failed to list non-archived accounts: {}", err);
+            event_bus.publish(ServerEvent::with_payload(
+                PORTFOLIO_UPDATE_ERROR,
+                json!(err_msg),
+            ));
+            crate::error::ApiError::Anyhow(anyhow!(err_msg))
+        })?;
+
+    let account_ids: Vec<String> = if let Some(ref target_ids) = config.account_ids {
+        target_ids.clone()
+    } else {
+        accounts_for_scope.iter().map(|a| a.id.clone()).collect()
+    };
+    let quote_reconciliation_account_ids: Vec<String> =
+        accounts_for_scope.iter().map(|a| a.id.clone()).collect();
+
     // Only perform market sync if the mode requires it
     if config.market_sync_mode.requires_sync() {
+        if let Err(e) = reconcile_quote_sync_from_latest_account_snapshots(
+            state.snapshot_service.as_ref(),
+            state.quote_service.as_ref(),
+            &quote_reconciliation_account_ids,
+        )
+        .await
+        {
+            tracing::warn!(
+                "Failed to reconcile quote sync state from latest holdings: {}. Quote sync planning may be affected.",
+                e
+            );
+        }
+
         event_bus.publish(ServerEvent::new(MARKET_SYNC_START));
 
         let sync_start = std::time::Instant::now();
@@ -149,9 +189,17 @@ pub async fn process_portfolio_job(
 
         match sync_result {
             Ok(result) => {
+                let skipped_reasons: Vec<(String, String)> = result
+                    .skipped_reasons
+                    .into_iter()
+                    .map(|(asset_id, reason)| (asset_id, reason.to_string()))
+                    .collect();
                 event_bus.publish(ServerEvent::with_payload(
                     MARKET_SYNC_COMPLETE,
-                    json!({ "failed_syncs": result.failed }),
+                    json!({
+                        "failed_syncs": result.failures,
+                        "skipped_reasons": skipped_reasons,
+                    }),
                 ));
                 tracing::info!("Market data sync completed in {:?}", sync_start.elapsed());
                 state.health_service.clear_cache().await;
@@ -175,30 +223,6 @@ pub async fn process_portfolio_job(
 
     event_bus.publish(ServerEvent::new(PORTFOLIO_UPDATE_START));
 
-    // For TOTAL portfolio calculation, use non-archived accounts (ignores is_active)
-    let accounts_for_total = state
-        .account_service
-        .get_non_archived_accounts()
-        .map_err(|err| {
-            let err_msg = format!("Failed to list non-archived accounts: {}", err);
-            event_bus.publish(ServerEvent::with_payload(
-                PORTFOLIO_UPDATE_ERROR,
-                json!(err_msg),
-            ));
-            crate::error::ApiError::Anyhow(anyhow!(err_msg))
-        })?;
-
-    // Determine which accounts to calculate individual snapshots for:
-    // - If specific account_ids provided: process those accounts (even if archived)
-    // - Otherwise: process all non-archived accounts
-    let mut account_ids: Vec<String> = if let Some(ref target_ids) = config.account_ids {
-        // Process the specific requested accounts (even if archived, for their own snapshots)
-        target_ids.clone()
-    } else {
-        // No specific accounts requested - use non-archived accounts
-        accounts_for_total.iter().map(|a| a.id.clone()).collect()
-    };
-
     if !account_ids.is_empty() {
         let ids_slice = account_ids.as_slice();
         if let Err(err) = state
@@ -218,51 +242,18 @@ pub async fn process_portfolio_job(
         }
     }
 
-    if let Err(err) = state
-        .snapshot_service
-        .recalculate_total_portfolio_snapshots(snapshot_mode)
-        .await
+    // Update position status from latest real-account snapshots for quote sync planning.
+    if let Err(e) = reconcile_quote_sync_from_latest_account_snapshots(
+        state.snapshot_service.as_ref(),
+        state.quote_service.as_ref(),
+        &quote_reconciliation_account_ids,
+    )
+    .await
     {
-        let err_msg = format!("Failed to calculate TOTAL portfolio snapshot: {}", err);
-        tracing::error!("{}", err_msg);
-        event_bus.publish(ServerEvent::with_payload(
-            PORTFOLIO_UPDATE_ERROR,
-            json!(err_msg),
-        ));
-        return Err(crate::error::ApiError::Anyhow(anyhow!(err_msg)));
-    }
-
-    // Update position status from TOTAL snapshot
-    // This derives open/closed position transitions for quote sync planning
-    if let Ok(Some(total_snapshot)) = state
-        .snapshot_service
-        .get_latest_holdings_snapshot(PORTFOLIO_TOTAL_ACCOUNT_ID)
-    {
-        // Extract asset quantities from the TOTAL snapshot
-        let current_holdings: std::collections::HashMap<String, rust_decimal::Decimal> =
-            total_snapshot
-                .positions
-                .iter()
-                .map(|(asset_id, position)| (asset_id.clone(), position.quantity))
-                .collect();
-
-        if let Err(e) = state
-            .quote_service
-            .update_position_status_from_holdings(&current_holdings)
-            .await
-        {
-            tracing::warn!(
-                "Failed to update position status from holdings: {}. Quote sync planning may be affected.",
-                e
-            );
-        }
-    }
-
-    if !account_ids
-        .iter()
-        .any(|id| id == PORTFOLIO_TOTAL_ACCOUNT_ID)
-    {
-        account_ids.push(PORTFOLIO_TOTAL_ACCOUNT_ID.to_string());
+        tracing::warn!(
+            "Failed to update position status from holdings: {}. Quote sync planning may be affected.",
+            e
+        );
     }
 
     for account_id in account_ids {

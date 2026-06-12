@@ -4,16 +4,21 @@ import {
   FormItem,
   FormLabel,
   FormMessage,
+  Icons,
   InputGroup,
   InputGroupAddon,
   InputGroupText,
   MoneyInput,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
 } from "@wealthfolio/ui";
 import { useFormContext, type FieldPath, type FieldValues } from "react-hook-form";
 
 interface AmountInputProps<TFieldValues extends FieldValues = FieldValues> {
   name: FieldPath<TFieldValues>;
   label?: string;
+  labelHelpText?: string;
   placeholder?: string;
   /** Maximum decimal places (default: 2 for currency) */
   maxDecimalPlaces?: number;
@@ -24,6 +29,7 @@ interface AmountInputProps<TFieldValues extends FieldValues = FieldValues> {
 export function AmountInput<TFieldValues extends FieldValues = FieldValues>({
   name,
   label = "Amount",
+  labelHelpText,
   placeholder = "0.00",
   maxDecimalPlaces = 2,
   currency,
@@ -35,14 +41,30 @@ export function AmountInput<TFieldValues extends FieldValues = FieldValues>({
       control={control}
       name={name}
       render={({ field }) => (
-        <FormItem>
-          <FormLabel>{label}</FormLabel>
+        <FormItem className="min-w-0">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <FormLabel>{label}</FormLabel>
+            {labelHelpText && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    className="text-muted-foreground/70 hover:text-foreground inline-flex rounded-full transition-colors"
+                    aria-label={`More info about ${label}`}
+                  >
+                    <Icons.Info className="h-3 w-3" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-xs text-xs">{labelHelpText}</TooltipContent>
+              </Tooltip>
+            )}
+          </div>
           <FormControl>
             {currency ? (
-              <InputGroup className="bg-input-bg h-input-height shadow-xs rounded-md">
+              <InputGroup className="bg-input-bg h-input-height shadow-xs min-w-0 rounded-md">
                 <MoneyInput
                   data-slot="input-group-control"
-                  className="aria-invalid:ring-0 flex-1 rounded-none border-0 bg-transparent shadow-none ring-0 focus-visible:ring-0"
+                  className="aria-invalid:ring-0 min-w-0 flex-1 rounded-none border-0 bg-transparent shadow-none ring-0 focus-visible:ring-0"
                   ref={field.ref}
                   name={field.name}
                   value={field.value}
@@ -52,8 +74,8 @@ export function AmountInput<TFieldValues extends FieldValues = FieldValues>({
                   aria-label={label}
                   data-testid={`${label.toLowerCase().replace(/\s+/g, "-")}-input`}
                 />
-                <InputGroupAddon align="inline-end">
-                  <InputGroupText>{currency}</InputGroupText>
+                <InputGroupAddon align="inline-end" className="shrink-0">
+                  <InputGroupText className="shrink-0">{currency}</InputGroupText>
                 </InputGroupAddon>
               </InputGroup>
             ) : (

@@ -8,6 +8,7 @@ import {
   createDraftTransaction,
   resolveAssetIdForTransaction,
   TRACKED_FIELDS,
+  validateTransactionsForSave,
   valuesAreEqual,
 } from "./activity-utils";
 import type { LocalTransaction } from "./types";
@@ -120,6 +121,16 @@ describe("activity-utils", () => {
       });
       // Backend now generates CASH:{currency} IDs, frontend returns undefined
       expect(resolveAssetIdForTransaction(tx, "GBP")).toBeUndefined();
+    });
+
+    it("should return assetId for staking reward interest", () => {
+      const tx = createMockTransaction({
+        activityType: ActivityType.INTEREST,
+        subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+        assetId: "ETH",
+        assetSymbol: "ETH",
+      });
+      expect(resolveAssetIdForTransaction(tx, "USD")).toBe("ETH");
     });
 
     it("should return undefined for non-cash activities without asset", () => {
@@ -352,12 +363,185 @@ describe("activity-utils", () => {
       );
 
       expect(result.creates).toHaveLength(1);
-      expect(result.creates[0].symbol).toEqual(
+      expect(result.creates[0].asset).toEqual(
         expect.objectContaining({
           symbol: "VWRPL.XC",
           exchangeMic: "XLON",
           quoteCcy: "GBP",
           instrumentType: "EQUITY",
+        }),
+      );
+    });
+
+    it("should save staking rewards as asset-backed income", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "temp-staking-1",
+          isNew: true,
+          activityType: ActivityType.INTEREST,
+          subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+          assetId: "",
+          assetSymbol: "ETH",
+          quantity: "0.25",
+          unitPrice: "4000",
+          amount: "1000",
+          pendingQuoteCcy: "USD",
+          pendingInstrumentType: "CRYPTO",
+        }),
+      ];
+      const dirtyIds = new Set(["temp-staking-1"]);
+
+      const result = buildSavePayload(
+        transactions,
+        dirtyIds,
+        new Set(),
+        mockResolveTransactionCurrency,
+        dirtyCurrencyLookup,
+        assetCurrencyLookup,
+        "USD",
+      );
+
+      expect(result.creates).toHaveLength(1);
+      expect(result.creates[0]).toEqual(
+        expect.objectContaining({
+          activityType: ActivityType.INTEREST,
+          subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+          quantity: "0.25",
+          unitPrice: "4000",
+          amount: "1000",
+        }),
+      );
+      expect(result.creates[0].asset).toEqual(
+        expect.objectContaining({
+          symbol: "ETH",
+          quoteCcy: "USD",
+          instrumentType: "CRYPTO",
+        }),
+      );
+    });
+
+    it("should send an empty subtype marker when clearing subtype on an existing row", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "existing-interest-1",
+          isNew: false,
+          activityType: ActivityType.INTEREST,
+          subtype: undefined,
+          amount: "25",
+        }),
+      ];
+      const dirtyIds = new Set(["existing-interest-1"]);
+
+      const result = buildSavePayload(
+        transactions,
+        dirtyIds,
+        new Set(),
+        mockResolveTransactionCurrency,
+        dirtyCurrencyLookup,
+        assetCurrencyLookup,
+        "USD",
+      );
+
+      expect(result.updates).toHaveLength(1);
+      expect(result.updates[0].subtype).toBe("");
+    });
+
+    it("should preserve explicit idempotency keys for new manual duplicates", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "temp-new-1",
+          isNew: true,
+          idempotencyKey: "manual-duplicate-123",
+        }),
+      ];
+      const dirtyIds = new Set(["temp-new-1"]);
+
+      const result = buildSavePayload(
+        transactions,
+        dirtyIds,
+        new Set(),
+        mockResolveTransactionCurrency,
+        dirtyCurrencyLookup,
+        assetCurrencyLookup,
+        "USD",
+      );
+
+      expect(result.creates).toHaveLength(1);
+      expect(result.creates[0].idempotencyKey).toBe("manual-duplicate-123");
+    });
+
+    it("should include existing asset id selected from search for new market activities", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "temp-new-1",
+          isNew: true,
+          assetId: "",
+          assetSymbol: "AAPL",
+          exchangeMic: "XNAS",
+          pendingAssetId: "SEC:AAPL:XNAS",
+          pendingQuoteCcy: "USD",
+          pendingInstrumentType: "EQUITY",
+        }),
+      ];
+      const dirtyIds = new Set(["temp-new-1"]);
+
+      const result = buildSavePayload(
+        transactions,
+        dirtyIds,
+        new Set(),
+        mockResolveTransactionCurrency,
+        dirtyCurrencyLookup,
+        assetCurrencyLookup,
+        "USD",
+      );
+
+      expect(result.creates).toHaveLength(1);
+      expect(result.creates[0].asset).toEqual(
+        expect.objectContaining({
+          id: "SEC:AAPL:XNAS",
+          symbol: "AAPL",
+          exchangeMic: "XNAS",
+          quoteCcy: "USD",
+          instrumentType: "EQUITY",
+        }),
+      );
+    });
+
+    it("should send asset identity when same symbol changes exchange", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "existing-1",
+          isNew: false,
+          assetSymbol: "FBTC",
+          exchangeMic: "XTSE",
+          _originalAssetSymbol: "FBTC",
+          _originalExchangeMic: "NEOE",
+          _originalAssetId: "SEC:FBTC:NEOE",
+          pendingAssetId: "SEC:FBTC:XTSE",
+          pendingQuoteCcy: "CAD",
+          pendingInstrumentType: "ETF",
+        }),
+      ];
+      const dirtyIds = new Set(["existing-1"]);
+
+      const result = buildSavePayload(
+        transactions,
+        dirtyIds,
+        new Set(),
+        mockResolveTransactionCurrency,
+        dirtyCurrencyLookup,
+        assetCurrencyLookup,
+        "USD",
+      );
+
+      expect(result.updates).toHaveLength(1);
+      expect(result.updates[0].asset).toEqual(
+        expect.objectContaining({
+          id: "SEC:FBTC:XTSE",
+          symbol: "FBTC",
+          exchangeMic: "XTSE",
+          quoteCcy: "CAD",
+          instrumentType: "ETF",
         }),
       );
     });
@@ -387,7 +571,7 @@ describe("activity-utils", () => {
       );
 
       expect(result.updates).toHaveLength(1);
-      expect(result.updates[0].symbol).toEqual(
+      expect(result.updates[0].asset).toEqual(
         expect.objectContaining({
           id: "asset-1",
           quoteCcy: "GBP",
@@ -423,7 +607,7 @@ describe("activity-utils", () => {
       );
 
       expect(result.creates).toHaveLength(1);
-      expect(result.creates[0].symbol).toEqual(
+      expect(result.creates[0].asset).toEqual(
         expect.objectContaining({
           symbol: "VWRPL.XC",
           exchangeMic: "XLON",
@@ -431,8 +615,8 @@ describe("activity-utils", () => {
           instrumentType: "EQUITY",
         }),
       );
-      expect(result.creates[0].symbol?.kind).toBeUndefined();
-      expect(result.creates[0].symbol?.name).toBeUndefined();
+      expect(result.creates[0].asset?.kind).toBeUndefined();
+      expect(result.creates[0].asset?.name).toBeUndefined();
     });
 
     it("should include pending delete IDs", () => {
@@ -521,7 +705,7 @@ describe("activity-utils", () => {
 
       // Backend now generates CASH:{currency} IDs for cash activities
       // Frontend doesn't set symbol for cash activities
-      expect(result.updates[0].symbol).toBeUndefined();
+      expect(result.updates[0].asset).toBeUndefined();
     });
 
     it("should not force account currency for securities transfers", () => {
@@ -548,7 +732,7 @@ describe("activity-utils", () => {
       );
 
       expect(result.updates[0].currency).toBeUndefined();
-      expect(result.updates[0].symbol).toEqual(
+      expect(result.updates[0].asset).toEqual(
         expect.objectContaining({
           symbol: "AAPL",
         }),
@@ -628,6 +812,135 @@ describe("activity-utils", () => {
       expect(updated.amount).toBe("0.02");
     });
 
+    it("should keep staking rewards asset-backed when subtype is selected", () => {
+      const accountLookup = new Map<string, { id: string; name: string; currency: string }>([
+        ["account-1", { id: "account-1", name: "Test Account", currency: "USD" }],
+      ]);
+      const assetCurrencyLookup = new Map<string, string>();
+      const tx = createMockTransaction({
+        activityType: ActivityType.INTEREST,
+        assetSymbol: "CASH",
+        assetId: "",
+        quantity: null,
+        unitPrice: null,
+        amount: "100",
+      });
+
+      const updated = applyTransactionUpdate({
+        transaction: tx,
+        field: "subtype",
+        value: ACTIVITY_SUBTYPES.STAKING_REWARD,
+        accountLookup,
+        assetCurrencyLookup,
+        fallbackCurrency: "USD",
+        resolveTransactionCurrency: () => "USD",
+      });
+
+      expect(updated.subtype).toBe(ACTIVITY_SUBTYPES.STAKING_REWARD);
+      expect(updated.assetSymbol).toBe("");
+      expect(updated.assetId).toBe("");
+      expect(updated.quantity).toBeNull();
+      expect(updated.unitPrice).toBeNull();
+    });
+
+    it("should clear asset-backed-only fields when removing a dividend subtype", () => {
+      const accountLookup = new Map<string, { id: string; name: string; currency: string }>([
+        ["account-1", { id: "account-1", name: "Test Account", currency: "USD" }],
+      ]);
+      const assetCurrencyLookup = new Map<string, string>();
+      const tx = createMockTransaction({
+        activityType: ActivityType.DIVIDEND,
+        subtype: ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND,
+        assetSymbol: "AAPL",
+        quantity: "2",
+        unitPrice: "100",
+        amount: "200",
+      });
+
+      const updated = applyTransactionUpdate({
+        transaction: tx,
+        field: "subtype",
+        value: "",
+        accountLookup,
+        assetCurrencyLookup,
+        fallbackCurrency: "USD",
+        resolveTransactionCurrency: () => "USD",
+      });
+
+      expect(updated.subtype).toBeUndefined();
+      expect(updated.quantity).toBeNull();
+      expect(updated.unitPrice).toBeNull();
+      expect(updated.amount).toBe("200");
+    });
+
+    it("should clear invalid staking subtype fields when changing to dividend", () => {
+      const accountLookup = new Map<string, { id: string; name: string; currency: string }>([
+        ["account-1", { id: "account-1", name: "Test Account", currency: "USD" }],
+      ]);
+      const assetCurrencyLookup = new Map<string, string>();
+      const tx = createMockTransaction({
+        activityType: ActivityType.INTEREST,
+        subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+        assetSymbol: "ETH",
+        assetId: "ETH",
+        quantity: "0.25",
+        unitPrice: "3000",
+        amount: "750",
+      });
+
+      const updated = applyTransactionUpdate({
+        transaction: tx,
+        field: "activityType",
+        value: ActivityType.DIVIDEND,
+        accountLookup,
+        assetCurrencyLookup,
+        fallbackCurrency: "USD",
+        resolveTransactionCurrency: () => "USD",
+      });
+
+      expect(updated.activityType).toBe(ActivityType.DIVIDEND);
+      expect(updated.subtype).toBeUndefined();
+      expect(updated.quantity).toBeNull();
+      expect(updated.unitPrice).toBeNull();
+      expect(updated.amount).toBe("750");
+      expect(updated.assetSymbol).toBe("ETH");
+      expect(updated.assetId).toBe("ETH");
+    });
+
+    it("should clear invalid dividend-in-kind subtype fields when changing to a market type", () => {
+      const accountLookup = new Map<string, { id: string; name: string; currency: string }>([
+        ["account-1", { id: "account-1", name: "Test Account", currency: "USD" }],
+      ]);
+      const assetCurrencyLookup = new Map<string, string>();
+      const tx = createMockTransaction({
+        activityType: ActivityType.DIVIDEND,
+        subtype: ACTIVITY_SUBTYPES.DIVIDEND_IN_KIND,
+        assetSymbol: "AAPL",
+        assetId: "AAPL",
+        quantity: "2",
+        unitPrice: "100",
+        amount: "200",
+      });
+
+      const updated = applyTransactionUpdate({
+        transaction: tx,
+        field: "activityType",
+        value: ActivityType.BUY,
+        accountLookup,
+        assetCurrencyLookup,
+        fallbackCurrency: "USD",
+        resolveTransactionCurrency: () => "USD",
+      });
+
+      expect(updated.activityType).toBe(ActivityType.BUY);
+      expect(updated.subtype).toBeUndefined();
+      expect(updated.quantity).toBeNull();
+      expect(updated.unitPrice).toBeNull();
+      expect(updated.amount).toBe("200");
+      expect(updated.assetSymbol).toBe("AAPL");
+      expect(updated.assetId).toBe("AAPL");
+    });
+
     it("should not force transfer activity rows to CASH", () => {
       const accountLookup = new Map<string, { id: string; name: string; currency: string }>([
         ["account-1", { id: "account-1", name: "Test Account", currency: "USD" }],
@@ -651,6 +964,74 @@ describe("activity-utils", () => {
 
       expect(updated.assetSymbol).toBe("AAPL");
       expect(updated.assetId).toBe("AAPL");
+    });
+  });
+
+  describe("validateTransactionsForSave", () => {
+    it("should require asset-backed income fields for staking rewards", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "staking-1",
+          activityType: ActivityType.INTEREST,
+          subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+          assetSymbol: "ETH",
+          assetId: "ETH",
+          quantity: null,
+          unitPrice: null,
+          amount: "100",
+        }),
+      ];
+
+      const result = validateTransactionsForSave(transactions, new Set(["staking-1"]));
+
+      expect(result.isValid).toBe(false);
+      expect(result.errors).toEqual(
+        expect.arrayContaining([expect.objectContaining({ field: "quantity" })]),
+      );
+      expect(result.errors).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ field: "unitPrice" })]),
+      );
+    });
+
+    it("should allow asset-backed income with amount instead of unit price", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "staking-amount-only",
+          activityType: ActivityType.INTEREST,
+          subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+          assetSymbol: "ETH",
+          assetId: "ETH",
+          quantity: "0.05",
+          unitPrice: null,
+          amount: "200",
+        }),
+      ];
+
+      const result = validateTransactionsForSave(transactions, new Set(["staking-amount-only"]));
+
+      expect(result.isValid).toBe(true);
+    });
+
+    it("should require an amount or unit price for asset-backed income", () => {
+      const transactions: LocalTransaction[] = [
+        createMockTransaction({
+          id: "staking-missing-value",
+          activityType: ActivityType.INTEREST,
+          subtype: ACTIVITY_SUBTYPES.STAKING_REWARD,
+          assetSymbol: "ETH",
+          assetId: "ETH",
+          quantity: "0.05",
+          unitPrice: null,
+          amount: null,
+        }),
+      ];
+
+      const result = validateTransactionsForSave(transactions, new Set(["staking-missing-value"]));
+
+      expect(result.isValid).toBe(false);
+      expect(result.errors).toEqual(
+        expect.arrayContaining([expect.objectContaining({ field: "unitPrice" })]),
+      );
     });
   });
 

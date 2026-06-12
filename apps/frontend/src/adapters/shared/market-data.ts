@@ -187,12 +187,16 @@ export const resolveSymbolQuote = async (
   symbol: string,
   exchangeMic?: string,
   instrumentType?: string,
+  providerId?: string,
+  quoteCcy?: string,
 ): Promise<ResolvedQuote | null> => {
   try {
     return await invoke<ResolvedQuote>("resolve_symbol_quote", {
       symbol,
       exchangeMic,
       instrumentType,
+      providerId,
+      quoteCcy,
     });
   } catch (_error) {
     logger.error("Error resolving symbol quote.");
@@ -209,11 +213,24 @@ export const getExchanges = async (): Promise<ExchangeInfo[]> => {
   }
 };
 
-export const fetchYahooDividends = async (
+export interface FetchDividendsOptions {
+  exchangeMic?: string;
+  instrumentType?: string;
+  quoteCcy?: string;
+  providerId?: string;
+  startDate?: string;
+  endDate?: string;
+}
+
+export const fetchDividends = async (
   symbol: string,
+  options: FetchDividendsOptions = {},
 ): Promise<{ amount: number; date: number }[]> => {
   try {
-    return await invoke<{ amount: number; date: number }[]>("fetch_yahoo_dividends", { symbol });
+    return await invoke<{ amount: number; date: number }[]>("fetch_dividends", {
+      symbol,
+      ...options,
+    });
   } catch (error) {
     logger.error(`Error fetching dividends for ${symbol}.`);
     throw error;

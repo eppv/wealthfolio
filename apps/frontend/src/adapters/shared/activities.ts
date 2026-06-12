@@ -14,6 +14,10 @@ import type {
   ImportActivitiesResult,
   ImportMappingData,
   ImportTemplateData,
+  InternalTransferPairRequest,
+  InternalTransferPairResponse,
+  TransferMatchCandidate,
+  TransferMatchCandidateRequest,
   BrokerSyncProfileData,
   SaveBrokerSyncProfileRulesRequest,
 } from "@/lib/types";
@@ -136,6 +140,82 @@ export const deleteActivity = async (activityId: string): Promise<Activity> => {
     return await invoke<Activity>("delete_activity", { activityId });
   } catch (err) {
     logger.error("Error deleting activity.");
+    throw err;
+  }
+};
+
+export const getTransferPairForActivity = async (
+  activityId: string,
+): Promise<InternalTransferPairResponse> => {
+  try {
+    return await invoke<InternalTransferPairResponse>("get_transfer_pair_for_activity", {
+      activityId,
+    });
+  } catch (err) {
+    logger.error("Error fetching transfer pair.");
+    throw err;
+  }
+};
+
+export const findTransferMatchCandidates = async (
+  request: TransferMatchCandidateRequest,
+): Promise<TransferMatchCandidate[]> => {
+  try {
+    return await invoke<TransferMatchCandidate[]>("find_transfer_match_candidates", {
+      request,
+    });
+  } catch (err) {
+    logger.error("Error finding transfer match candidates.");
+    throw err;
+  }
+};
+
+export const saveInternalTransferPair = async (
+  request: InternalTransferPairRequest,
+): Promise<InternalTransferPairResponse> => {
+  const payload: InternalTransferPairRequest = {
+    ...request,
+    activityDate:
+      request.activityDate instanceof Date
+        ? request.activityDate.toISOString()
+        : request.activityDate,
+  };
+  try {
+    return await invoke<InternalTransferPairResponse>("save_internal_transfer_pair", {
+      request: payload,
+    });
+  } catch (err) {
+    logger.error("Error saving internal transfer pair.");
+    throw err;
+  }
+};
+
+export const linkTransferActivities = async (
+  activityAId: string,
+  activityBId: string,
+): Promise<[Activity, Activity]> => {
+  try {
+    return await invoke<[Activity, Activity]>("link_transfer_activities", {
+      activityAId,
+      activityBId,
+    });
+  } catch (err) {
+    logger.error("Error linking transfer activities.");
+    throw err;
+  }
+};
+
+export const unlinkTransferActivities = async (
+  activityAId: string,
+  activityBId: string,
+): Promise<[Activity, Activity]> => {
+  try {
+    return await invoke<[Activity, Activity]>("unlink_transfer_activities", {
+      activityAId,
+      activityBId,
+    });
+  } catch (err) {
+    logger.error("Error unlinking transfer activities.");
     throw err;
   }
 };

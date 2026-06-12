@@ -1,5 +1,9 @@
 import { searchTicker } from "@/adapters";
-import { isCashActivity, isSymbolRequired } from "@/lib/activity-utils";
+import {
+  isAssetBackedIncomeSubtype,
+  isAssetIdentityRequired,
+  isCashActivity,
+} from "@/lib/activity-utils";
 import {
   ActivityStatus,
   ActivityType,
@@ -34,11 +38,38 @@ const isTransferActivity = (activityType: string | undefined): boolean => {
   return activityType === ActivityType.TRANSFER_IN || activityType === ActivityType.TRANSFER_OUT;
 };
 
+const normalizeActivityToken = (value: string | null | undefined): string =>
+  value?.trim().toUpperCase() ?? "";
+
+const shouldDisplaySubtype = (
+  transaction: LocalTransaction | undefined,
+  activityType: string | undefined,
+  subtype: string | null | undefined,
+): boolean => {
+  const normalizedSubtype = normalizeActivityToken(subtype);
+  if (!normalizedSubtype) return false;
+
+  const normalizedActivityType = normalizeActivityToken(activityType);
+  return (
+    normalizedSubtype !== normalizedActivityType || (!!transaction && isPendingReview(transaction))
+  );
+};
+
+const getSubtypeDisplayLabel = (subtype: string, optionLabel?: string): string => {
+  const normalizedSubtype = normalizeActivityToken(subtype);
+  return optionLabel ?? SUBTYPE_DISPLAY_NAMES[normalizedSubtype] ?? subtype;
+};
+
+const UNIT_PRICE_HELP_TEXT =
+  "For buys and sells, enter the trade price. For staking rewards and in-kind dividends, enter the fair market value per unit at receipt; it sets income amount and cost basis.";
+
 interface UseActivityColumnsOptions {
   accounts: Account[];
   onEditActivity: (activity: ActivityDetails) => void;
   onDuplicate: (activity: ActivityDetails) => void;
   onDelete: (activity: ActivityDetails) => void;
+  onLinkTransfer?: (activity: ActivityDetails) => void;
+  onUnlinkTransfer?: (activity: ActivityDetails) => void;
   /** Called when a symbol is selected from search, with the full result including exchangeMic */
   onSymbolSelect?: (rowIndex: number, result: SymbolSearchResult) => void;
   /** Called when user wants to create a custom asset. Opens a dialog to collect asset metadata. */
@@ -53,6 +84,8 @@ export function useActivityColumns({
   onEditActivity,
   onDuplicate,
   onDelete,
+  onLinkTransfer,
+  onUnlinkTransfer,
   onSymbolSelect,
   onCreateCustomAsset,
 }: UseActivityColumnsOptions) {
@@ -75,20 +108,7 @@ export function useActivityColumns({
   );
 
   const handleSymbolSearch = useCallback(async (query: string): Promise<SymbolSearchResult[]> => {
-    const results = await searchTicker(query);
-    return results.map((result) => ({
-      symbol: result.symbol,
-      shortName: result.shortName,
-      longName: result.longName,
-      exchange: result.exchange,
-      exchangeMic: result.exchangeMic,
-      currency: result.currency,
-      currencySource: result.currencySource,
-      quoteType: result.quoteType,
-      score: result.score,
-      dataSource: result.dataSource,
-      assetKind: result.assetKind,
-    }));
+    return searchTicker(query);
   }, []);
 
   const columns = useMemo<ColumnDef<LocalTransaction>[]>(
@@ -167,9 +187,18 @@ export function useActivityColumns({
           cell: {
             variant: "select",
             options: activityTypeOptions,
-            valueRenderer: (value: string) => (
-              <ActivityTypeBadge type={value as ActivityType} className="text-xs font-normal" />
-            ),
+            valueRenderer: (value: string, _option, rowData) => {
+              const transaction = rowData as LocalTransaction | undefined;
+              const subtype = transaction?.subtype;
+
+              return (
+                <ActivityTypeBadge
+                  type={value as ActivityType}
+                  subtype={shouldDisplaySubtype(transaction, value, subtype) ? subtype : undefined}
+                  className="text-xs font-normal"
+                />
+              );
+            },
           },
         },
       },
@@ -197,6 +226,24 @@ export function useActivityColumns({
             }) as any,
             allowEmpty: true,
             emptyLabel: "None",
+            valueRenderer: (value: string, option, rowData) => {
+              const transaction = rowData as LocalTransaction | undefined;
+              if (!shouldDisplaySubtype(transaction, transaction?.activityType, value)) {
+                return null;
+              }
+
+              const displayLabel = getSubtypeDisplayLabel(value, option?.label);
+
+              return (
+                <Badge
+                  variant="secondary"
+                  className="min-w-0 max-w-full rounded-sm px-1.5 text-xs"
+                  title={displayLabel}
+                >
+                  <span className="min-w-0 truncate">{displayLabel}</span>
+                </Badge>
+              );
+            },
           },
         },
       },
@@ -234,7 +281,9 @@ export function useActivityColumns({
             isDisabled: (rowData: unknown) => {
               const row = rowData as LocalTransaction;
               return (
-                isCashActivity(row.activityType ?? "") && !isTransferActivity(row.activityType)
+                isCashActivity(row.activityType ?? "") &&
+                !isAssetBackedIncomeSubtype(row.activityType ?? "", row.subtype) &&
+                !isTransferActivity(row.activityType)
               );
             },
             getDisplayContext: (rowData: unknown) => {
@@ -256,7 +305,7 @@ export function useActivityColumns({
             },
             isClearable: (rowData: unknown) => {
               const row = rowData as LocalTransaction;
-              return !isSymbolRequired(row.activityType ?? "");
+              return !isAssetIdentityRequired(row.activityType ?? "", row.subtype);
             },
             onSearch: handleSymbolSearch,
             onSelect: onSymbolSelect
@@ -307,7 +356,10 @@ export function useActivityColumns({
         header: "Price",
         size: 120,
         enableSorting: false,
-        meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
+        meta: {
+          helpText: UNIT_PRICE_HELP_TEXT,
+          cell: { variant: "number", step: 0.000001, valueType: "string" },
+        },
       },
       // 10. Amount (most important money column)
       {
@@ -388,6 +440,8 @@ export function useActivityColumns({
               onEdit={onEditActivity}
               onDuplicate={onDuplicate}
               onDelete={onDelete}
+              onLinkTransfer={onLinkTransfer}
+              onUnlinkTransfer={onUnlinkTransfer}
             />
           </div>
         ),
@@ -401,6 +455,8 @@ export function useActivityColumns({
       onDelete,
       onDuplicate,
       onEditActivity,
+      onLinkTransfer,
+      onUnlinkTransfer,
       onSymbolSelect,
     ],
   );

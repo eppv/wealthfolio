@@ -1,11 +1,10 @@
 import { TickerAvatar } from "@/components/ticker-avatar";
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
-import { PORTFOLIO_ACCOUNT_ID } from "@/lib/constants";
+import { HoldingType } from "@/lib/constants";
 import { parseOccSymbol } from "@/lib/occ-symbol";
-import { Account, Holding } from "@/lib/types";
+import { Account, AccountScope, Holding } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { AmountDisplay, GainPercent, Input, Separator } from "@wealthfolio/ui";
-import { Badge } from "@wealthfolio/ui/components/ui/badge";
 import { Button } from "@wealthfolio/ui/components/ui/button";
 import { Card } from "@wealthfolio/ui/components/ui/card";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
@@ -14,21 +13,24 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { HoldingsMobileFilterSheet } from "./holdings-mobile-filter-sheet";
 
+type PerformanceMode = "daily" | "pnl" | "return";
+
 interface HoldingsTableMobileProps {
   holdings: Holding[];
   isLoading: boolean;
   selectedTypes: string[];
   setSelectedTypes: (types: string[]) => void;
-  selectedAccount: Account | null;
+  accountFilter: AccountScope;
+  onAccountScopeChange: (filter: AccountScope) => void;
   accounts: Account[];
-  onAccountChange: (account: Account) => void;
-  showAccountFilter?: boolean;
+  portfolios: { id: string; name: string }[];
+  showAccountScope?: boolean;
   showSearch?: boolean;
   showFilterButton?: boolean;
   sortBy?: "symbol" | "marketValue";
   setSortBy?: (value: "symbol" | "marketValue") => void;
-  showTotalReturn?: boolean;
-  setShowTotalReturn?: (value: boolean) => void;
+  performanceMode?: PerformanceMode;
+  setPerformanceMode?: (value: PerformanceMode) => void;
   typeOptions?: { value: string; label: string }[];
 }
 
@@ -37,16 +39,17 @@ export const HoldingsTableMobile = ({
   isLoading,
   selectedTypes,
   setSelectedTypes,
-  selectedAccount,
+  accountFilter,
+  onAccountScopeChange,
   accounts,
-  onAccountChange,
-  showAccountFilter = true,
+  portfolios,
+  showAccountScope = true,
   showSearch = true,
   showFilterButton = true,
   sortBy: controlledSortBy,
   setSortBy: controlledSetSortBy,
-  showTotalReturn: controlledShowTotalReturn,
-  setShowTotalReturn: controlledSetShowTotalReturn,
+  performanceMode: controlledPerformanceMode,
+  setPerformanceMode: controlledSetPerformanceMode,
   typeOptions,
 }: HoldingsTableMobileProps) => {
   const { isBalanceHidden } = useBalancePrivacy();
@@ -56,18 +59,18 @@ export const HoldingsTableMobile = ({
 
   // Internal state for uncontrolled mode
   const [internalSortBy, setInternalSortBy] = useState<"symbol" | "marketValue">("marketValue");
-  const [internalShowTotalReturn, setInternalShowTotalReturn] = useState(true);
+  const [internalPerformanceMode, setInternalPerformanceMode] = useState<PerformanceMode>("pnl");
 
   const sortBy = controlledSortBy ?? internalSortBy;
   const setSortBy = controlledSetSortBy ?? setInternalSortBy;
-  const showTotalReturn = controlledShowTotalReturn ?? internalShowTotalReturn;
-  const setShowTotalReturn = controlledSetShowTotalReturn ?? setInternalShowTotalReturn;
+  const performanceMode = controlledPerformanceMode ?? internalPerformanceMode;
+  const setPerformanceMode = controlledSetPerformanceMode ?? setInternalPerformanceMode;
 
   const hasActiveFilters = useMemo(() => {
-    const hasAccountFilter = showAccountFilter && selectedAccount?.id !== PORTFOLIO_ACCOUNT_ID;
+    const hasAccountScope = showAccountScope && accountFilter.type !== "all";
     const hasTypeFilter = selectedTypes.length > 0;
-    return hasAccountFilter || hasTypeFilter;
-  }, [selectedAccount, selectedTypes, showAccountFilter]);
+    return hasAccountScope || hasTypeFilter;
+  }, [accountFilter, selectedTypes, showAccountScope]);
 
   const filteredHoldings = useMemo(() => {
     let result = [...holdings];
@@ -161,11 +164,13 @@ export const HoldingsTableMobile = ({
         {filteredHoldings.length > 0 ? (
           filteredHoldings.map((holding) => {
             const symbol = holding.instrument?.symbol ?? holding.id;
-            const isCash = symbol.startsWith("$CASH");
+            const isCash = holding.holdingType === HoldingType.CASH || symbol.startsWith("$CASH");
             const parsedOption = isCash ? null : parseOccSymbol(symbol);
-            const today = new Date().toISOString().split("T")[0];
-            const isExpiredOption = parsedOption ? parsedOption.expiration < today : false;
-            const avatarSymbol = isCash ? "$CASH" : parsedOption ? parsedOption.underlying : symbol;
+            const avatarSymbol = isCash
+              ? `CASH:${holding.localCurrency}`
+              : parsedOption
+                ? parsedOption.underlying
+                : symbol;
             const displaySymbol = isCash
               ? symbol.split("-")[0]
               : parsedOption
@@ -191,11 +196,6 @@ export const HoldingsTableMobile = ({
                     <div className="flex-1 overflow-hidden">
                       <div className="flex items-center gap-1.5">
                         <p className="truncate font-semibold">{displaySymbol}</p>
-                        {isExpiredOption && (
-                          <Badge variant="destructive" className="h-4 px-1 py-0 text-[10px]">
-                            Expired
-                          </Badge>
-                        )}
                       </div>
                       {subtitle && (
                         <p className="text-muted-foreground truncate text-sm">{subtitle}</p>
@@ -212,9 +212,11 @@ export const HoldingsTableMobile = ({
                     <div className="flex items-center justify-end gap-1">
                       <AmountDisplay
                         value={
-                          showTotalReturn
-                            ? (holding.totalGain?.local ?? 0)
-                            : (holding.dayChange?.local ?? 0)
+                          performanceMode === "return"
+                            ? (holding.totalReturn?.local ?? holding.totalGain?.local ?? 0)
+                            : performanceMode === "pnl"
+                              ? (holding.totalGain?.local ?? 0)
+                              : (holding.dayChange?.local ?? 0)
                         }
                         currency={holding.localCurrency}
                         isHidden={isBalanceHidden}
@@ -224,9 +226,11 @@ export const HoldingsTableMobile = ({
                       <Separator orientation="vertical" className="mx-1 h-4" />
                       <GainPercent
                         value={
-                          showTotalReturn
-                            ? (holding.totalGainPct ?? 0)
-                            : (holding.dayChangePct ?? 0)
+                          performanceMode === "return"
+                            ? (holding.totalReturnPct ?? holding.totalGainPct ?? 0)
+                            : performanceMode === "pnl"
+                              ? (holding.totalGainPct ?? 0)
+                              : (holding.dayChangePct ?? 0)
                         }
                         className="text-xs"
                       />
@@ -252,16 +256,17 @@ export const HoldingsTableMobile = ({
       <HoldingsMobileFilterSheet
         open={isFilterSheetOpen}
         onOpenChange={setIsFilterSheetOpen}
-        selectedAccount={selectedAccount}
+        accountFilter={accountFilter}
+        onAccountScopeChange={onAccountScopeChange}
         accounts={accounts}
-        onAccountChange={onAccountChange}
+        portfolios={portfolios}
         selectedTypes={selectedTypes}
         setSelectedTypes={setSelectedTypes}
-        showAccountFilter={showAccountFilter}
+        showAccountScope={showAccountScope}
         sortBy={sortBy}
         setSortBy={setSortBy}
-        showTotalReturn={showTotalReturn}
-        setShowTotalReturn={setShowTotalReturn}
+        performanceMode={performanceMode}
+        setPerformanceMode={setPerformanceMode}
         typeOptions={typeOptions}
       />
     </div>

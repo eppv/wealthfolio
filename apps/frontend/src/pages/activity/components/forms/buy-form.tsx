@@ -30,6 +30,8 @@ const assetMetadataSchema = z
     name: z.string().nullable().optional(),
     kind: z.string().nullable().optional(),
     exchangeMic: z.string().nullable().optional(),
+    providerId: z.string().nullable().optional(),
+    providerSymbol: z.string().nullable().optional(),
   })
   .optional();
 
@@ -40,6 +42,7 @@ export const buyFormSchema = z
     assetKind: z.string().optional(),
     accountId: z.string().min(1, { message: "Please select an account." }),
     assetId: z.string().default(""),
+    existingAssetId: z.string().nullable().optional(),
     activityDate: z.date({ required_error: "Please select a date." }),
     quantity: z.coerce
       .number({
@@ -232,6 +235,11 @@ export function BuyForm({
       setValue("assetKind", undefined);
     }
     setValue("assetId", "");
+    setValue("existingAssetId", undefined);
+    setValue("exchangeMic", undefined);
+    setValue("symbolQuoteCcy", undefined);
+    setValue("symbolInstrumentType", undefined);
+    setValue("assetMetadata", undefined);
   };
 
   const quantityLabel = isOption ? "Contracts" : assetType === "bond" ? "Bonds" : "Quantity";
@@ -268,6 +276,7 @@ export function BuyForm({
         data.strikePrice,
       );
       data.assetId = occSymbol;
+      data.existingAssetId = undefined;
       data.symbolInstrumentType = "OPTION";
       data.assetMetadata = {
         ...data.assetMetadata,
@@ -324,6 +333,7 @@ export function BuyForm({
                   currencyName="currency"
                   quoteCcyName="symbolQuoteCcy"
                   instrumentTypeName="symbolInstrumentType"
+                  existingAssetIdName="existingAssetId"
                   assetMetadataName="assetMetadata"
                 />
                 {/* Hidden fields to register assetMetadata for react-hook-form */}
@@ -331,6 +341,7 @@ export function BuyForm({
                 <input type="hidden" {...form.register("assetMetadata.kind")} />
                 <input type="hidden" {...form.register("symbolQuoteCcy")} />
                 <input type="hidden" {...form.register("symbolInstrumentType")} />
+                <input type="hidden" {...form.register("existingAssetId")} />
               </>
             )}
 

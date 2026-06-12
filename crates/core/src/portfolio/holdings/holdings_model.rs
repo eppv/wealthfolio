@@ -29,6 +29,7 @@ pub struct Instrument {
     pub notes: Option<String>,
     pub pricing_mode: String,
     pub preferred_provider: Option<String>,
+    pub exchange_mic: Option<String>,
 
     // Taxonomy-based classifications
     pub classifications: Option<AssetClassifications>,
@@ -63,6 +64,10 @@ pub struct HoldingSummary {
     pub market_value: Decimal,
     pub currency: String,
     pub weight_in_category: Decimal,
+    /// Actual market price per share from the quote provider.
+    /// Use this for trade sizing instead of market_value/quantity,
+    /// which gives a wrong result when market_value is weighted across categories.
+    pub unit_price: Option<Decimal>,
 }
 
 /// Position view model for frontend display with daily and total performance
@@ -110,6 +115,10 @@ pub struct Holding {
     pub realized_gain_pct: Option<Decimal>,
     pub total_gain: Option<MonetaryValue>,
     pub total_gain_pct: Option<Decimal>,
+    pub income: Option<MonetaryValue>,
+    pub total_return: Option<MonetaryValue>,
+    pub total_return_pct: Option<Decimal>,
+    pub return_basis: Option<MonetaryValue>,
 
     // Daily performance
     pub day_change: Option<MonetaryValue>,
@@ -125,4 +134,9 @@ pub struct Holding {
     /// Asset metadata (JSON) for alternative assets.
     /// Contains purchase_price, purchase_date, sub_type, linked_asset_id, etc.
     pub metadata: Option<Value>,
+
+    /// Source account IDs for aggregated holdings (portfolio or multi-account scope).
+    /// Empty for single-account holdings; `account_id` is then the authoritative identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_account_ids: Vec<String>,
 }

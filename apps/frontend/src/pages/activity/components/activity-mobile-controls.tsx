@@ -1,35 +1,47 @@
 import { Button, Icons, Input } from "@wealthfolio/ui";
 import { ActivityType } from "@/lib/constants";
-import { Account } from "@/lib/types";
+import { Account, AccountScope, PortfolioWithAccounts } from "@/lib/types";
 import { useState } from "react";
+import type { DateRange } from "react-day-picker";
 import { ActivityMobileFilterSheet } from "./activity-mobile-filter-sheet";
 
 interface ActivityMobileControlsProps {
   accounts: Account[];
+  portfolios: PortfolioWithAccounts[];
   searchQuery: string;
   onSearchQueryChange: (value: string) => void;
-  selectedAccountIds: string[];
-  onAccountIdsChange: (accountIds: string[]) => void;
+  accountScope: AccountScope;
+  onAccountScopeChange: (accountScope: AccountScope) => void;
   selectedActivityTypes: ActivityType[];
   onActivityTypesChange: (types: ActivityType[]) => void;
+  dateRange: DateRange | undefined;
+  onDateRangeChange: (dateRange: DateRange | undefined) => void;
   isCompactView: boolean;
   onCompactViewChange: (isCompact: boolean) => void;
 }
 
 export function ActivityMobileControls({
   accounts,
+  portfolios,
   searchQuery,
   onSearchQueryChange,
-  selectedAccountIds,
-  onAccountIdsChange,
+  accountScope,
+  onAccountScopeChange,
   selectedActivityTypes,
   onActivityTypesChange,
+  dateRange,
+  onDateRangeChange,
   isCompactView,
   onCompactViewChange,
 }: ActivityMobileControlsProps) {
   const [isFilterSheetOpen, setIsFilterSheetOpen] = useState(false);
 
-  const hasActiveFilters = selectedAccountIds.length > 0 || selectedActivityTypes.length > 0;
+  const hasActiveFilters =
+    searchQuery.trim().length > 0 ||
+    accountScope.type !== "all" ||
+    selectedActivityTypes.length > 0 ||
+    !!dateRange?.from ||
+    !!dateRange?.to;
 
   return (
     <>
@@ -71,11 +83,14 @@ export function ActivityMobileControls({
       <ActivityMobileFilterSheet
         open={isFilterSheetOpen}
         onOpenChange={setIsFilterSheetOpen}
-        selectedAccounts={selectedAccountIds}
+        accountScope={accountScope}
         accounts={accounts}
-        setSelectedAccounts={onAccountIdsChange}
+        portfolios={portfolios}
+        setAccountScope={onAccountScopeChange}
         selectedActivityTypes={selectedActivityTypes}
         setSelectedActivityTypes={onActivityTypesChange}
+        dateRange={dateRange}
+        setDateRange={onDateRangeChange}
       />
     </>
   );

@@ -1,8 +1,10 @@
 import AppLauncher from "@/components/app-launcher";
 import { MobileLoadingIndicator } from "@/components/mobile-loading-indicator";
 import { Toaster } from "@/components/sonner";
+import { StartupError } from "@/components/startup-error";
 import { UpdateDialog } from "@/components/update-dialog";
 import { PortfolioSyncProvider } from "@/context/portfolio-sync-context";
+import { useActiveAppSyncTrigger } from "@/features/devices-sync/hooks/use-active-app-sync-trigger";
 import useNavigationEventListener from "@/hooks/use-navigation-event-listener";
 import { useIsMobileViewport, usePlatform } from "@/hooks/use-platform";
 import { useSettings } from "@/hooks/use-settings";
@@ -18,10 +20,17 @@ import { MobileNavBar } from "./navigation/mobile-navbar";
 import { NavigationModeProvider, useNavigationMode } from "./navigation/navigation-mode-context";
 
 const AppLayoutContent = () => {
-  const { data: settings, isSuccess: isSettingsReady } = useSettings();
+  const {
+    data: settings,
+    error: settingsError,
+    isError: isSettingsError,
+    isFetching: isSettingsFetching,
+    isSuccess: isSettingsReady,
+    refetch: refetchSettings,
+  } = useSettings();
   const location = useLocation();
   const navigation = useNavigation();
-  const { isMobile } = usePlatform();
+  const { isMobile, isTauri } = usePlatform();
   const isMobileViewport = useIsMobileViewport();
   const isIPad =
     typeof window !== "undefined" &&
@@ -36,11 +45,22 @@ const AppLayoutContent = () => {
 
   useGlobalEventListener();
   useNavigationEventListener();
+  useActiveAppSyncTrigger({ enabled: isTauri, requireWindowFocusForInterval: !isMobile });
+
+  if (isSettingsError) {
+    return (
+      <StartupError
+        error={settingsError}
+        isRetrying={isSettingsFetching}
+        onRetry={() => void refetchSettings()}
+      />
+    );
+  }
 
   if (!isSettingsReady) {
     return (
       <div
-        className="flex h-screen items-center justify-center"
+        className="flex h-screen items-center justify-center supports-[height:100dvh]:h-dvh"
         style={{ backgroundColor: "#09090b" }}
       >
         <img src="/logo-gold.png" alt="Wealthfolio" className="h-[100px] w-auto" />
@@ -55,7 +75,7 @@ const AppLayoutContent = () => {
   return (
     <ErrorBoundary>
       <ApplicationShell
-        className="app-shell h-screen overflow-x-hidden"
+        className="app-shell h-screen overflow-x-hidden supports-[height:100dvh]:h-dvh"
         style={
           launchBarHeight ? { ["--mobile-nav-ui-height" as string]: launchBarHeight } : undefined
         }

@@ -2,7 +2,7 @@
 
 [![Version](https://img.shields.io/npm/v/@wealthfolio/addon-sdk?style=flat-square)](https://www.npmjs.com/package/@wealthfolio/addon-sdk)
 [![Downloads](https://img.shields.io/npm/dm/@wealthfolio/addon-sdk?style=flat-square)](https://www.npmjs.com/package/@wealthfolio/addon-sdk)
-[![License](https://img.shields.io/npm/l/@wealthfolio/addon-sdk?style=flat-square)](https://github.com/afadil/wealthfolio/blob/main/LICENSE)
+[![License](https://img.shields.io/npm/l/@wealthfolio/addon-sdk?style=flat-square)](https://github.com/wealthfolio/wealthfolio/blob/main/LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue?style=flat-square)](https://www.typescriptlang.org/)
 [![Node](https://img.shields.io/node/v/@wealthfolio/addon-sdk?style=flat-square)](https://nodejs.org/)
 
@@ -492,11 +492,11 @@ export default AnalyticsDashboard;
 // hooks/usePortfolioData.ts
 import { useState, useEffect } from 'react';
 import { getAddonContext } from '@wealthfolio/addon-sdk';
-import type { Holding, PerformanceMetrics } from '@wealthfolio/addon-sdk/types';
+import type { Holding, PerformanceResult } from '@wealthfolio/addon-sdk/types';
 
 export function usePortfolioData(accountId?: string) {
   const [holdings, setHoldings] = useState<Holding[]>([]);
-  const [performance, setPerformance] = useState<PerformanceMetrics | null>(
+  const [performance, setPerformance] = useState<PerformanceResult | null>(
     null,
   );
   const [loading, setLoading] = useState(true);
@@ -521,6 +521,11 @@ export function usePortfolioData(accountId?: string) {
               itemType: 'account',
               itemId: accountId,
             });
+          console.log(
+            performanceData.returns.twr,
+            performanceData.returns.irr,
+            performanceData.risk.maxDrawdown,
+          );
           setPerformance(performanceData);
         }
       } catch (err) {
@@ -536,6 +541,10 @@ export function usePortfolioData(accountId?: string) {
   return { holdings, performance, loading, error };
 }
 ```
+
+`performanceData.returns.irr` is the selected-period money-weighted return.
+`performanceData.returns.annualizedIrr` is the annualized XIRR on the same dated
+cash flows.
 
 ## 🔐 Security & Permissions
 
@@ -785,6 +794,8 @@ ctx.api.logger.debug('Debug info:', debugData);
 | `marketData.getAssetProfile(assetId)`           | Get asset profile                                         | `market-data`        |
 | `marketData.searchTicker(query)`                | Search for tickers                                        | `market-data`        |
 | `goals.getAll()`                                | Get financial goals                                       | `financial-planning` |
+| `goals.getFunding(goalId)`                      | Get funding rules for a goal                              | `financial-planning` |
+| `goals.saveFunding(goalId, rules)`              | Save funding rules for a goal                             | `financial-planning` |
 | `settings.get()`                                | Get app settings                                          | `settings`           |
 | `query.getClient()`                             | Get shared QueryClient instance                           | None                 |
 
@@ -1039,7 +1050,7 @@ If you want to contribute to the SDK itself:
 
 ```bash
 # Clone the Wealthfolio repository
-git clone https://github.com/afadil/wealthfolio.git
+git clone https://github.com/wealthfolio/wealthfolio.git
 cd wealthfolio/packages/addon-sdk
 
 # Install dependencies
@@ -1330,7 +1341,7 @@ We welcome contributions to improve the addon SDK!
 | **Scope**        | `@wealthfolio`                                                    |
 | **Registry**     | [npmjs.com](https://www.npmjs.com/package/@wealthfolio/addon-sdk) |
 | **License**      | MIT                                                               |
-| **Repository**   | [GitHub](https://github.com/afadil/wealthfolio)                   |
+| **Repository**   | [GitHub](https://github.com/wealthfolio/wealthfolio)              |
 
 ### Version History
 
@@ -1376,10 +1387,10 @@ npm install @wealthfolio/addon-sdk@1.1.0-beta.1
 
 ```bash
 # Install directly from GitHub
-npm install github:afadil/wealthfolio#main
+npm install github:wealthfolio/wealthfolio#main
 
-# Or from a specific branch/commit
-npm install github:afladil/wealthfolio#wealthfolio-addons
+# Or from a specific Wealthfolio commit
+npm install github:wealthfolio/wealthfolio#COMMIT_SHA
 ```
 
 ### Package Information Commands
@@ -1504,9 +1515,10 @@ npm pack && tar -tf *.tgz
 
 1. **Documentation**: Check this README and
    [docs](https://docs.wealthfolio.app/addons)
-2. **Issues**: [GitHub Issues](https://github.com/afadil/wealthfolio/issues)
+2. **Issues**:
+   [GitHub Issues](https://github.com/wealthfolio/wealthfolio/issues)
 3. **Discussions**:
-   [GitHub Discussions](https://github.com/afadil/wealthfolio/discussions)
+   [GitHub Discussions](https://github.com/wealthfolio/wealthfolio/discussions)
 4. **Discord**: [Community Discord](https://discord.gg/wealthfolio)
 5. **Email**: [support@wealthfolio.app](mailto:support@wealthfolio.app)
 
@@ -1519,13 +1531,13 @@ MIT - see [LICENSE](LICENSE) for details.
 - [Wealthfolio Homepage](https://wealthfolio.app)
 - [Addon Gallery](https://wealthfolio.app/addons)
 - [Documentation](https://docs.wealthfolio.app/addons)
-- [GitHub Repository](https://github.com/afadil/wealthfolio)
-- [Issue Tracker](https://github.com/afadil/wealthfolio/issues)
+- [GitHub Repository](https://github.com/wealthfolio/wealthfolio)
+- [Issue Tracker](https://github.com/wealthfolio/wealthfolio/issues)
 
 ## 💬 Support
 
 - [Discord Community](https://discord.gg/wealthfolio)
-- [GitHub Discussions](https://github.com/afadil/wealthfolio/discussions)
+- [GitHub Discussions](https://github.com/wealthfolio/wealthfolio/discussions)
 - [Email Support](mailto:support@wealthfolio.app)
 
 ## 🔧 Troubleshooting
@@ -1752,7 +1764,7 @@ If you're still experiencing issues:
    - Share the code and error logs
 
 3. **Search Existing Issues**:
-   - Check [GitHub Issues](https://github.com/afadil/wealthfolio/issues)
+   - Check [GitHub Issues](https://github.com/wealthfolio/wealthfolio/issues)
    - Look for similar problems and solutions
 
 4. **Provide Complete Information**:

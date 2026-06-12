@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::{error::ApiResult, main_lib::AppState};
+use crate::{
+    error::{ApiError, ApiResult},
+    main_lib::AppState,
+};
 use axum::{
     extract::State,
     http::HeaderMap,
@@ -58,6 +61,8 @@ async fn run_health_checks_internal(
             state.asset_service.clone(),
             state.taxonomy_service.clone(),
             state.valuation_service.clone(),
+            state.activity_service.clone(),
+            state.lots_repository.clone(),
             Some(configured_timezone.as_str()),
             client_timezone,
         )
@@ -135,6 +140,11 @@ async fn execute_health_fix(
     if action.id == "sync_prices" || action.id == "retry_sync" {
         let asset_ids: Vec<String> = serde_json::from_value(action.payload.clone())
             .map_err(|e| anyhow::anyhow!("Invalid payload for {}: {}", action.id, e))?;
+        if asset_ids.is_empty() {
+            return Err(ApiError::BadRequest(
+                "No assets selected for price sync".to_string(),
+            ));
+        }
 
         state
             .quote_service

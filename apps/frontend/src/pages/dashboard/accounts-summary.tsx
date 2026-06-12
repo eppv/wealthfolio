@@ -1,12 +1,19 @@
 "use client";
 
-import { calculatePerformanceSummary } from "@/adapters";
+import { calculatePerformanceSummaries, performanceSummaryScopeKey } from "@/adapters";
 import { useAccounts } from "@/hooks/use-accounts";
 import { useLatestValuations } from "@/hooks/use-latest-valuations";
+import { AccountPurpose } from "@/lib/constants";
+import { performanceHeadlineReturn, performancePeriodPnl } from "@/lib/performance";
 import { QueryKeys } from "@/lib/query-keys";
 import { useSettingsContext } from "@/lib/settings-provider";
-import type { AccountValuation, DateRange } from "@/lib/types";
-import { useQueries } from "@tanstack/react-query";
+import type {
+  AccountValuation,
+  DateRange,
+  PerformanceSummaryScope,
+  TrackingMode,
+} from "@/lib/types";
+import { useQuery } from "@tanstack/react-query";
 import { GainAmount, GainPercent, PrivacyAmount } from "@wealthfolio/ui";
 import { Button } from "@wealthfolio/ui/components/ui/button";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
@@ -29,6 +36,7 @@ interface AccountSummaryDisplayData {
   accountId?: string;
   accountType?: string;
   accountGroup?: string | null;
+  trackingMode?: TrackingMode;
   isGroup?: boolean;
   accountCount?: number;
   accounts?: AccountSummaryDisplayData[];
@@ -83,7 +91,7 @@ const AccountSummaryComponent = React.memo(
       }
 
       return (
-        <div className="border-border bg-card shadow-xs flex w-full items-center justify-between gap-3 rounded-lg border px-4 py-3 md:px-5 md:py-4">
+        <div className="border-border/40 bg-card/90 shadow-xs flex w-full items-center justify-between gap-3 rounded-xl border px-4 py-3 backdrop-blur-xl md:px-5 md:py-4">
           {skeletonContent}
         </div>
       );
@@ -123,6 +131,14 @@ const AccountSummaryComponent = React.memo(
       gainPercentToDisplay === null &&
       gainAmountToDisplay !== null &&
       gainAmountToDisplay !== 0;
+    const warningMessages = hasBadData
+      ? [
+          item.trackingMode === "HOLDINGS"
+            ? "Return % unavailable - missing cost basis or starting holdings value."
+            : "Return % unavailable - activity history may be inconsistent.",
+        ]
+      : [];
+    const shouldShowWarning = hasBadData;
     const shouldRenderGainMetrics = gainPercentToDisplay !== null && (isNested || !isZeroGain);
     // Nested rows always show a secondary line for visual consistency —
     // fall back to a "-" placeholder when gain metrics aren't available.
@@ -167,14 +183,17 @@ const AccountSummaryComponent = React.memo(
         <div className="flex min-w-0 flex-1 flex-col gap-1 md:gap-1.5">
           <h3 className="flex items-center gap-1.5 text-sm font-semibold leading-tight md:text-base md:font-semibold">
             <span className="truncate">{name}</span>
-            {hasBadData && (
+            {shouldShowWarning && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span className="inline-block h-2 w-2 shrink-0 cursor-help rounded-full bg-amber-500" />
                 </TooltipTrigger>
-                <TooltipContent>
-                  Return % unavailable — activity history may be inconsistent (e.g. buys without
-                  deposits)
+                <TooltipContent className="max-w-80">
+                  <div className="space-y-1">
+                    {warningMessages.slice(0, 3).map((message) => (
+                      <p key={message}>{message}</p>
+                    ))}
+                  </div>
                 </TooltipContent>
               </Tooltip>
             )}
@@ -240,7 +259,7 @@ const AccountSummaryComponent = React.memo(
       return (
         <Link
           to={`/accounts/${accountId}`}
-          className="border-border bg-card shadow-xs flex w-full cursor-pointer items-center justify-between gap-3 rounded-lg border px-4 py-3 transition-all duration-150 hover:shadow-md md:px-5 md:py-4"
+          className="border-border/40 bg-card/90 shadow-xs flex w-full cursor-pointer items-center justify-between gap-3 rounded-xl border px-4 py-3 backdrop-blur-xl transition-all duration-150 hover:shadow-md md:px-5 md:py-4"
         >
           {content}
         </Link>
@@ -248,7 +267,7 @@ const AccountSummaryComponent = React.memo(
     }
 
     return (
-      <div className="border-border bg-card shadow-xs flex w-full items-center justify-between gap-3 rounded-lg border px-4 py-3 md:px-5 md:py-4">
+      <div className="border-border/40 bg-card/90 shadow-xs flex w-full items-center justify-between gap-3 rounded-xl border px-4 py-3 backdrop-blur-xl md:px-5 md:py-4">
         {content}
       </div>
     );
@@ -266,9 +285,9 @@ export const AccountsSummary = React.memo(
       isLoading: isLoadingAccounts,
       isError: isErrorAccounts,
       error: errorAccounts,
-    } = useAccounts();
+    } = useAccounts({ accountPurpose: AccountPurpose.PERFORMANCE });
 
-    const accounts = allAccounts ?? [];
+    const accounts = useMemo(() => allAccounts ?? [], [allAccounts]);
 
     const accountIds = useMemo(() => accounts?.map((acc) => acc.id) ?? [], [accounts]);
 
@@ -279,34 +298,48 @@ export const AccountsSummary = React.memo(
     const endDate = !isAllTime && dateRange?.to ? format(dateRange.to, "yyyy-MM-dd") : undefined;
     const datesReady = isAllTime || (!!startDate && !!endDate);
 
-    const performanceQueries = useQueries({
-      queries: accounts.map((acc) => ({
-        queryKey: [
-          QueryKeys.PERFORMANCE_SUMMARY,
-          "account",
-          acc.id,
-          startDate,
-          endDate,
-          acc.trackingMode,
-        ],
-        queryFn: () =>
-          calculatePerformanceSummary({
-            itemType: "account",
-            itemId: acc.id,
-            startDate,
-            endDate,
-            trackingMode:
-              acc.trackingMode === "HOLDINGS" || acc.trackingMode === "TRANSACTIONS"
-                ? acc.trackingMode
-                : undefined,
-          }),
-        enabled: datesReady,
-        staleTime: 30 * 1000,
-        retry: false,
-      })),
-    });
+    const performanceScopes = useMemo((): PerformanceSummaryScope[] => {
+      const scopes = accounts.map((account) => ({ accountIds: [account.id] }));
+      if (!accountsGrouped) return scopes;
 
-    const isLoadingPerformanceQueries = performanceQueries.some((q) => q.isLoading);
+      const groupedAccountIds = new Map<string, string[]>();
+
+      for (const account of accounts) {
+        const groupName = account.group ?? "Uncategorized";
+        if (groupName === "Uncategorized") continue;
+        const ids = groupedAccountIds.get(groupName) ?? [];
+        ids.push(account.id);
+        groupedAccountIds.set(groupName, ids);
+      }
+
+      for (const ids of groupedAccountIds.values()) {
+        if (ids.length > 1) {
+          scopes.push({ accountIds: ids });
+        }
+      }
+
+      return scopes;
+    }, [accounts, accountsGrouped]);
+
+    const {
+      data: performanceSummaries,
+      isLoading: isLoadingPerformanceQueries,
+      isError: isPerformanceError,
+      error: performanceError,
+    } = useQuery({
+      queryKey: [
+        QueryKeys.PERFORMANCE_SUMMARY,
+        "dashboard-accounts-batch",
+        performanceScopes,
+        startDate,
+        endDate,
+      ],
+      queryFn: () =>
+        calculatePerformanceSummaries(performanceScopes, startDate, endDate, "headline"),
+      enabled: datesReady && performanceScopes.length > 0,
+      staleTime: 30 * 1000,
+      retry: 1,
+    });
 
     const combinedAccountViews = useMemo((): AccountSummaryDisplayData[] => {
       if (!accounts || accounts.length === 0) return [];
@@ -314,7 +347,7 @@ export const AccountsSummary = React.memo(
       if (latestValuations) {
         latestValuations.forEach((val: AccountValuation) => valuationMap.set(val.accountId, val));
       }
-      return accounts.map((acc, i): AccountSummaryDisplayData => {
+      return accounts.map((acc): AccountSummaryDisplayData => {
         const valuation = valuationMap.get(acc.id);
         const baseCurrency = settings?.baseCurrency ?? "USD";
 
@@ -329,19 +362,17 @@ export const AccountsSummary = React.memo(
             accountId: acc.id,
             accountType: acc.accountType,
             accountGroup: acc.group ?? null,
+            trackingMode: acc.trackingMode,
             isGroup: false,
           };
         }
 
-        const perf = performanceQueries[i]?.data;
-        const fxRate = valuation.fxRateToBase ?? 1;
+        const perf = performanceSummaries?.[performanceSummaryScopeKey([acc.id])];
         const totalValueAccountCurrency = valuation.totalValue;
-        const totalValueBaseCurrency = totalValueAccountCurrency * fxRate;
+        const totalValueBaseCurrency = valuation.totalValueBase;
 
-        const gainLossAccountCurrency = perf?.periodGain ?? null;
-        const gainLossBaseCurrency =
-          gainLossAccountCurrency !== null ? gainLossAccountCurrency * fxRate : null;
-        const gainPercent = perf?.periodReturn ?? null;
+        const gainLossBaseCurrency = performancePeriodPnl(perf);
+        const gainPercent = performanceHeadlineReturn(perf);
 
         return {
           accountName: acc.name,
@@ -350,15 +381,17 @@ export const AccountsSummary = React.memo(
           totalGainLossAmountBaseCurrency: gainLossBaseCurrency,
           totalValueAccountCurrency,
           accountCurrency: valuation.accountCurrency,
-          totalGainLossAmountAccountCurrency: gainLossAccountCurrency,
+          totalGainLossAmountAccountCurrency:
+            valuation.accountCurrency === valuation.baseCurrency ? gainLossBaseCurrency : null,
           totalGainLossPercent: gainPercent,
           accountId: acc.id,
           accountType: acc.accountType,
           accountGroup: acc.group ?? null,
+          trackingMode: acc.trackingMode,
           isGroup: false,
         };
       });
-    }, [accounts, latestValuations, performanceQueries, settings?.baseCurrency]);
+    }, [accounts, latestValuations, performanceSummaries, settings?.baseCurrency]);
 
     const toggleGroup = useCallback((groupName: string) => {
       setExpandedGroups((prev) => ({
@@ -372,7 +405,7 @@ export const AccountsSummary = React.memo(
         return Array.from({ length: 4 }).map((_, index) => (
           <div
             key={`skeleton-${index}`}
-            className="border-border bg-card shadow-xs rounded-lg border px-4 py-3 md:px-5 md:py-4"
+            className="border-border/40 bg-card/90 shadow-xs rounded-xl border px-4 py-3 backdrop-blur-xl md:px-5 md:py-4"
           >
             <AccountSummarySkeleton />
           </div>
@@ -381,7 +414,7 @@ export const AccountsSummary = React.memo(
 
       if (isErrorAccounts) {
         return (
-          <div className="border-destructive/30 bg-destructive/5 rounded-lg border p-4 md:p-5">
+          <div className="border-destructive/30 bg-destructive/5 rounded-xl border p-4 md:p-5">
             <div className="flex items-start gap-3">
               <div className="bg-destructive/10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full">
                 <Icons.AlertTriangle className="text-destructive h-4 w-4" />
@@ -402,7 +435,7 @@ export const AccountsSummary = React.memo(
 
       if (!combinedAccountViews || combinedAccountViews.length === 0) {
         return (
-          <div className="border-border/50 bg-success/10 rounded-lg border p-6 text-center md:p-8">
+          <div className="border-border/50 bg-success/10 rounded-xl border p-6 text-center md:p-8">
             <p className="text-sm">No accounts found.</p>
             <Link
               to="/settings/accounts"
@@ -440,63 +473,19 @@ export const AccountsSummary = React.memo(
             standaloneAccounts.push(groupAccounts[0]);
           } else {
             const baseCurrency = groupAccounts[0]?.baseCurrency ?? settings?.baseCurrency ?? "USD";
-            const groupCurrencies = new Set(
-              groupAccounts
-                .map((acc) => acc.accountCurrency ?? acc.baseCurrency)
-                .filter((currency): currency is string => Boolean(currency)),
-            );
-            const groupDisplaysAccountCurrency = groupCurrencies.size === 1;
-            const groupDisplayCurrency = groupDisplaysAccountCurrency
-              ? (groupAccounts[0]?.accountCurrency ??
-                groupAccounts[0]?.baseCurrency ??
-                baseCurrency)
-              : baseCurrency;
+            const groupAccountIds = groupAccounts
+              .map((account) => account.accountId)
+              .filter((id): id is string => Boolean(id));
+            const groupPerformance =
+              performanceSummaries?.[performanceSummaryScopeKey(groupAccountIds)];
 
             const totalValueBaseCurrency = groupAccounts.reduce(
               (sum, acc) => sum + Number(acc.totalValueBaseCurrency),
               0,
             );
 
-            const totalGainLossAmountBase = groupAccounts.reduce(
-              (sum, acc) => sum + Number(acc.totalGainLossAmountBaseCurrency ?? 0),
-              0,
-            );
-
-            // Market-value-weighted average — only over accounts with a computable return.
-            // Accounts with null return (negative start value) are excluded and the
-            // denominator is reweighted to their combined value, so they don't dilute the result.
-            const knownReturnAccounts = groupAccounts.filter(
-              (acc) => acc.totalGainLossPercent !== null,
-            );
-            const knownReturnTotalValue = knownReturnAccounts.reduce(
-              (sum, acc) => sum + Number(acc.totalValueBaseCurrency),
-              0,
-            );
-            const groupTotalReturnPercentBase =
-              knownReturnAccounts.length > 0 && knownReturnTotalValue > 0
-                ? knownReturnAccounts.reduce(
-                    (sum, acc) =>
-                      sum +
-                      acc.totalGainLossPercent! *
-                        (Number(acc.totalValueBaseCurrency) / knownReturnTotalValue),
-                    0,
-                  )
-                : null;
-
-            const totalValueAccountCurrency = groupDisplaysAccountCurrency
-              ? groupAccounts.reduce(
-                  (sum, acc) =>
-                    sum + Number(acc.totalValueAccountCurrency ?? acc.totalValueBaseCurrency),
-                  0,
-                )
-              : undefined;
-
-            const totalGainLossAmountAccountCurrency = groupDisplaysAccountCurrency
-              ? groupAccounts.reduce(
-                  (sum, acc) => sum + Number(acc.totalGainLossAmountAccountCurrency ?? 0),
-                  0,
-                )
-              : undefined;
+            const totalGainLossAmountBase = performancePeriodPnl(groupPerformance);
+            const groupTotalReturnPercentBase = performanceHeadlineReturn(groupPerformance);
 
             actualGroups.push({
               accountName: groupName,
@@ -504,13 +493,16 @@ export const AccountsSummary = React.memo(
               baseCurrency,
               totalGainLossAmountBaseCurrency: totalGainLossAmountBase,
               totalGainLossPercent: groupTotalReturnPercentBase,
-              accountCurrency: groupDisplayCurrency,
-              totalValueAccountCurrency,
-              totalGainLossAmountAccountCurrency: totalGainLossAmountAccountCurrency ?? null,
+              accountCurrency: baseCurrency,
+              totalValueAccountCurrency: totalValueBaseCurrency,
+              totalGainLossAmountAccountCurrency: totalGainLossAmountBase,
               isGroup: true,
               accountCount: groupAccounts.length,
               accounts: groupAccounts,
-              displayInAccountCurrency: groupDisplaysAccountCurrency,
+              trackingMode: groupAccounts.every((account) => account.trackingMode === "HOLDINGS")
+                ? "HOLDINGS"
+                : undefined,
+              displayInAccountCurrency: false,
             });
           }
         });
@@ -533,7 +525,7 @@ export const AccountsSummary = React.memo(
               return (
                 <div
                   key={group.accountName}
-                  className="border-border bg-card shadow-xs overflow-hidden rounded-lg border transition-shadow duration-150 hover:shadow-md"
+                  className="border-border/40 bg-card/90 shadow-xs overflow-hidden rounded-xl border backdrop-blur-xl transition-shadow duration-150 hover:shadow-md"
                 >
                   <div className="cursor-pointer">
                     <AccountSummaryComponent
@@ -550,7 +542,9 @@ export const AccountsSummary = React.memo(
                             <AccountSummaryComponent
                               item={account}
                               isLoadingValuation={isLoadingPerformance}
-                              displayInAccountCurrency
+                              displayInAccountCurrency={
+                                account.accountCurrency === account.baseCurrency
+                              }
                               isNested
                             />
                           </div>
@@ -566,7 +560,7 @@ export const AccountsSummary = React.memo(
                 key={account.accountId}
                 item={account}
                 isLoadingValuation={isLoadingPerformance}
-                displayInAccountCurrency
+                displayInAccountCurrency={account.accountCurrency === account.baseCurrency}
               />
             ))}
           </>
@@ -581,7 +575,7 @@ export const AccountsSummary = React.memo(
             key={account.accountId}
             item={account}
             isLoadingValuation={isLoadingPerformance}
-            displayInAccountCurrency
+            displayInAccountCurrency={account.accountCurrency === account.baseCurrency}
           />
         ));
       }
@@ -593,6 +587,7 @@ export const AccountsSummary = React.memo(
       isLoadingAccounts,
       isLoadingValuations,
       isLoadingPerformanceQueries,
+      performanceSummaries,
       isErrorAccounts,
       errorAccounts,
       settings?.baseCurrency,
@@ -601,7 +596,7 @@ export const AccountsSummary = React.memo(
     return (
       <div className="mb-4 w-full space-y-0">
         <div className="flex flex-row items-center justify-between gap-2 pb-2">
-          <h2 className="text-md font-semibold tracking-tight">Accounts</h2>
+          <h2 className="text-sm font-semibold tracking-tight">Accounts</h2>
           <Button
             variant="ghost"
             className="text-muted-foreground hover:bg-success/10"
@@ -618,6 +613,21 @@ export const AccountsSummary = React.memo(
             )}
           </Button>
         </div>
+        {isPerformanceError && (
+          <div className="border-destructive/30 bg-destructive/5 mb-2 rounded-lg border p-3">
+            <div className="flex items-start gap-2">
+              <Icons.AlertTriangle className="text-destructive mt-0.5 h-4 w-4 shrink-0" />
+              <div className="min-w-0">
+                <p className="text-destructive text-sm font-medium">
+                  Failed to load performance metrics
+                </p>
+                <p className="text-muted-foreground mt-1 break-words text-xs">
+                  {performanceError?.message || "Account values are shown without period returns."}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="space-y-2 md:space-y-3">{renderedContent}</div>
       </div>
     );

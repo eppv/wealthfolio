@@ -9,6 +9,7 @@ mod compiler;
 mod csv_parser;
 mod idempotency;
 mod import_run_model;
+mod transfer_pairs;
 
 #[cfg(test)]
 mod activities_service_tests;
@@ -24,12 +25,13 @@ pub use activities_model::{
     Activity, ActivityBulkIdentifierMapping, ActivityBulkMutationError,
     ActivityBulkMutationRequest, ActivityBulkMutationResult, ActivityDetails, ActivityImport,
     ActivitySearchResponse, ActivitySearchResponseMeta, ActivityStatus, ActivityType,
-    ActivityUpdate, ActivityUpsert, BrokerActivityProfileConfig, BrokerProfileScope,
-    BrokerSyncProfileData, BulkUpsertResult, FieldMappingValue, ImportActivitiesResult,
-    ImportActivitiesSummary, ImportAssetCandidate, ImportAssetPreviewItem,
+    ActivityUpdate, ActivityUpsert, AssetResolutionInput, BrokerActivityProfileConfig,
+    BrokerProfileScope, BrokerSyncProfileData, BulkUpsertResult, FieldMappingValue,
+    ImportActivitiesResult, ImportActivitiesSummary, ImportAssetCandidate, ImportAssetPreviewItem,
     ImportAssetPreviewStatus, ImportMapping, ImportMappingData, ImportTemplate, ImportTemplateData,
-    ImportTemplateScope, IncomeData, NewActivity, PrepareActivitiesResult,
-    SaveBrokerSyncProfileRulesRequest, Sort, SymbolInput, TemplateKind,
+    ImportTemplateScope, IncomeData, InternalTransferPairRequest, InternalTransferPairResponse,
+    NewActivity, PrepareActivitiesResult, SaveBrokerSyncProfileRulesRequest, Sort, TemplateKind,
+    TransferMatchCandidate, TransferMatchCandidateRequest,
 };
 pub use activities_service::ActivityService;
 pub use activities_traits::{ActivityRepositoryTrait, ActivityServiceTrait};
@@ -42,3 +44,4 @@ pub use import_run_model::{
     ImportRun, ImportRunMode, ImportRunRepositoryTrait, ImportRunStatus, ImportRunSummary,
     ImportRunType, ReviewMode,
 };
+pub use transfer_pairs::{InvalidTransferGroup, TransferPair, TransferPairResolution};

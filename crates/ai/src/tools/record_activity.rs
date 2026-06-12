@@ -7,6 +7,15 @@ use log::debug;
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use wealthfolio_core::activities::{
+    ACTIVITY_SUBTYPE_BONUS, ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND, ACTIVITY_SUBTYPE_DRIP,
+    ACTIVITY_SUBTYPE_STAKING_REWARD, ACTIVITY_TYPE_ADJUSTMENT, ACTIVITY_TYPE_BUY,
+    ACTIVITY_TYPE_CREDIT, ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_DIVIDEND, ACTIVITY_TYPE_FEE,
+    ACTIVITY_TYPE_INTEREST, ACTIVITY_TYPE_SELL, ACTIVITY_TYPE_SPLIT, ACTIVITY_TYPE_TAX,
+    ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_UNKNOWN,
+    ACTIVITY_TYPE_WITHDRAWAL,
+};
+use wealthfolio_core::utils::time_utils::{parse_user_timezone, DEFAULT_VALUATION_TZ};
 
 use crate::env::AiEnvironment;
 use crate::error::AiError;
@@ -141,6 +150,8 @@ pub struct AccountOption {
     pub id: String,
     pub name: String,
     pub currency: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
 }
 
 /// Resolved asset information.
@@ -156,6 +167,8 @@ pub struct ResolvedAsset {
     pub exchange: Option<String>,
     /// Exchange MIC code (e.g., "XNAS").
     pub exchange_mic: Option<String>,
+    /// Instrument type from the search provider (e.g., "EQUITY", "ETF", "BOND").
+    pub instrument_type: Option<String>,
 }
 
 /// A subtype option for the dropdown.
@@ -174,20 +187,20 @@ pub struct SubtypeOption {
 
 /// Canonical activity types.
 const ACTIVITY_TYPES: &[&str] = &[
-    "BUY",
-    "SELL",
-    "SPLIT",
-    "DIVIDEND",
-    "INTEREST",
-    "DEPOSIT",
-    "WITHDRAWAL",
-    "TRANSFER_IN",
-    "TRANSFER_OUT",
-    "FEE",
-    "TAX",
-    "CREDIT",
-    "ADJUSTMENT",
-    "UNKNOWN",
+    ACTIVITY_TYPE_BUY,
+    ACTIVITY_TYPE_SELL,
+    ACTIVITY_TYPE_SPLIT,
+    ACTIVITY_TYPE_DIVIDEND,
+    ACTIVITY_TYPE_INTEREST,
+    ACTIVITY_TYPE_DEPOSIT,
+    ACTIVITY_TYPE_WITHDRAWAL,
+    ACTIVITY_TYPE_TRANSFER_IN,
+    ACTIVITY_TYPE_TRANSFER_OUT,
+    ACTIVITY_TYPE_FEE,
+    ACTIVITY_TYPE_TAX,
+    ACTIVITY_TYPE_CREDIT,
+    ACTIVITY_TYPE_ADJUSTMENT,
+    ACTIVITY_TYPE_UNKNOWN,
 ];
 
 // ============================================================================
@@ -199,24 +212,24 @@ const ACTIVITY_TYPES: &[&str] = &[
 fn get_subtypes_for_activity_type(activity_type: &str) -> Vec<SubtypeOption> {
     match activity_type.to_uppercase().as_str() {
         // DIVIDEND subtypes
-        "DIVIDEND" => vec![
+        s if s == ACTIVITY_TYPE_DIVIDEND => vec![
             SubtypeOption {
-                value: "DRIP".to_string(),
+                value: ACTIVITY_SUBTYPE_DRIP.to_string(),
                 label: "Dividend Reinvested (DRIP)".to_string(),
             },
             SubtypeOption {
-                value: "DIVIDEND_IN_KIND".to_string(),
+                value: ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND.to_string(),
                 label: "Dividend in Kind".to_string(),
             },
         ],
         // STAKING_REWARD expands to INTEREST + BUY
-        "INTEREST" => vec![SubtypeOption {
-            value: "STAKING_REWARD".to_string(),
+        s if s == ACTIVITY_TYPE_INTEREST => vec![SubtypeOption {
+            value: ACTIVITY_SUBTYPE_STAKING_REWARD.to_string(),
             label: "Staking Reward".to_string(),
         }],
         // BONUS is external flow (affects TWR)
-        "CREDIT" => vec![SubtypeOption {
-            value: "BONUS".to_string(),
+        s if s == ACTIVITY_TYPE_CREDIT => vec![SubtypeOption {
+            value: ACTIVITY_SUBTYPE_BONUS.to_string(),
             label: "Bonus".to_string(),
         }],
         _ => vec![],
@@ -248,7 +261,7 @@ impl<E: AiEnvironment> RecordActivityTool<E> {
         let accounts = self
             .env
             .account_service()
-            .get_active_accounts()
+            .get_active_non_archived_accounts()
             .map_err(|e| AiError::ToolExecutionFailed(e.to_string()))?;
 
         self.build_output_with_accounts(args, &accounts).await
@@ -281,6 +294,7 @@ impl<E: AiEnvironment> RecordActivityTool<E> {
                 id: a.id.clone(),
                 name: a.name.clone(),
                 currency: a.currency.clone(),
+                account_type: Some(a.account_type.clone()),
             })
             .collect();
 
@@ -335,6 +349,8 @@ impl<E: AiEnvironment> RecordActivityTool<E> {
                             .unwrap_or_else(|| currency.clone()),
                         exchange: top_result.exchange_name.clone(),
                         exchange_mic: top_result.exchange_mic.clone(),
+                        instrument_type: (!top_result.quote_type.trim().is_empty())
+                            .then(|| top_result.quote_type.clone()),
                     };
                     (
                         Some(asset.clone()),
@@ -468,6 +484,13 @@ impl<E: AiEnvironment> RecordActivityTool<E> {
         let mut errors = Vec::new();
 
         let activity_type = draft.activity_type.to_uppercase();
+        let subtype = draft.subtype.as_deref().map(str::to_uppercase);
+        let is_dividend_asset_income = activity_type == ACTIVITY_TYPE_DIVIDEND
+            && subtype.as_deref().is_some_and(|subtype| {
+                subtype == ACTIVITY_SUBTYPE_DRIP || subtype == ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND
+            });
+        let is_staking_reward = activity_type == ACTIVITY_TYPE_INTEREST
+            && subtype.as_deref() == Some(ACTIVITY_SUBTYPE_STAKING_REWARD);
 
         // Account is always required
         if draft.account_id.is_none() {
@@ -476,7 +499,7 @@ impl<E: AiEnvironment> RecordActivityTool<E> {
 
         // Validate based on activity type
         match activity_type.as_str() {
-            "BUY" | "SELL" => {
+            s if s == ACTIVITY_TYPE_BUY || s == ACTIVITY_TYPE_SELL => {
                 if draft.symbol.is_none() && draft.asset_id.is_none() {
                     missing_fields.push("symbol".to_string());
                 }
@@ -488,31 +511,46 @@ impl<E: AiEnvironment> RecordActivityTool<E> {
                     missing_fields.push("unit_price".to_string());
                 }
             }
-            "DEPOSIT" | "WITHDRAWAL" | "TAX" | "FEE" | "CREDIT" => {
-                if draft.amount.is_none() {
-                    missing_fields.push("amount".to_string());
-                }
+            s if (s == ACTIVITY_TYPE_DEPOSIT
+                || s == ACTIVITY_TYPE_WITHDRAWAL
+                || s == ACTIVITY_TYPE_TAX
+                || s == ACTIVITY_TYPE_FEE
+                || s == ACTIVITY_TYPE_CREDIT)
+                && draft.amount.is_none() =>
+            {
+                missing_fields.push("amount".to_string());
             }
-            "DIVIDEND" => {
+            s if s == ACTIVITY_TYPE_DIVIDEND => {
                 if draft.symbol.is_none() && draft.asset_id.is_none() {
                     missing_fields.push("symbol".to_string());
                 }
-                // Either amount or (quantity + unit_price) is required
-                if draft.amount.is_none()
-                    && (draft.quantity.is_none() || draft.unit_price.is_none())
+                if is_dividend_asset_income && draft.quantity.is_none() {
+                    missing_fields.push("quantity".to_string());
+                }
+                if is_dividend_asset_income && draft.amount.is_none() && draft.unit_price.is_none()
                 {
+                    missing_fields.push("unit_price".to_string());
+                }
+                if !is_dividend_asset_income && draft.amount.is_none() {
                     missing_fields.push("amount".to_string());
                 }
             }
-            "INTEREST" => {
-                // Amount is required, symbol is optional
-                if draft.amount.is_none()
-                    && (draft.quantity.is_none() || draft.unit_price.is_none())
-                {
+            s if s == ACTIVITY_TYPE_INTEREST => {
+                if is_staking_reward {
+                    if draft.symbol.is_none() && draft.asset_id.is_none() {
+                        missing_fields.push("symbol".to_string());
+                    }
+                    if draft.quantity.is_none() {
+                        missing_fields.push("quantity".to_string());
+                    }
+                    if draft.amount.is_none() && draft.unit_price.is_none() {
+                        missing_fields.push("unit_price".to_string());
+                    }
+                } else if draft.amount.is_none() {
                     missing_fields.push("amount".to_string());
                 }
             }
-            "SPLIT" => {
+            s if s == ACTIVITY_TYPE_SPLIT => {
                 if draft.symbol.is_none() && draft.asset_id.is_none() {
                     missing_fields.push("symbol".to_string());
                 }
@@ -520,11 +558,12 @@ impl<E: AiEnvironment> RecordActivityTool<E> {
                     missing_fields.push("quantity".to_string());
                 }
             }
-            "TRANSFER_IN" | "TRANSFER_OUT" => {
-                // Either amount (for cash) or (symbol + quantity) for assets
-                if draft.amount.is_none() && draft.symbol.is_none() {
-                    missing_fields.push("amount".to_string());
-                }
+            // Either amount (for cash) or (symbol + quantity) for assets
+            s if (s == ACTIVITY_TYPE_TRANSFER_IN || s == ACTIVITY_TYPE_TRANSFER_OUT)
+                && draft.amount.is_none()
+                && draft.symbol.is_none() =>
+            {
+                missing_fields.push("amount".to_string());
             }
             _ => {}
         }
@@ -589,9 +628,47 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivityTool<E> {
     type Output = RecordActivityOutput;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let configured_timezone = self
+            .env
+            .settings_service()
+            .get_settings()
+            .map(|settings| settings.timezone)
+            .unwrap_or_default();
+        let timezone =
+            parse_user_timezone(configured_timezone.trim()).unwrap_or(DEFAULT_VALUATION_TZ);
+        let now = chrono::Utc::now().with_timezone(&timezone);
+        let current_date = now.format("%Y-%m-%d").to_string();
+        let current_weekday = now.format("%A").to_string();
+        let timezone_name = timezone.name();
+
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Record investment transactions from natural language. Creates a draft preview for user confirmation. Supports all activity types: BUY, SELL, DIVIDEND, DEPOSIT, WITHDRAWAL, TRANSFER_IN, TRANSFER_OUT, INTEREST, FEE, SPLIT, TAX, CREDIT, ADJUSTMENT.".to_string(),
+            description: format!(
+                "Record investment transactions from natural language. Creates an editable draft \
+                preview for user confirmation — every field can be adjusted before save. Supports \
+                all activity types: BUY, SELL, DIVIDEND, DEPOSIT, WITHDRAWAL, TRANSFER_IN, \
+                TRANSFER_OUT, INTEREST, FEE, SPLIT, TAX, CREDIT, ADJUSTMENT. \
+                \n\nUser timezone is {timezone_name}; current date there is {current_date} \
+                ({current_weekday}). Resolve all relative date phrases (\"yesterday\", \"last \
+                Monday\", \"2 days ago\") to ISO 8601 yourself before calling. \
+                \n\nACCOUNT HANDLING: \
+                \n- If only ONE account exists, pass that account name. \
+                \n- If accounts are listed in Known App Context, use those names. \
+                \n- If accounts aren't listed and `get_accounts` is available, call it with \
+                `displayMode=\"compact\"` first; otherwise ASK which account before calling. \
+                \n- If MULTIPLE accounts exist and the user didn't specify, ASK first — do NOT \
+                call this tool with an empty account just to show the picker. \
+                \n\nSYMBOL HANDLING: pass whatever the user wrote (ticker, company name, or \
+                freeform like \"my rental property\") VERBATIM. The backend resolves names to \
+                tickers and marks unresolvable symbols as custom assets. Do NOT hand-convert \
+                names to tickers — models routinely hallucinate or use stale tickers (e.g. \
+                \"Facebook\" is now META, not FB). \
+                \n\nSUBTYPES: \"reinvested dividend\" → DRIP, \"dividend in kind\"/\"spinoff\" → \
+                DIVIDEND_IN_KIND, \"staking reward\" → STAKING_REWARD, \"bonus\"/\"promo credit\" \
+                → BONUS. \
+                \n\nUse `record_activities` (the batch tool) instead of this one when recording 2+ \
+                transactions in a single user request."
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -602,23 +679,29 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivityTool<E> {
                     },
                     "symbol": {
                         "type": "string",
-                        "description": "Symbol or ticker (e.g., 'AAPL', 'BTC', 'VTI'). Required for BUY/SELL/DIVIDEND/SPLIT"
+                        "description": "Symbol or ticker (e.g., 'AAPL', 'BTC', 'VTI'). Required for BUY/SELL/DIVIDEND/SPLIT and asset-backed income subtypes like DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD"
                     },
                     "activityDate": {
                         "type": "string",
-                        "description": "ISO 8601 date (e.g., '2026-01-17'). Parse relative dates like 'yesterday' or 'last Monday' to ISO format"
+                        "description": format!(
+                            "Concrete ISO 8601 date only, e.g. '2026-01-17'. Do not pass \
+                            relative phrases like 'yesterday', 'today', 'last Friday', or \
+                            'next Monday'. Resolve them relative to current local date \
+                            {current_date} ({current_weekday}) in timezone {timezone_name} \
+                            before calling this tool."
+                        )
                     },
                     "quantity": {
                         "type": "number",
-                        "description": "Number of shares or units. Required for BUY/SELL/SPLIT"
+                        "description": "Number of shares or units. Required for BUY/SELL/SPLIT and asset-backed income subtypes like DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD"
                     },
                     "unitPrice": {
                         "type": "number",
-                        "description": "Price per unit. If omitted for BUY/SELL, user will need to provide it"
+                        "description": "Price or fair market value per unit. Required for BUY/SELL unless amount is provided; for DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD, provide either unitPrice or amount"
                     },
                     "amount": {
                         "type": "number",
-                        "description": "Total amount. For DEPOSIT/WITHDRAWAL/DIVIDEND or when quantity*price doesn't apply"
+                        "description": "Total cash amount or taxable income amount. For DRIP, DIVIDEND_IN_KIND, and STAKING_REWARD, provide either amount or unitPrice"
                     },
                     "fee": {
                         "type": "number",
@@ -626,11 +709,11 @@ impl<E: AiEnvironment + 'static> Tool for RecordActivityTool<E> {
                     },
                     "account": {
                         "type": "string",
-                        "description": "Account name or ID. If user has multiple accounts and doesn't specify, ask which account"
+                        "description": "Account name or ID. Required before calling this tool when the user has multiple accounts. If the user did not specify an account, ask which account first instead of calling this tool with an empty account."
                     },
                     "subtype": {
                         "type": "string",
-                        "description": "Activity subtype for semantic variations: DRIP (dividend reinvested), DIVIDEND_IN_KIND (dividend paid in asset), STAKING_REWARD (crypto staking), BONUS (promotional credit)"
+                        "description": "Activity subtype for semantic variations: DRIP (dividend reinvested), DIVIDEND_IN_KIND (dividend paid as additional units of the same asset), STAKING_REWARD (staking income received as more units of the same asset), BONUS (promotional credit)"
                     },
                     "notes": {
                         "type": "string",
@@ -743,6 +826,34 @@ mod tests {
         // Should have subtypes available for DIVIDEND
         assert!(!output.available_subtypes.is_empty());
         assert!(output.available_subtypes.iter().any(|s| s.value == "DRIP"));
+    }
+
+    #[tokio::test]
+    async fn test_record_activity_allows_unknown_provider_subtype_label() {
+        let env = Arc::new(MockEnvironment::new());
+        let tool = RecordActivityTool::new(env);
+
+        let output = tool
+            .call(RecordActivityArgs {
+                activity_type: "BUY".to_string(),
+                symbol: Some("AAPL".to_string()),
+                activity_date: "2026-01-17".to_string(),
+                quantity: Some(2.0),
+                unit_price: Some(100.0),
+                amount: None,
+                fee: None,
+                account: None,
+                subtype: Some("BUY_TO_OPEN".to_string()),
+                notes: None,
+            })
+            .await
+            .expect("tool should return an editable draft");
+
+        assert!(!output
+            .validation
+            .errors
+            .iter()
+            .any(|error| error.field == "subtype"));
     }
 
     #[tokio::test]

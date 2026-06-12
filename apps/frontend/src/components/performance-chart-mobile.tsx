@@ -18,6 +18,7 @@ interface PerformanceChartMobileProps {
     id: string;
     name: string;
     returns: ReturnData[];
+    isReference?: boolean;
   }[];
 }
 
@@ -97,7 +98,7 @@ export function PerformanceChartMobile({ data }: PerformanceChartMobileProps) {
 
   return (
     <div className="h-full w-full">
-      <ChartContainer config={chartConfig} className="h-full w-full">
+      <ChartContainer config={chartConfig} className="h-full w-full" data-no-swipe-drag>
         <ResponsiveContainer width="100%" height="100%" aspect={undefined}>
           <LineChart data={formattedData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
             <CartesianGrid vertical={false} strokeDasharray="3 3" opacity={0.3} />
@@ -115,7 +116,7 @@ export function PerformanceChartMobile({ data }: PerformanceChartMobileProps) {
               tickLine={false}
               axisLine={false}
               tickMargin={4}
-              domain={[-0.12, "auto"]}
+              domain={["auto", "auto"]}
               tick={{ fontSize: 10 }}
               width={50}
             />
@@ -135,7 +136,8 @@ export function PerformanceChartMobile({ data }: PerformanceChartMobileProps) {
                 type="linear"
                 dataKey={series.id}
                 stroke={PERFORMANCE_CHART_COLORS[seriesIndex % PERFORMANCE_CHART_COLORS.length]}
-                strokeWidth={2}
+                strokeWidth={series.isReference ? 1.75 : 2}
+                strokeDasharray={series.isReference ? "5 5" : undefined}
                 dot={false}
                 name={series.name}
                 isAnimationActive={false}

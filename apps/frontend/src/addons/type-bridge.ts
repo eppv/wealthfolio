@@ -21,7 +21,8 @@ import type {
   DepositsCalculation,
   ExchangeRate,
   Goal,
-  GoalAllocation,
+  GoalFundingRule,
+  GoalFundingRuleInput,
   Holding,
   HoldingsSnapshotInput,
   ImportActivitiesResult,
@@ -30,16 +31,20 @@ import type {
   IncomeSummary,
   MarketDataProviderInfo,
   NewContributionLimit,
-  PerformanceMetrics,
+  PerformanceResult,
   Quote,
   SnapshotInfo,
   SymbolSearchResult,
   Settings,
-  SimplePerformanceMetrics,
+  SimplePerformanceResult,
   UpdateAssetProfile,
 } from "@/lib/types";
 import type { HoldingInput } from "@/adapters";
-import type { HostAPI as SDKHostAPI } from "@wealthfolio/addon-sdk";
+import type {
+  Goal as SDKGoal,
+  GoalAllocation as SDKGoalAllocation,
+  HostAPI as SDKHostAPI,
+} from "@wealthfolio/addon-sdk";
 
 /**
  * Internal HostAPI interface that matches the actual command function signatures
@@ -68,13 +73,23 @@ export interface InternalHostAPI {
   // Goals
   getGoals(): Promise<Goal[]>;
   createGoal(goal: unknown): Promise<Goal>;
-  updateGoal(goal: Goal): Promise<Goal>;
-  updateGoalsAllocations(allocations: GoalAllocation[]): Promise<void>;
-  getGoalsAllocation(): Promise<GoalAllocation[]>;
+  updateGoal(goal: unknown): Promise<Goal>;
+  getGoalFunding(goalId: string): Promise<GoalFundingRule[]>;
+  saveGoalFunding(goalId: string, rules: GoalFundingRuleInput[]): Promise<GoalFundingRule[]>;
 
   // Market data
   searchTicker(query: string): Promise<SymbolSearchResult[]>;
-  fetchYahooDividends(symbol: string): Promise<{ amount: number; date: number }[]>;
+  fetchDividends(
+    symbol: string,
+    options?: {
+      exchangeMic?: string;
+      instrumentType?: string;
+      quoteCcy?: string;
+      providerId?: string;
+      startDate?: string;
+      endDate?: string;
+    },
+  ): Promise<{ amount: number; date: number }[]>;
   syncHistoryQuotes(): Promise<void>;
   getAssetProfile(assetId: string): Promise<Asset>;
   updateAssetProfile(payload: UpdateAssetProfile): Promise<Asset>;
@@ -101,22 +116,22 @@ export interface InternalHostAPI {
   calculatePerformanceHistory(
     itemType: "account" | "symbol",
     itemId: string,
-    startDate: string,
-    endDate: string,
-  ): Promise<PerformanceMetrics>;
+    startDate?: string,
+    endDate?: string,
+  ): Promise<PerformanceResult>;
   calculatePerformanceSummary(args: {
     itemType: "account" | "symbol";
     itemId: string;
     startDate?: string | null;
     endDate?: string | null;
-  }): Promise<PerformanceMetrics>;
-  calculateAccountsSimplePerformance(accountIds: string[]): Promise<SimplePerformanceMetrics[]>;
+  }): Promise<PerformanceResult>;
+  calculateAccountsSimplePerformance(accountIds: string[]): Promise<SimplePerformanceResult[]>;
   getHolding(accountId: string, assetId: string): Promise<Holding | null>;
 
   // Settings
   getSettings(): Promise<Settings>;
   updateSettings(settingsUpdate: Partial<Settings>): Promise<Settings>;
-  backupDatabase(): Promise<{ filename: string; data: Uint8Array }>;
+  backupDatabase(): Promise<{ filename: string }>;
 
   // Account management
   createAccount(account: unknown): Promise<Account>;
@@ -214,6 +229,86 @@ export function createSDKHostAPIBridge(
     debug: (message: string) => internalAPI.logDebug(`[${prefix}] ${message}`),
   });
 
+  const toSDKGoal = (goal: Goal): SDKGoal => {
+    const targetAmount = goal.targetAmount ?? goal.summaryTargetAmount ?? 0;
+
+    return {
+      id: goal.id,
+      goalType: goal.goalType,
+      title: goal.title,
+      description: goal.description ?? undefined,
+      targetAmount,
+      statusLifecycle: goal.statusLifecycle,
+      statusHealth: goal.statusHealth,
+      priority: goal.priority,
+      coverImageKey: goal.coverImageKey ?? undefined,
+      currency: goal.currency ?? undefined,
+      startDate: goal.startDate ?? undefined,
+      targetDate: goal.targetDate ?? undefined,
+      summaryCurrentValue: goal.summaryCurrentValue ?? undefined,
+      summaryProgress: goal.summaryProgress ?? undefined,
+      projectedCompletionDate: goal.projectedCompletionDate ?? undefined,
+      projectedValueAtTargetDate: goal.projectedValueAtTargetDate ?? undefined,
+      summaryTargetAmount: goal.summaryTargetAmount ?? targetAmount,
+      createdAt: goal.createdAt ?? undefined,
+      updatedAt: goal.updatedAt ?? undefined,
+    };
+  };
+
+  const toSDKGoalAllocation = (rule: GoalFundingRule): SDKGoalAllocation => ({
+    id: rule.id,
+    goalId: rule.goalId,
+    accountId: rule.accountId,
+    sharePercent: rule.sharePercent,
+    taxBucket: rule.taxBucket,
+  });
+
+  const toGoalFundingRuleInput = (allocation: SDKGoalAllocation): GoalFundingRuleInput => {
+    if (!Number.isFinite(allocation.sharePercent)) {
+      throw new Error("Goal allocation sharePercent must be a number");
+    }
+    return {
+      accountId: allocation.accountId,
+      sharePercent: allocation.sharePercent,
+      taxBucket: allocation.taxBucket,
+    };
+  };
+
+  const getGoalAllocations = async (): Promise<SDKGoalAllocation[]> => {
+    const goals = await internalAPI.getGoals();
+    const allocations = await Promise.all(goals.map((goal) => internalAPI.getGoalFunding(goal.id)));
+    return allocations.flat().map(toSDKGoalAllocation);
+  };
+
+  const getGoalFunding = async (goalId: string): Promise<SDKGoalAllocation[]> => {
+    const rules = await internalAPI.getGoalFunding(goalId);
+    return rules.map(toSDKGoalAllocation);
+  };
+
+  const saveGoalFunding = async (
+    goalId: string,
+    allocations: SDKGoalAllocation[],
+  ): Promise<SDKGoalAllocation[]> => {
+    const rules = await internalAPI.saveGoalFunding(
+      goalId,
+      allocations.map(toGoalFundingRuleInput),
+    );
+    return rules.map(toSDKGoalAllocation);
+  };
+
+  const updateGoalAllocations = async (allocations: SDKGoalAllocation[]): Promise<void> => {
+    const byGoalId = new Map<string, GoalFundingRuleInput[]>();
+    for (const allocation of allocations) {
+      const rules = byGoalId.get(allocation.goalId) ?? [];
+      rules.push(toGoalFundingRuleInput(allocation));
+      byGoalId.set(allocation.goalId, rules);
+    }
+
+    await Promise.all(
+      Array.from(byGoalId, ([goalId, rules]) => internalAPI.saveGoalFunding(goalId, rules)),
+    );
+  };
+
   return {
     accounts: {
       getAll: internalAPI.getAccounts,
@@ -248,7 +343,7 @@ export function createSDKHostAPIBridge(
       syncHistory: internalAPI.syncHistoryQuotes,
       sync: internalAPI.syncMarketData,
       getProviders: internalAPI.getMarketDataProviders,
-      fetchDividends: internalAPI.fetchYahooDividends,
+      fetchDividends: internalAPI.fetchDividends,
     },
     assets: {
       getProfile: internalAPI.getAssetProfile,
@@ -276,11 +371,13 @@ export function createSDKHostAPIBridge(
       calculateDeposits: internalAPI.calculateDepositsForLimit,
     },
     goals: {
-      getAll: internalAPI.getGoals,
-      create: internalAPI.createGoal,
-      update: internalAPI.updateGoal,
-      updateAllocations: internalAPI.updateGoalsAllocations,
-      getAllocations: internalAPI.getGoalsAllocation,
+      getAll: async () => (await internalAPI.getGoals()).map(toSDKGoal),
+      create: async (goal) => toSDKGoal(await internalAPI.createGoal(goal)),
+      update: async (goal) => toSDKGoal(await internalAPI.updateGoal(goal)),
+      getFunding: getGoalFunding,
+      saveFunding: saveGoalFunding,
+      getAllocations: getGoalAllocations,
+      updateAllocations: updateGoalAllocations,
     },
     settings: {
       get: internalAPI.getSettings,

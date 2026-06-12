@@ -23,6 +23,7 @@ import {
   isAssetBackedIncomeActivity,
   isCashActivity,
   isCashTransfer,
+  isSecuritiesTransfer,
   isFeeActivity,
   isIncomeActivity,
   isSplitActivity,
@@ -42,7 +43,7 @@ import {
   getSortedRowModel,
   useReactTable,
 } from "@tanstack/react-table";
-import { Button, formatAmount } from "@wealthfolio/ui";
+import { Button, EmptyPlaceholder, formatAmount } from "@wealthfolio/ui";
 import { Link } from "react-router-dom";
 import { useActivityMutations } from "../../hooks/use-activity-mutations";
 import { ActivityOperations } from "../activity-operations";
@@ -55,6 +56,11 @@ interface ActivityTableProps {
   onSortingChange: (sorting: SortingState) => void;
   handleEdit: (activity?: ActivityDetails) => void;
   handleDelete: (activity: ActivityDetails) => void;
+  onLinkTransfer?: (activity: ActivityDetails) => void;
+  onUnlinkTransfer?: (activity: ActivityDetails) => void;
+  filtersActive?: boolean;
+  onAdd?: () => void;
+  onClearFilters?: () => void;
 }
 
 export const ActivityTable = ({
@@ -64,6 +70,11 @@ export const ActivityTable = ({
   onSortingChange,
   handleEdit,
   handleDelete,
+  onLinkTransfer,
+  onUnlinkTransfer,
+  filtersActive = false,
+  onAdd,
+  onClearFilters,
 }: ActivityTableProps) => {
   const { duplicateActivityMutation } = useActivityMutations();
   const { settings } = useSettingsContext();
@@ -114,6 +125,7 @@ export const ActivityTable = ({
             <div className="flex items-center text-sm">
               <ActivityTypeBadge
                 type={activityType as ActivityType}
+                subtype={row.original.subtype}
                 className="whitespace-nowrap text-xs font-normal"
               />
             </div>
@@ -161,14 +173,21 @@ export const ActivityTable = ({
           const isAssetBackedIncome = isAssetBackedIncomeActivity(activityType, symbol, assetId);
           const hasAsset = Boolean(assetId?.trim());
           const isCash = isTransferActivity
-            ? !hasAsset || isCashTransfer(activityType, symbol)
+            ? isCashTransfer(activityType, symbol, assetId)
             : isCashActivity(activityType) && !isAssetBackedIncome;
 
           // Parse OCC symbol for options
           const isOptionActivity = instrumentType === "OPTION";
           const parsedOption = isOptionActivity ? parseOccSymbol(symbol) : null;
 
-          const displaySymbol = isCash ? "Cash" : parsedOption ? parsedOption.underlying : symbol;
+          // For cash activities, surface the payee/merchant from notes when available
+          // (e.g., "AMAZON*MARKETPLACE" instead of just "Cash").
+          const cashPayee = isCash ? (row.original.comment ?? "").trim() : "";
+          const displaySymbol = isCash
+            ? cashPayee || "Cash"
+            : parsedOption
+              ? parsedOption.underlying
+              : symbol;
           const avatarSymbol = isCash ? "$CASH" : symbol;
           const normalizedSymbol = (parsedOption?.underlying ?? symbol).trim().toUpperCase();
           const shouldShowExchange =
@@ -198,7 +217,11 @@ export const ActivityTable = ({
                   ) : null}
                 </span>
                 <span className="text-muted-foreground truncate text-xs font-light">
-                  {isCash ? String(currency) : (optionSubtitle ?? String(assetName ?? currency))}
+                  {isCash
+                    ? cashPayee
+                      ? `Cash · ${String(currency)}`
+                      : String(currency)
+                    : (optionSubtitle ?? String(assetName ?? currency))}
                 </span>
               </div>
             </div>
@@ -241,9 +264,8 @@ export const ActivityTable = ({
           );
           const isTransfer =
             activityType === ActivityType.TRANSFER_IN || activityType === ActivityType.TRANSFER_OUT;
-          const hasAsset = Boolean(row.original.assetId?.trim());
           const isCash = isTransfer
-            ? !hasAsset || isCashTransfer(activityType, assetSymbol)
+            ? isCashTransfer(activityType, assetSymbol, row.original.assetId)
             : isCashActivity(activityType) && !isAssetBackedIncome;
 
           if (
@@ -308,8 +330,10 @@ export const ActivityTable = ({
             return <div className="text-right">{formatSplitRatio(Number(amount))}</div>;
           }
           if (
-            (isCashActivity(activityType) && !isAssetBackedIncome) ||
-            isCashTransfer(activityType, assetSymbol) ||
+            (isCashActivity(activityType) &&
+              !isAssetBackedIncome &&
+              !isSecuritiesTransfer(activityType, assetSymbol, row.original.assetId)) ||
+            isCashTransfer(activityType, assetSymbol, row.original.assetId) ||
             (isIncomeActivity(activityType) && !isAssetBackedIncome)
           ) {
             return <div className="text-right">{formatAmount(Number(amount), currency)}</div>;
@@ -468,13 +492,22 @@ export const ActivityTable = ({
               onEdit={handleEdit}
               onDelete={handleDelete}
               onDuplicate={handleDuplicate}
+              onLinkTransfer={onLinkTransfer}
+              onUnlinkTransfer={onUnlinkTransfer}
             />
           );
         },
         enableHiding: false,
       },
     ],
-    [handleEdit, handleDelete, handleDuplicate, symbolExchangeCountMap],
+    [
+      handleEdit,
+      handleDelete,
+      handleDuplicate,
+      onLinkTransfer,
+      onUnlinkTransfer,
+      symbolExchangeCountMap,
+    ],
   );
 
   const handleSortingChange = React.useCallback<OnChangeFn<SortingState>>(
@@ -509,6 +542,36 @@ export const ActivityTable = ({
     );
   }
 
+  const hasRows = table.getRowModel().rows?.length > 0;
+
+  if (!hasRows) {
+    return (
+      <div className="flex h-full flex-col">
+        <EmptyPlaceholder>
+          <EmptyPlaceholder.Icon name="Activity" />
+          <EmptyPlaceholder.Title>No activities</EmptyPlaceholder.Title>
+          <EmptyPlaceholder.Description>
+            {filtersActive
+              ? "No activities match your filters."
+              : "Add your first activity to get started."}
+          </EmptyPlaceholder.Description>
+          {filtersActive ? (
+            onClearFilters ? (
+              <Button variant="outline" onClick={onClearFilters}>
+                Clear filters
+              </Button>
+            ) : null
+          ) : onAdd ? (
+            <Button onClick={onAdd}>
+              <Icons.Plus className="mr-2 h-4 w-4" aria-hidden="true" />
+              Add Activity
+            </Button>
+          ) : null}
+        </EmptyPlaceholder>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col">
       <div className="min-h-0 flex-1 overflow-auto rounded-md border">
@@ -530,25 +593,17 @@ export const ActivityTable = ({
           </TableHeader>
 
           <TableBody>
-            {table.getRowModel().rows?.length > 0 ? (
-              table.getRowModel().rows.map((row) => {
-                return (
-                  <TableRow key={row.id}>
-                    {row.getVisibleCells().map((cell) => (
-                      <TableCell key={cell.id}>
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                );
-              })
-            ) : (
-              <TableRow>
-                <TableCell colSpan={columns.length} className="h-24 text-center">
-                  No activity found.
-                </TableCell>
-              </TableRow>
-            )}
+            {table.getRowModel().rows.map((row) => {
+              return (
+                <TableRow key={row.id}>
+                  {row.getVisibleCells().map((cell) => (
+                    <TableCell key={cell.id}>
+                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       </div>

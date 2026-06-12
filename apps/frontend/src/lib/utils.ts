@@ -2,8 +2,8 @@ import { logger } from "@/adapters";
 import { type ClassValue, clsx } from "clsx";
 import { format, isValid, parse, parseISO } from "date-fns";
 import { twMerge } from "tailwind-merge";
+import { getQuoteUnitCurrency } from "@wealthfolio/ui/lib/currencies";
 import { DECIMAL_PRECISION, DISPLAY_DECIMAL_PRECISION } from "./constants";
-import { AccountValuation } from "./types";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -34,6 +34,12 @@ export function tryParseDate(dateStr: string): Date | null {
     "yyyy-MM-dd'T'HH:mm:ss'Z'", // Added Standard ISO format
     "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", // Added Standard ISO format with milliseconds
     "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX", // Added Standard ISO timestamp with microsecond precision and timezone offset
+
+    // 12-hour / AM-PM Formats (e.g. Questrade exports). Only the unambiguous
+    // ISO date order is auto-detected; slash orders (MM/dd vs dd/MM) are
+    // ambiguous and must be chosen explicitly via an import format preset.
+    "yyyy-MM-dd hh:mm:ss a", // "2024-05-01 12:00:00 AM"
+    "yyyy-MM-dd hh:mm a", // "2024-05-01 12:00 AM"
 
     // ISO and Technical Formats
     "yyyy-MM-dd", // "2024-05-01" - ISO 8601
@@ -152,6 +158,20 @@ export function formatDate(input: string | number | Date | null | undefined): st
  */
 export function formatDateISO(date: Date): string {
   return format(date, "yyyy-MM-dd");
+}
+
+/**
+ * Formats a time as "h:mm a" (e.g. "12:00 AM"). Use when only the time of day
+ * is meaningful and the seconds-bearing formatDateTime would be too verbose.
+ */
+export function formatTime(input: string | number | Date | null | undefined): string {
+  if (input === null || input === undefined) return "-";
+  let date: Date | null = null;
+  if (input instanceof Date) date = input;
+  else if (typeof input === "string") date = tryParseDate(input) ?? new Date(input);
+  else if (typeof input === "number") date = Number.isFinite(input) ? new Date(input) : null;
+  if (date && isValid(date)) return format(date, "h:mm a");
+  return "-";
 }
 
 export const formatDateTime = (date: string | Date, timezone?: string) => {
@@ -278,26 +298,14 @@ const getCurrencyFormatter = (currency: string) => {
 };
 
 /**
- * Minor currency normalization rules.
- * Maps minor currency codes to their major equivalents.
- */
-const MINOR_CURRENCY_MAP: Record<string, string> = {
-  GBp: "GBP", // British pence
-  GBX: "GBP", // British pence (alternative code)
-  ZAc: "ZAR", // South African cents
-  ZAC: "ZAR", // South African cents (uppercase)
-  ILA: "ILS", // Israeli agorot
-  KWF: "KWD", // Kuwaiti fils
-};
-
-/**
  * Normalizes a minor currency code to its major equivalent.
  * E.g., "GBp" -> "GBP", "ZAc" -> "ZAR"
- * If no normalization rule exists, returns the input unchanged.
+ * If no normalization rule exists, returns the uppercased input.
  */
 export function normalizeCurrency(currency: string | undefined): string | undefined {
   if (!currency) return currency;
-  return MINOR_CURRENCY_MAP[currency] ?? currency;
+  const trimmed = currency.trim();
+  return getQuoteUnitCurrency(trimmed)?.major ?? trimmed.toUpperCase();
 }
 
 export function formatAmount(
@@ -308,34 +316,38 @@ export function formatAmount(
   if (amount == null) return "-";
   const numericAmount = typeof amount === "string" ? Number(amount) : amount;
   if (!Number.isFinite(numericAmount)) return "-";
+  const displayAmount = Math.abs(numericAmount) < 0.005 ? 0 : numericAmount;
   const rawCurrency = currency ?? "USD";
-  const isPenceCurrency = rawCurrency === "GBp" || rawCurrency === "GBX";
+  const quoteUnit = getQuoteUnitCurrency(rawCurrency);
 
-  if (isPenceCurrency) {
-    const formattedNumber = decimalFormatter.format(numericAmount);
-    return displayCurrency ? `${formattedNumber}p` : formattedNumber;
+  if (quoteUnit) {
+    const formattedNumber = decimalFormatter.format(displayAmount);
+    return displayCurrency ? `${formattedNumber}${quoteUnit.symbol}` : formattedNumber;
   }
 
   if (!displayCurrency) {
-    return decimalFormatter.format(numericAmount);
+    return decimalFormatter.format(displayAmount);
   }
 
-  return getCurrencyFormatter(rawCurrency).format(numericAmount);
+  return getCurrencyFormatter(rawCurrency).format(displayAmount);
 }
 
-export function formatPercent(value: number | null | undefined) {
+export function formatPercent(
+  value: number | null | undefined,
+  options: { digits?: number; signDisplay?: "auto" | "always" | "never" } = {},
+) {
   if (value == null) return "-";
+  const digits = options.digits ?? 2;
   try {
-    // Use Intl.NumberFormat for correct percentage formatting (handles x100 and % sign)
     return new Intl.NumberFormat("en-US", {
       style: "percent",
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+      signDisplay: options.signDisplay ?? "auto",
     }).format(value);
   } catch (error) {
     logger.error(`Error formatting percent ${value}: ${error}`);
-    // Fallback to simple string conversion if formatting fails
-    return `${value}%`; // Keep original fallback but it might still be incorrect
+    return `${value}%`;
   }
 }
 
@@ -371,54 +383,6 @@ export function safeDivide(numerator: number, denominator: number): number {
     return 0;
   }
   return numerator / denominator;
-}
-
-export function calculatePerformanceMetrics(
-  history: AccountValuation[] | null | undefined,
-  isAllTime = false,
-): { gainLossAmount: number; simpleReturn: number } {
-  if (!history?.length) return { gainLossAmount: 0, simpleReturn: 0 };
-
-  const first = history[0];
-  const last = history[history.length - 1];
-
-  const ncFlow = Number(last.netContribution) - Number(first.netContribution);
-  const mvGain = Number(last.totalValue) - Number(first.totalValue);
-  const gain$ = mvGain - ncFlow; // profit / loss
-
-  // ── all‑time ROI ────────────────────────────────────────────────
-  if (isAllTime) {
-    const totalNC = Number(last.netContribution);
-    const gain = Number(last.totalValue) - totalNC;
-
-    return {
-      gainLossAmount: gain,
-      simpleReturn: totalNC !== 0 ? gain / totalNC : 0,
-    };
-  }
-
-  // ── period Perf: daily time‑weighted return (TWR) ───────────────
-  let twr = 1;
-  for (let i = 1; i < history.length; i++) {
-    const prev = history[i - 1];
-    const curr = history[i];
-
-    const cf = Number(curr.netContribution) - Number(prev.netContribution); // deposit(+)/withdraw(-)
-    const mv0 = Number(prev.totalValue);
-    if (mv0 === 0) {
-      continue; // skip day zero if portfolio just opened
-    }
-
-    const dailyReturn = (Number(curr.totalValue) - cf) / mv0;
-    twr *= dailyReturn;
-  }
-
-  const result = {
-    gainLossAmount: gain$,
-    simpleReturn: twr - 1, // e.g. 0.034 -> 3.4 %
-  };
-
-  return result;
 }
 
 /**

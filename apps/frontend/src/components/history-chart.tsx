@@ -7,6 +7,13 @@ import { AmountDisplay } from "@wealthfolio/ui";
 import { useId, useMemo, useRef, useState } from "react";
 import { Area, AreaChart, ReferenceDot, Tooltip, XAxis, YAxis } from "recharts";
 import type { MouseHandlerDataParam } from "recharts/types/synchronisation/types";
+import {
+  HistoryChartActiveDot,
+  HistoryChartMarkerShape,
+  type RechartsActiveDotProps,
+  type RechartsMarkerShapeProps,
+} from "./history-chart-marker";
+import { getAutomaticHistoryChartScale, type HistoryChartScaleMode } from "./history-chart-scale";
 
 const CHART_SCRUB_HAPTIC_INTERVAL_MS = 80;
 
@@ -26,6 +33,12 @@ interface HistoryChartProps {
   showMarkers?: boolean;
   /** Callback when a marker is clicked */
   onMarkerClick?: (date: string) => void;
+  /** Controls how the Y-axis domain is calculated. */
+  scaleMode?: HistoryChartScaleMode;
+  /** Expands the domain to show net contribution when the widened span stays under this ratio. */
+  netContributionMaxDomainSpanRatio?: number;
+  /** Keeps narrow ranges from zooming too aggressively. Ratio is relative to the visible center. */
+  minDomainSpanRatio?: number;
 }
 
 interface TooltipEntry {
@@ -69,6 +82,7 @@ const CustomTooltip = ({
     return null;
   }
 
+  const netContributionPayload = ncPayload ?? tvPayload;
   const tooltipColor = tvPayload.totalValue >= 0 ? "var(--success)" : "var(--destructive)";
 
   return (
@@ -87,7 +101,7 @@ const CustomTooltip = ({
           className="text-xs font-semibold"
         />
       </div>
-      {isChartHovered && ncPayload && (
+      {isChartHovered && netContributionPayload && (
         <div className="flex items-center justify-between space-x-2">
           <div className="flex items-center space-x-1.5">
             <span
@@ -97,8 +111,8 @@ const CustomTooltip = ({
             <span className="text-muted-foreground text-xs">Net Deposit:</span>
           </div>
           <AmountDisplay
-            value={ncPayload.netContribution}
-            currency={ncPayload.currency}
+            value={netContributionPayload.netContribution}
+            currency={netContributionPayload.currency}
             isHidden={isBalanceHidden}
             className="text-xs font-semibold"
           />
@@ -114,6 +128,9 @@ export function HistoryChart({
   snapshotDates,
   showMarkers,
   onMarkerClick,
+  scaleMode,
+  netContributionMaxDomainSpanRatio,
+  minDomainSpanRatio,
 }: HistoryChartProps) {
   const { triggerHaptic } = useHapticFeedback();
   const { isBalanceHidden } = useBalancePrivacy();
@@ -126,6 +143,17 @@ export function HistoryChart({
   const id = useId();
   const fillGradientId = `historyFill-${id}`;
   const strokeGradientId = `historyStroke-${id}`;
+  const scaleConfig = useMemo(
+    () =>
+      getAutomaticHistoryChartScale(data, {
+        ...(scaleMode ? { mode: scaleMode } : {}),
+        ...(netContributionMaxDomainSpanRatio === undefined
+          ? {}
+          : { netContributionMaxDomainSpanRatio }),
+        ...(minDomainSpanRatio === undefined ? {} : { minDomainSpanRatio }),
+      }),
+    [data, scaleMode, netContributionMaxDomainSpanRatio, minDomainSpanRatio],
+  );
 
   const chartConfig = {
     totalValue: {
@@ -148,11 +176,10 @@ export function HistoryChart({
     }
     if (min >= 0) return { zeroOffset: 1, allPositive: true, allNegative: false };
     if (max <= 0) return { zeroOffset: 0, allPositive: false, allNegative: true };
-    // Account for the 2% padding on the Y domain minimum
-    const adjustedMin = min - Math.abs(min) * 0.02;
-    const offset = max / (max - adjustedMin);
+    const [domainMin, domainMax] = scaleConfig.domain;
+    const offset = domainMax / (domainMax - domainMin);
     return { zeroOffset: offset, allPositive: false, allNegative: false };
-  }, [data]);
+  }, [data, scaleConfig.domain]);
 
   // Build a map of date -> index for efficient lookup
   const dateToIndexMap = useMemo(() => {
@@ -309,7 +336,7 @@ export function HistoryChart({
         </defs>
         <Tooltip
           position={isMobile ? { y: 60 } : { y: -20 }}
-          cursor={{ pointerEvents: "none" }}
+          cursor={{ stroke: "var(--border)", strokeWidth: 1, pointerEvents: "none" }}
           wrapperStyle={{ pointerEvents: "none" }}
           content={(props) => (
             <CustomTooltip
@@ -323,7 +350,8 @@ export function HistoryChart({
         <YAxis
           hide
           type="number"
-          domain={[(dataMin: number) => dataMin - Math.abs(dataMin) * 0.02, "auto"]}
+          scale={scaleConfig.scale === "log" ? "log" : "auto"}
+          domain={scaleConfig.domain}
         />
         <Area
           isAnimationActive={true}
@@ -333,44 +361,40 @@ export function HistoryChart({
           type="monotone"
           dataKey="totalValue"
           stroke={`url(#${strokeGradientId})`}
+          activeDot={(props: RechartsActiveDotProps & { payload?: HistoryChartData }) =>
+            showMarkers && props.payload?.date && markerDateSet.has(props.payload.date) ? null : (
+              <HistoryChartActiveDot {...props} stroke="var(--success)" />
+            )
+          }
           fillOpacity={1}
           fill={`url(#${fillGradientId})`}
           style={{ pointerEvents: "none" }}
         />
-        <Area
-          isAnimationActive={true}
-          animationDuration={300}
-          animationEasing="ease-out"
-          connectNulls={true}
-          type="monotone"
-          dataKey="netContribution"
-          stroke="var(--muted-foreground)"
-          fill="transparent"
-          strokeDasharray="5 5"
-          strokeOpacity={isChartHovered ? 0.8 : 0}
-          style={{ pointerEvents: "none" }}
-        />
-        {/* Snapshot markers - diamond shape */}
+        {scaleConfig.showNetContribution && (
+          <Area
+            isAnimationActive={true}
+            animationDuration={300}
+            animationEasing="ease-out"
+            connectNulls={true}
+            type="monotone"
+            dataKey="netContribution"
+            stroke="var(--muted-foreground)"
+            activeDot={false}
+            fill="transparent"
+            strokeDasharray="5 5"
+            strokeOpacity={isChartHovered ? 0.8 : 0}
+            style={{ pointerEvents: "none" }}
+          />
+        )}
         {showMarkers &&
           markerDataPoints.map((point) => (
             <ReferenceDot
               key={`marker-${point.date}`}
               x={point.date}
               y={point.value}
-              shape={(props: { cx?: number; cy?: number }) => {
-                const cx = props.cx ?? 0;
-                const cy = props.cy ?? 0;
-                const size = 8;
-                return (
-                  <polygon
-                    points={`${cx},${cy - size} ${cx + size},${cy} ${cx},${cy + size} ${cx - size},${cy}`}
-                    fill={point.value >= 0 ? "var(--success)" : "var(--destructive)"}
-                    stroke="hsl(var(--background))"
-                    strokeWidth={2}
-                    style={{ pointerEvents: "none" }}
-                  />
-                );
-              }}
+              shape={(props: RechartsMarkerShapeProps) => (
+                <HistoryChartMarkerShape {...props} variant="snapshot" value={point.value} />
+              )}
             />
           ))}
       </AreaChart>
