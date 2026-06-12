@@ -159,11 +159,17 @@ impl MoexProvider {
             .collect()
     }
 
-    /// Get the first row matching the primary board (TQBR for stocks, CETS for currency),
+    /// Get the first row matching the primary board (TQBR for stocks, TQCB for bonds, CETS for currency),
     /// or fallback to first available row.
     fn get_primary_board_data(data: &MoexDataTable) -> Option<Vec<Option<serde_json::Value>>> {
         // Try stock engine primary board first
         let filtered = Self::filter_by_board(data, PRIMARY_BOARD);
+        if !filtered.is_empty() {
+            return filtered.into_iter().next().cloned();
+        }
+
+        // Try corporate bond board
+        let filtered = Self::filter_by_board(data, "TQCB");
         if !filtered.is_empty() {
             return filtered.into_iter().next().cloned();
         }
@@ -323,7 +329,8 @@ impl MarketDataProvider for MoexProvider {
         ProviderCapabilities {
             instrument_kinds: &[
                 InstrumentKind::Equity,
-                InstrumentKind::Fx, // RUB pairs
+                InstrumentKind::Bond, // Russian corporate/government bonds
+                InstrumentKind::Fx,   // RUB pairs
             ],
             coverage: Coverage {
                 equity_mic_allow: Some(&["XMOS"]), // Moscow Exchange MIC
@@ -333,8 +340,8 @@ impl MarketDataProvider for MoexProvider {
             },
             supports_latest: true,
             supports_historical: true,
-            supports_search: true,  // MOEX has search capabilities
-            supports_profile: true, // MOEX has security information
+            supports_search: true,
+            supports_profile: true,
         }
     }
 
@@ -354,10 +361,14 @@ impl MarketDataProvider for MoexProvider {
         let symbol = instrument.to_symbol_string();
         debug!("MOEX: Fetching latest quote for {}", symbol);
 
-        // Try stock engine first, then currency engine
+        // Try stock engine (shares + bonds), then currency engine
         let endpoints = [
             format!(
                 "{}/engines/stock/markets/shares/securities/{}.json",
+                BASE_URL, symbol
+            ),
+            format!(
+                "{}/engines/stock/markets/bonds/securities/{}.json",
                 BASE_URL, symbol
             ),
             format!(
@@ -408,10 +419,17 @@ impl MarketDataProvider for MoexProvider {
             end.format("%Y-%m-%d")
         );
 
-        // Try stock engine first, then currency engine
+        // Try stock engine (shares + bonds), then currency engine
         let endpoints = [
             format!(
                 "{}/history/engines/stock/markets/shares/securities/{}.json?from={}&till={}",
+                BASE_URL,
+                symbol,
+                start.format("%Y-%m-%d"),
+                end.format("%Y-%m-%d")
+            ),
+            format!(
+                "{}/history/engines/stock/markets/bonds/securities/{}.json?from={}&till={}",
                 BASE_URL,
                 symbol,
                 start.format("%Y-%m-%d"),
@@ -782,6 +800,7 @@ mod tests {
         let caps = provider.capabilities();
 
         assert!(caps.instrument_kinds.contains(&InstrumentKind::Equity));
+        assert!(caps.instrument_kinds.contains(&InstrumentKind::Bond));
         assert!(caps.instrument_kinds.contains(&InstrumentKind::Fx));
         assert!(!caps.instrument_kinds.contains(&InstrumentKind::Crypto));
         assert!(!caps.instrument_kinds.contains(&InstrumentKind::Metal));
