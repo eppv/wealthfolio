@@ -1,12 +1,12 @@
 <div align="center">
-  <a href="https://github.com/afadil/wealthfolio">
+  <a href="https://github.com/wealthfolio/wealthfolio">
     <img src="apps/frontend/public/logo.svg" alt="Logo" width="80" height="80">
   </a>
 
   <h3 align="center">Wealthfolio</h3>
 
   <p align="center">
-    A Beautiful and Boring Desktop Investment Tracker
+    A Beautiful Personal Finance Tracker — investments, net worth, spending, and simulations
     <br />
     <br />
     <a href="https://wealthfolio.app">Website</a>
@@ -15,7 +15,7 @@
     ·
     <a href="https://x.com/intent/follow?screen_name=WealthfolioApp">Twitter</a>
     ·
-    <a href="https://github.com/afadil/wealthfolio/releases">Releases</a>
+    <a href="https://github.com/wealthfolio/wealthfolio/releases">Releases</a>
   </p>
 </div>
 <div align="center">
@@ -32,17 +32,18 @@
     style="width: 250px; height: 55px;" width="250" height="55"
   />
 </a>
-  <a href="https://www.producthunt.com/posts/wealthfolio?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_souce=badge-wealthfolio" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=461640&amp;theme=light" alt="Wealthfolio - A boring, Local first, desktop Investment Tracking app | Product Hunt" class="h-[55px] w-[250px]" width="250" height="55"></a>
+  <a href="https://www.producthunt.com/posts/wealthfolio?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_souce=badge-wealthfolio" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=461640&amp;theme=light" alt="Wealthfolio - A beautiful, local-first personal finance tracker | Product Hunt" class="h-[55px] w-[250px]" width="250" height="55"></a>
 
   <a href="https://trendshift.io/repositories/11701" target="_blank">
-  <img src="https://trendshift.io/api/badge/repositories/11701" alt="afadil%2Fwealthfolio | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+  <img src="https://trendshift.io/api/badge/repositories/11701" alt="wealthfolio%2Fwealthfolio | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
 </div>
 
 ## Introduction
 
-**Wealthfolio App** is a Beautiful and Boring Investment Tracker, with Local
-Data Storage. No Subscriptions, No Cloud.
+**Wealthfolio App** is a Beautiful Personal Finance Tracker — investments, net
+worth, spending, and simulations — with local data storage. No subscriptions, no
+cloud.
 
 Visit the app website at [Wealthfolio App](https://wealthfolio.app/).
 
@@ -115,7 +116,10 @@ See [ROADMAP.md](./ROADMAP.md).
 
 ### Quick Links
 
-- 💡 **[Example Addons](addons/)** - Browse sample addons in the repository
+- 💡 **Official Addons** - Browse maintained addon examples in the
+  [official addon repository](https://github.com/wealthfolio/wealthfolio-addons/tree/main/official)
+- 🧩 **Community Addons** - Browse addons shared by the community in the
+  [community addon directory](https://github.com/wealthfolio/wealthfolio-addons/tree/main/community)
 - 🛠️ **[Development Tools](packages/addon-dev-tools/)** - CLI tools for addon
   development
 
@@ -135,7 +139,7 @@ Ensure you have the following installed on your machine:
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/afadil/wealthfolio.git
+   git clone https://github.com/wealthfolio/wealthfolio.git
    cd wealthfolio
    ```
 
@@ -228,7 +232,7 @@ All configuration is done via environment variables in `.env.web`.
 
 **Server Configuration (WF\_\* variables)**:
 
-- `WF_LISTEN_ADDR` - Server bind address (default: `0.0.0.0:8080`)
+- `WF_LISTEN_ADDR` - Server bind address (default: `0.0.0.0:8088`)
 - `WF_DB_PATH` - SQLite database path or directory (default: `./db/app.db`)
   - If a directory is provided, `app.db` will be used inside it
 - `WF_CORS_ALLOW_ORIGINS` - Comma-separated list of allowed CORS origins
@@ -261,7 +265,7 @@ All configuration is done via environment variables in `.env.web`.
 **Vite Configuration**:
 
 - `VITE_API_TARGET` - Backend API URL for Vite proxy (default:
-  `http://127.0.0.1:8080`)
+  `http://127.0.0.1:8088`)
 
 #### Authentication (Web Mode)
 
@@ -280,19 +284,22 @@ All configuration is done via environment variables in `.env.web`.
   > - The first argument is the **salt** (use 16+ characters); the password is
   >   read from stdin.
   > - Use `printf` instead of `echo -n` to avoid hidden newline issues.
-  > - For Docker Compose, double every `$` in the hash (`$$argon2id$$...`).
+  > - For Docker Compose `.env` / `--env-file`, single-quote the hash or double
+  >   every `$` (`$$argon2id$$...`).
 
   Copy the full output (starting with `$argon2id$...`) into `.env.web`.
 
   **Dollar-sign (`$`) escaping cheat-sheet** — Argon2 hashes contain `$`
   characters that shells and Compose interpret as variable references:
 
-  | Context                      | Syntax                                | Notes                                            |
-  | ---------------------------- | ------------------------------------- | ------------------------------------------------ |
-  | `.env` file                  | `WF_AUTH_PASSWORD_HASH=$argon2id$...` | No quotes, no escaping needed                    |
-  | Docker Compose YAML inline   | `HASH: '$$argon2id$$v=19$$...'`       | Double every `$` to escape Compose interpolation |
-  | `docker run` (single quotes) | `-e HASH='$argon2id$...'`             | Single quotes prevent shell expansion            |
-  | `docker run` (double quotes) | `-e HASH="\$argon2id\$..."`           | Backslash-escape each `$`                        |
+  | Context                            | Syntax                                  | Notes                                            |
+  | ---------------------------------- | --------------------------------------- | ------------------------------------------------ |
+  | `.env.web` / app-loaded dotenv     | `WF_AUTH_PASSWORD_HASH=$argon2id$...`   | Loaded by the app; no Compose interpolation      |
+  | Docker Compose `.env`/`--env-file` | `WF_AUTH_PASSWORD_HASH='$argon2id$...'` | Single quotes prevent Compose interpolation      |
+  | Docker Compose `.env`/`--env-file` | `WF_AUTH_PASSWORD_HASH=$$argon2id$$...` | Alternative: double every `$`                    |
+  | Docker Compose YAML inline         | `HASH: '$$argon2id$$v=19$$...'`         | Double every `$` to escape Compose interpolation |
+  | `docker run` (single quotes)       | `-e HASH='$argon2id$...'`               | Single quotes prevent shell expansion            |
+  | `docker run` (double quotes)       | `-e HASH="\$argon2id\$..."`             | Backslash-escape each `$`                        |
 
 - Sessions are cookie-based (`HttpOnly`, `SameSite=Lax`, `Path=/api`). The login
   endpoint sets the session cookie automatically — no token is exposed to
@@ -324,7 +331,7 @@ The server accepts the same `WF_*` environment variables as documented in the
 or via `.env.web`:
 
 ```bash
-WF_LISTEN_ADDR=127.0.0.1:8080 WF_DB_PATH=./db/app.db cargo run --manifest-path apps/server/Cargo.toml
+WF_LISTEN_ADDR=127.0.0.1:8088 WF_DB_PATH=./db/app.db cargo run --manifest-path apps/server/Cargo.toml
 ```
 
 See [Web Mode Configuration](#configuration) for a complete list of supported
@@ -339,11 +346,15 @@ You can either pull the official Docker image or build it yourself locally.
 The latest server build is published to Docker Hub.
 
 ```bash
-docker pull afadil/wealthfolio:latest
+docker pull wealthfolio/wealthfolio:latest
 ```
 
-After pulling, use `afadil/wealthfolio:latest` in the run commands below. If you
-build the image locally, swap the image name back to `wealthfolio`.
+After pulling, use `wealthfolio/wealthfolio:latest` in the run commands below.
+If you build the image locally, swap the image name back to `wealthfolio`.
+
+> **Legacy image:** the same build is also mirrored to `afadil/wealthfolio` so
+> existing `compose.yml` files keep working. New deployments should prefer
+> `wealthfolio/wealthfolio`.
 
 ### Building the Image
 
@@ -372,25 +383,26 @@ You can configure the container using either:
 1. **Environment variables** (inline with `-e` flag)
 2. **Environment file** (using `--env-file` flag)
 
-**Option 1: Create an environment file** (recommended for production):
+**Option 1: Create a Docker Compose environment file** (recommended for
+production):
 
 ```bash
-# Create a Docker-specific environment file
-cat > .env.docker << 'EOF'
+SECRET=$(openssl rand -base64 32)
+HASH=$(printf 'your-password' | argon2 yoursalt16chars! -id -e)
+
+cat > .env.docker << EOF
 WF_LISTEN_ADDR=0.0.0.0:8088
 WF_DB_PATH=/data/wealthfolio.db
-WF_SECRET_KEY=<generate-with-openssl-rand>
-WF_CORS_ALLOW_ORIGINS=https://wealthfolio.example.com
+WF_SECRET_KEY='${SECRET}'
+WF_AUTH_PASSWORD_HASH='${HASH}'
+WF_CORS_ALLOW_ORIGINS=http://localhost:8088
 WF_REQUEST_TIMEOUT_MS=30000
 WF_STATIC_DIR=dist
 EOF
 ```
 
-Generate and add your secret key:
-
-```bash
-echo "WF_SECRET_KEY=$(openssl rand -base64 32)" >> .env.docker
-```
+Set `WF_CORS_ALLOW_ORIGINS` to the exact URL you will use in your browser, such
+as `http://192.168.1.10:8088` or `https://wealthfolio.example.com`.
 
 **Option 2: Use inline environment variables** (simpler for testing):
 
@@ -398,33 +410,75 @@ See examples below for inline configuration.
 
 ### Running the Container
 
-All examples below use the published image (`afadil/wealthfolio:latest`). If you
-built locally, substitute your local tag (e.g., `wealthfolio`).
+All examples below use the published image (`wealthfolio/wealthfolio:latest`).
+If you built locally, substitute your local tag (e.g., `wealthfolio`).
 
-**Using environment file** (recommended):
+**Docker Compose** (recommended):
+
+```bash
+docker compose --env-file .env.docker up -d
+```
+
+This publishes the app at `http://localhost:8088` by default. Set `WF_PORT` to
+change the host port:
+
+```bash
+WF_PORT=8090 docker compose --env-file .env.docker up -d
+```
+
+**Docker Compose behind a reverse proxy**:
+
+```bash
+docker compose --env-file .env.docker -f compose.yml -f compose.proxy.yml up -d
+```
+
+Use this when the proxy runs on the same Docker network and forwards traffic to
+`http://wealthfolio:8088`.
+
+**Using Docker CLI environment file**:
+
+Docker CLI `--env-file` keeps `$` characters as-is, so use raw values without
+Compose escaping:
+
+```bash
+SECRET=$(openssl rand -base64 32)
+HASH=$(printf 'your-password' | argon2 yoursalt16chars! -id -e)
+
+cat > .env.docker-run << EOF
+WF_LISTEN_ADDR=0.0.0.0:8088
+WF_DB_PATH=/data/wealthfolio.db
+WF_SECRET_KEY=${SECRET}
+WF_AUTH_PASSWORD_HASH=${HASH}
+WF_CORS_ALLOW_ORIGINS=http://localhost:8088
+WF_REQUEST_TIMEOUT_MS=30000
+WF_STATIC_DIR=dist
+EOF
+```
 
 ```bash
 docker run --rm -d \
   --name wealthfolio \
-  --env-file .env.docker \
+  --env-file .env.docker-run \
   -p 8088:8088 \
-  -v "$(pwd)/wealthfolio-data:/data" \
-  afadil/wealthfolio:latest
+  -v wealthfolio-data:/data \
+  wealthfolio/wealthfolio:latest
 ```
 
-**Basic usage** (inline environment variables):
+**Basic usage** (inline environment variables, testing only):
 
 ```bash
 docker run --rm -d \
   --name wealthfolio \
   -e WF_LISTEN_ADDR=0.0.0.0:8088 \
   -e WF_DB_PATH=/data/wealthfolio.db \
+  -e WF_SECRET_KEY="$(openssl rand -base64 32)" \
+  -e WF_AUTH_REQUIRED=false \
   -p 8088:8088 \
-  -v "$(pwd)/wealthfolio-data:/data" \
-  afadil/wealthfolio:latest
+  -v wealthfolio-data:/data \
+  wealthfolio/wealthfolio:latest
 ```
 
-**Development mode** (with CORS for local Vite dev server):
+**Development mode** (with CORS for local Vite dev server, no built-in auth):
 
 ```bash
 docker run --rm -it \
@@ -432,9 +486,11 @@ docker run --rm -it \
   -e WF_LISTEN_ADDR=0.0.0.0:8088 \
   -e WF_DB_PATH=/data/wealthfolio.db \
   -e WF_CORS_ALLOW_ORIGINS=http://localhost:1420 \
+  -e WF_SECRET_KEY="$(openssl rand -base64 32)" \
+  -e WF_AUTH_REQUIRED=false \
   -p 8088:8088 \
-  -v "$(pwd)/wealthfolio-data:/data" \
-  afadil/wealthfolio:latest
+  -v wealthfolio-data:/data \
+  wealthfolio/wealthfolio:latest
 ```
 
 **Production with encryption** (recommended):
@@ -444,10 +500,12 @@ docker run --rm -d \
   --name wealthfolio \
   -e WF_LISTEN_ADDR=0.0.0.0:8088 \
   -e WF_DB_PATH=/data/wealthfolio.db \
-  -e WF_SECRET_KEY=$(openssl rand -base64 32) \
+  -e WF_SECRET_KEY="$(openssl rand -base64 32)" \
+  -e WF_AUTH_PASSWORD_HASH="$(printf 'your-password' | argon2 yoursalt16chars! -id -e)" \
+  -e WF_CORS_ALLOW_ORIGINS=https://wealthfolio.example.com \
   -p 8088:8088 \
-  -v "$(pwd)/wealthfolio-data:/data" \
-  afadil/wealthfolio:latest
+  -v wealthfolio-data:/data \
+  wealthfolio/wealthfolio:latest
 ```
 
 ### Environment Variables
@@ -504,7 +562,7 @@ steps and provides an isolated environment with all necessary dependencies.
 
 1. **Clone the repository** (if you haven't already):
    ```bash
-   git clone https://github.com/afadil/wealthfolio.git
+   git clone https://github.com/wealthfolio/wealthfolio.git
    cd wealthfolio
    ```
 2. **Open in VS Code**:
@@ -562,12 +620,15 @@ Your addon will be automatically discovered and loaded with hot reload support!
 - **⚡ Hot Reload**: Seamless development experience
 - **🔒 Permission System**: Transparent security with user consent
 
-### Example Addons
+### Official Addons
 
-Check out the [addons/](addons/) directory for sample addons including:
+Check out the
+[official addon repository](https://github.com/wealthfolio/wealthfolio-addons/tree/main/official)
+for maintained addon examples including:
 
 - **Goal Progress Tracker**: Visual goal tracking with calendar like interface
 - **Investment Fees Tracker**: Track and analyze investment fees
+- **Swingfolio**: Track swing trading performance and open positions
 
 ### Resources
 
@@ -640,10 +701,6 @@ wealthfolio/
 │   ├── market-data/             # Market data providers
 │   ├── connect/                 # External service integrations
 │   └── device-sync/             # Device sync functionality
-├── addons/                      # Example addons
-│   ├── goal-progress-tracker/   # Goal tracking addon
-│   ├── investment-fees-tracker/ # Fees tracking addon
-│   └── swingfolio/              # Trading addon
 ├── packages/                    # Shared TypeScript packages
 │   ├── addon-sdk/               # Addon SDK for developers
 │   ├── addon-dev-tools/         # CLI and dev server for addons
@@ -659,6 +716,10 @@ wealthfolio/
 ├── pnpm-workspace.yaml          # pnpm workspace config
 └── tsconfig.json                # TypeScript config
 ```
+
+Official and community addon source lives in the separate
+[wealthfolio-addons](https://github.com/wealthfolio/wealthfolio-addons)
+repository.
 
 ### Security & Data Storage
 
@@ -717,6 +778,6 @@ licensed under AGPL-3.0; trademarks are not granted under that license.
 
 ## 🌟 Star History
 
-## [![Star History Chart](https://api.star-history.com/svg?repos=afadil/wealthfolio&type=Timeline)](https://star-history.com/#afadil/wealthfolio&Date)
+## [![Star History Chart](https://api.star-history.com/svg?repos=wealthfolio/wealthfolio&type=Timeline)](https://star-history.com/#wealthfolio/wealthfolio&Date)
 
 Enjoy managing your wealth with **Wealthfolio**! 🚀
