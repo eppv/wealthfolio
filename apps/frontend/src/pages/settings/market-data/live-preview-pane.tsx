@@ -1,21 +1,29 @@
+import type { TFunction } from "i18next";
 import { useMemo, useState } from "react";
 import { type UseFormReturn } from "react-hook-form";
+import { useTranslation } from "react-i18next";
 
 import { Button } from "@wealthfolio/ui/components/ui/button";
-import { Icons } from "@wealthfolio/ui/components/ui/icons";
-import { Input } from "@wealthfolio/ui/components/ui/input";
-import { Label } from "@wealthfolio/ui/components/ui/label";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@wealthfolio/ui/components/ui/collapsible";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import { Input } from "@wealthfolio/ui/components/ui/input";
+import { Label } from "@wealthfolio/ui/components/ui/label";
 
 import type { DetectedHtmlTable } from "@/lib/types/custom-provider";
 import { cn } from "@/lib/utils";
 
-import { RawResponseViewer } from "./response-preview";
+import { useNumberFormatting, type FormattingApi } from "@wealthfolio/ui";
 import type { FormValues, SourceKey } from "./custom-provider-form";
+import { RawResponseViewer } from "./response-preview";
+import {
+  expandTemplatePlaceholders,
+  resolveTemplatePlaceholder,
+  type TemplatePlaceholderValues,
+} from "./template-placeholders";
 import type { MappingField, SourceRuntime } from "./use-source-runtime";
 
 interface LivePreviewPaneProps {
@@ -26,32 +34,79 @@ interface LivePreviewPaneProps {
 
 const MAPPING_META: {
   field: MappingField;
-  label: string;
+  labelKey: string;
   color: string;
   required: boolean;
 }[] = [
-  { field: "pricePath", label: "Price", color: "bg-emerald-500", required: true },
-  { field: "datePath", label: "As of", color: "bg-sky-500", required: false },
-  { field: "currencyPath", label: "Currency", color: "bg-amber-500", required: false },
-  { field: "openPath", label: "Open", color: "bg-yellow-500", required: false },
-  { field: "highPath", label: "High", color: "bg-orange-500", required: false },
-  { field: "lowPath", label: "Low", color: "bg-rose-500", required: false },
-  { field: "volumePath", label: "Volume", color: "bg-violet-500", required: false },
+  {
+    field: "pricePath",
+    labelKey: "settings:market_data_page.field_price",
+    color: "bg-emerald-500",
+    required: true,
+  },
+  {
+    field: "datePath",
+    labelKey: "settings:market_data_page.field_as_of",
+    color: "bg-sky-500",
+    required: false,
+  },
+  {
+    field: "currencyPath",
+    labelKey: "settings:market_data_page.field_currency",
+    color: "bg-amber-500",
+    required: false,
+  },
+  {
+    field: "openPath",
+    labelKey: "settings:market_data_page.field_open",
+    color: "bg-yellow-500",
+    required: false,
+  },
+  {
+    field: "highPath",
+    labelKey: "settings:market_data_page.field_high",
+    color: "bg-orange-500",
+    required: false,
+  },
+  {
+    field: "lowPath",
+    labelKey: "settings:market_data_page.field_low",
+    color: "bg-rose-500",
+    required: false,
+  },
+  {
+    field: "volumePath",
+    labelKey: "settings:market_data_page.field_volume",
+    color: "bg-violet-500",
+    required: false,
+  },
 ];
 
 /** Inline chips replacing placeholders in the preview URL. */
-function PreviewUrl({ template, values }: { template: string; values: Record<string, string> }) {
+function PreviewUrl({
+  template,
+  values,
+  multiline,
+  placeholder,
+}: {
+  template: string;
+  values: TemplatePlaceholderValues;
+  multiline?: boolean;
+  placeholder?: string;
+}) {
+  const { t } = useTranslation();
   const segments = useMemo(() => {
     if (!template) return [];
-    const re = /\{([A-Za-z:%\-_]+)\}/g;
+    const re = /\{([A-Za-z]+)(?::([^}]+))?\}/g;
     const out: { kind: "text" | "chip"; text: string; value?: string }[] = [];
     let last = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(template))) {
       if (m.index > last) out.push({ kind: "text", text: template.slice(last, m.index) });
       const key = m[1];
-      const value = values[key] || values[key.toUpperCase()];
-      out.push({ kind: "chip", text: key, value });
+      const format = m[2];
+      const value = resolveTemplatePlaceholder(key, format, values);
+      out.push({ kind: "chip", text: format ? `${key}:${format}` : key, value });
       last = m.index + m[0].length;
     }
     if (last < template.length) out.push({ kind: "text", text: template.slice(last) });
@@ -61,13 +116,13 @@ function PreviewUrl({ template, values }: { template: string; values: Record<str
   if (!template) {
     return (
       <span className="text-muted-foreground/60 font-mono text-xs italic">
-        Enter a URL template to preview the request…
+        {placeholder ?? t("settings:market_data_page.enter_url_to_preview")}
       </span>
     );
   }
 
   return (
-    <span className="break-all font-mono text-xs">
+    <span className={cn("break-all font-mono text-xs", multiline && "whitespace-pre-wrap")}>
       {segments.map((seg, i) =>
         seg.kind === "text" ? (
           <span key={i}>{seg.text}</span>
@@ -98,11 +153,12 @@ function StatusPill({
   status: { code: number; ok: boolean } | null;
   error: string | null;
 }) {
+  const { t } = useTranslation();
   if (isFetching) {
     return (
       <span className="text-muted-foreground inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-xs">
         <Icons.Spinner className="h-3 w-3 animate-spin" />
-        Fetching
+        {t("settings:market_data_page.fetching")}
       </span>
     );
   }
@@ -110,7 +166,7 @@ function StatusPill({
     return (
       <span className="text-destructive border-destructive/40 bg-destructive/10 inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-xs">
         <span className="bg-destructive h-1.5 w-1.5 rounded-full" />
-        Error
+        {t("settings:market_data_page.status_error")}
       </span>
     );
   }
@@ -118,30 +174,33 @@ function StatusPill({
     return (
       <span className="text-success border-success/40 bg-success/10 inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-xs">
         <span className="bg-success h-1.5 w-1.5 rounded-full" />
-        {status.code} OK
+        {t("settings:market_data_page.status_ok", { code: status.code })}
       </span>
     );
   }
   return (
     <span className="text-muted-foreground inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-xs">
       <span className="bg-muted-foreground/40 h-1.5 w-1.5 rounded-full" />
-      Idle
+      {t("settings:market_data_page.status_idle")}
     </span>
   );
 }
 
 function EmptyResponseState() {
+  const { t } = useTranslation();
   return (
     <div className="flex min-h-[220px] flex-col items-center justify-center gap-3 rounded-xl border border-dashed p-6 text-center">
       <Icons.Target className="text-muted-foreground/40 h-6 w-6" />
       <div className="space-y-1">
         <p className="text-muted-foreground text-sm">
-          Fill in the URL, then press{" "}
-          <span className="bg-muted rounded px-1.5 py-0.5 font-mono text-[11px]">Fetch</span> to
-          test.
+          {t("settings:market_data_page.empty_response_before")}
+          <span className="bg-muted rounded px-1.5 py-0.5 font-mono text-[11px]">
+            {t("settings:market_data_page.fetch")}
+          </span>
+          {t("settings:market_data_page.empty_response_after")}
         </p>
         <p className="text-muted-foreground/70 text-xs">
-          Response previews appear here, and you can click any value to map it.
+          {t("settings:market_data_page.empty_response_line2")}
         </p>
       </div>
     </div>
@@ -173,6 +232,7 @@ function HtmlTableResponse({
   tables: DetectedHtmlTable[];
   runtime: SourceRuntime;
 }) {
+  const { t } = useTranslation();
   const [activeIndex, setActiveIndex] = useState(0);
   const table = tables[activeIndex] ?? tables[0];
   if (!table) return null;
@@ -206,11 +266,11 @@ function HtmlTableResponse({
       {/* Table selector — shown always when html_table, as a legend + switcher */}
       <div className="flex flex-wrap items-center gap-1">
         <span className="text-muted-foreground mr-1 text-[11px] font-medium uppercase tracking-wide">
-          Table
+          {t("settings:market_data_page.table")}
         </span>
-        {tables.map((t, i) => (
+        {tables.map((tbl, i) => (
           <button
-            key={t.index}
+            key={tbl.index}
             type="button"
             onClick={() => handleSwitchTable(i)}
             className={cn(
@@ -219,14 +279,23 @@ function HtmlTableResponse({
                 ? "bg-background border-foreground/30 shadow-sm"
                 : "bg-muted/30 text-muted-foreground hover:bg-muted/50 border-transparent",
             )}
-            title={`${t.columns.length} cols · ${t.rowCount} rows`}
+            title={t("settings:market_data_page.table_cols_rows_title", {
+              cols: tbl.columns.length,
+              rows: tbl.rowCount,
+            })}
           >
             {i + 1}
           </button>
         ))}
         <span className="text-muted-foreground ml-auto text-xs">
-          {table.rowCount} rows · click a column header to map
-          {runtime.armedField ? ` to ${labelForField(runtime.armedField)}` : ""}
+          {runtime.armedField
+            ? t("settings:market_data_page.table_click_column_to_map_field", {
+                count: table.rowCount,
+                field: labelForField(runtime.armedField, t),
+              })
+            : t("settings:market_data_page.table_click_column_to_map", {
+                count: table.rowCount,
+              })}
         </span>
       </div>
 
@@ -242,7 +311,8 @@ function HtmlTableResponse({
                     className="hover:text-foreground group flex flex-col items-start gap-1 text-left"
                   >
                     <span className="text-foreground text-xs font-medium">
-                      {col.header || `Col ${col.index}`}
+                      {col.header ||
+                        t("settings:market_data_page.column_index", { index: col.index })}
                     </span>
                     {col.role && (
                       <span
@@ -277,6 +347,7 @@ function HtmlTableResponse({
 }
 
 function CsvResponse({ raw, runtime }: { raw: string; runtime: SourceRuntime }) {
+  const { t } = useTranslation();
   const { headers, rows } = useMemo(() => parseCsv(raw), [raw]);
   if (headers.length === 0) {
     return (
@@ -294,8 +365,12 @@ function CsvResponse({ raw, runtime }: { raw: string; runtime: SourceRuntime }) 
   return (
     <div className="space-y-2">
       <p className="text-muted-foreground text-xs">
-        {rows.length} rows detected. Click a column header to map it
-        {runtime.armedField ? ` to ${labelForField(runtime.armedField)}` : ""}.
+        {runtime.armedField
+          ? t("settings:market_data_page.csv_rows_detected_field", {
+              count: rows.length,
+              field: labelForField(runtime.armedField, t),
+            })
+          : t("settings:market_data_page.csv_rows_detected", { count: rows.length })}
       </p>
       <div className="bg-background max-h-[420px] overflow-auto rounded-lg border">
         <table className="w-full text-xs">
@@ -362,11 +437,15 @@ function inferCsvFieldFromHeader(h: string): MappingField {
   return "pricePath";
 }
 
-function labelForField(f: MappingField): string {
-  return MAPPING_META.find((m) => m.field === f)?.label ?? f;
+function labelForField(f: MappingField, t: TFunction): string {
+  const meta = MAPPING_META.find((m) => m.field === f);
+  return meta ? t(meta.labelKey) : f;
 }
 
 function HtmlElementsResponse({ runtime }: { runtime: SourceRuntime }) {
+  const numberFormatting = useNumberFormatting();
+
+  const { t } = useTranslation();
   const [showAll, setShowAll] = useState(false);
   const max = 10;
   const list = showAll ? runtime.detectedElements : runtime.detectedElements.slice(0, max);
@@ -375,8 +454,14 @@ function HtmlElementsResponse({ runtime }: { runtime: SourceRuntime }) {
   return (
     <div className="space-y-2">
       <p className="text-muted-foreground text-xs">
-        {runtime.detectedElements.length} elements detected. Click one to assign its selector
-        {runtime.armedField ? ` to ${labelForField(runtime.armedField)}` : ""}.
+        {runtime.armedField
+          ? t("settings:market_data_page.elements_detected_field", {
+              count: runtime.detectedElements.length,
+              field: labelForField(runtime.armedField, t),
+            })
+          : t("settings:market_data_page.elements_detected", {
+              count: runtime.detectedElements.length,
+            })}
       </p>
       <div className="max-h-[420px] space-y-2 overflow-y-auto">
         {list.map((el) => (
@@ -398,7 +483,7 @@ function HtmlElementsResponse({ runtime }: { runtime: SourceRuntime }) {
               )}
             </div>
             <span className="shrink-0 pt-0.5 font-mono text-base font-semibold tabular-nums">
-              {formatNumber(el.value)}
+              {formatNumber(el.value, numberFormatting)}
             </span>
           </button>
         ))}
@@ -409,20 +494,23 @@ function HtmlElementsResponse({ runtime }: { runtime: SourceRuntime }) {
           onClick={() => setShowAll(true)}
           className="text-muted-foreground hover:text-foreground text-xs underline underline-offset-2"
         >
-          Show {runtime.detectedElements.length - max} more elements
+          {t("settings:market_data_page.show_more_elements", {
+            count: runtime.detectedElements.length - max,
+          })}
         </button>
       )}
     </div>
   );
 }
 
-function formatNumber(n: number): string {
-  if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-  if (n !== Math.floor(n)) return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+function formatNumber(n: number, formatting: Pick<FormattingApi, "formatDecimal">): string {
+  if (Math.abs(n) >= 1000) return formatting.formatDecimal(n, { maximumFractionDigits: 2 });
+  if (n !== Math.floor(n)) return formatting.formatDecimal(n, { maximumFractionDigits: 6 });
   return String(n);
 }
 
 function CopyButton({ text, disabled }: { text: string; disabled?: boolean }) {
+  const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const handleCopy = async () => {
     if (disabled || !text) return;
@@ -439,7 +527,9 @@ function CopyButton({ text, disabled }: { text: string; disabled?: boolean }) {
       type="button"
       onClick={handleCopy}
       disabled={disabled}
-      title={copied ? "Copied!" : "Copy URL"}
+      title={
+        copied ? t("settings:market_data_page.copied") : t("settings:market_data_page.copy_url")
+      }
       className="text-muted-foreground hover:text-foreground hover:bg-muted/50 absolute right-1.5 top-1.5 flex h-7 w-7 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-40"
     >
       {copied ? (
@@ -460,6 +550,7 @@ function ExtractedRow({
   label: string;
   display: React.ReactNode;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="flex items-center gap-3 px-3 py-2">
       <span className={cn("h-2 w-2 shrink-0 rounded-sm", color)} />
@@ -467,7 +558,11 @@ function ExtractedRow({
         {label}
       </span>
       <span className="text-foreground min-w-0 flex-1 truncate text-sm font-semibold">
-        {display ?? <span className="text-muted-foreground/60 italic">— not returned</span>}
+        {display ?? (
+          <span className="text-muted-foreground/60 italic">
+            {t("settings:market_data_page.not_returned")}
+          </span>
+        )}
       </span>
       {display && <Icons.CheckCircle className="text-success h-3.5 w-3.5 shrink-0" />}
     </div>
@@ -510,6 +605,7 @@ function FieldMappingRow({
   armed: boolean;
   onArm: () => void;
 }) {
+  const { t } = useTranslation();
   const assigned = !!value;
   return (
     <button
@@ -537,7 +633,7 @@ function FieldMappingRow({
           assigned ? "text-foreground" : "text-muted-foreground/70 italic",
         )}
       >
-        {assigned ? value : "unassigned — click to pick"}
+        {assigned ? value : t("settings:market_data_page.unassigned_click_to_pick")}
       </span>
       {required ? (
         <span
@@ -546,11 +642,11 @@ function FieldMappingRow({
             assigned ? "text-muted-foreground" : "text-destructive",
           )}
         >
-          Required
+          {t("settings:market_data_page.required")}
         </span>
       ) : (
         <span className="text-muted-foreground shrink-0 text-[10px] font-medium uppercase tracking-wide">
-          Optional
+          {t("settings:market_data_page.optional")}
         </span>
       )}
     </button>
@@ -558,6 +654,8 @@ function FieldMappingRow({
 }
 
 export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps) {
+  const formatting = useNumberFormatting();
+  const { t } = useTranslation();
   const [moreFieldsOpen, setMoreFieldsOpen] = useState(false);
   const format = form.watch(`${prefix}.format`) ?? "json";
   const pricePath = form.watch(`${prefix}.pricePath`);
@@ -581,7 +679,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
   const { inputs, setInputs, extraPlaceholders, isHistorical } = runtime;
   const previewCurrency = inputs.currency.trim() || "USD";
 
-  const previewValues: Record<string, string> = {
+  const previewValues: TemplatePlaceholderValues = {
     SYMBOL: inputs.symbol,
     ISIN: inputs.isin,
     MIC: inputs.mic,
@@ -591,6 +689,10 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
     FROM: inputs.from,
     TO: inputs.to,
   };
+
+  const method = form.watch(`${prefix}.method`) ?? "GET";
+  const bodyTemplate = form.watch(`${prefix}.body`) ?? "";
+  const expandedBody = expandTemplatePlaceholders(bodyTemplate, previewValues);
 
   const missingRange = isHistorical && (!inputs.from || !inputs.to);
   const fetchDisabled =
@@ -603,9 +705,11 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
         <div className="space-y-0.5">
-          <h3 className="text-base font-semibold">Live request &amp; response</h3>
+          <h3 className="text-base font-semibold">
+            {t("settings:market_data_page.live_request_response")}
+          </h3>
           <p className="text-muted-foreground text-xs">
-            Every change reflects here instantly. Click any value below to map it.
+            {t("settings:market_data_page.live_reflects_instantly")}
           </p>
         </div>
         <StatusPill
@@ -619,10 +723,14 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <Label className="text-muted-foreground text-[11px] font-medium uppercase tracking-wide">
-            Request URL (preview)
+            {t("settings:market_data_page.request_url_preview")}
           </Label>
           <span className="text-muted-foreground text-[11px]">
-            GET · {isHistorical ? "historical" : "latest"}
+            {form.watch(`${prefix}.method`) === "POST" ? "POST" : "GET"}
+            &nbsp;·&nbsp;
+            {isHistorical
+              ? t("settings:market_data_page.method_historical")
+              : t("settings:market_data_page.method_latest")}
           </span>
         </div>
         <div className="bg-background relative min-h-[40px] rounded-lg border px-3 py-2 pr-10">
@@ -631,18 +739,39 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
         </div>
       </section>
 
+      {/* Request body preview (POST only) */}
+      {method === "POST" && (
+        <section className="space-y-2">
+          <Label className="text-muted-foreground text-[11px] font-medium uppercase tracking-wide">
+            {t("settings:market_data_page.request_body_preview")}
+          </Label>
+          <div className="bg-background relative min-h-[40px] rounded-lg border px-3 py-2 pr-10">
+            <PreviewUrl
+              template={bodyTemplate}
+              values={previewValues}
+              multiline
+              placeholder={t("settings:market_data_page.enter_body_to_preview")}
+            />
+            <CopyButton text={expandedBody} disabled={!bodyTemplate} />
+          </div>
+        </section>
+      )}
+
       {/* Test inputs */}
       <section className="space-y-2">
         <div className="flex flex-wrap items-end gap-2">
-          <TestField label="Test symbol" className="min-w-[140px] flex-1">
+          <TestField
+            label={t("settings:market_data_page.test_symbol")}
+            className="min-w-[140px] flex-1"
+          >
             <Input
-              placeholder="e.g. AAPL"
+              placeholder={t("settings:market_data_page.test_symbol_placeholder")}
               value={inputs.symbol}
               onChange={(e) => setInputs({ symbol: e.target.value })}
             />
           </TestField>
           {extraPlaceholders.isin && (
-            <TestField label="ISIN" className="w-28">
+            <TestField label={t("settings:market_data_page.field_isin")} className="w-28">
               <Input
                 placeholder="US0378331005"
                 value={inputs.isin}
@@ -651,7 +780,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
             </TestField>
           )}
           {extraPlaceholders.mic && (
-            <TestField label="MIC" className="w-24">
+            <TestField label={t("settings:market_data_page.field_mic")} className="w-24">
               <Input
                 placeholder="XLON"
                 value={inputs.mic}
@@ -660,7 +789,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
             </TestField>
           )}
           {extraPlaceholders.currency && (
-            <TestField label="Currency" className="w-20">
+            <TestField label={t("common:currency")} className="w-20">
               <Input
                 placeholder="USD"
                 value={inputs.currency}
@@ -670,14 +799,14 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
           )}
           {isHistorical && (
             <>
-              <TestField label="From" className="w-36">
+              <TestField label={t("settings:market_data_page.from")} className="w-36">
                 <Input
                   type="date"
                   value={inputs.from}
                   onChange={(e) => setInputs({ from: e.target.value })}
                 />
               </TestField>
-              <TestField label="To" className="w-36">
+              <TestField label={t("settings:market_data_page.to")} className="w-36">
                 <Input
                   type="date"
                   value={inputs.to}
@@ -698,7 +827,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
             ) : (
               <Icons.PlayCircle className="mr-1.5 h-3.5 w-3.5" />
             )}
-            Fetch
+            {t("settings:market_data_page.fetch")}
           </Button>
         </div>
       </section>
@@ -707,12 +836,14 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <Label className="text-muted-foreground text-[11px] font-medium uppercase tracking-wide">
-            Response · {formatLabel}
+            {t("settings:market_data_page.response")} · {formatLabel}
           </Label>
           {runtime.detectedTables[0] && (
             <span className="text-muted-foreground text-[11px]">
-              {runtime.detectedTables[0].rowCount} rows · {runtime.detectedTables[0].columns.length}{" "}
-              cols
+              {t("settings:market_data_page.table_rows_cols", {
+                rows: runtime.detectedTables[0].rowCount,
+                cols: runtime.detectedTables[0].columns.length,
+              })}
             </span>
           )}
         </div>
@@ -725,7 +856,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
                 <p className="text-destructive text-sm">{runtime.fetchError}</p>
                 {/403|forbidden|denied/i.test(runtime.fetchError) && (
                   <p className="text-muted-foreground mt-1 text-xs">
-                    This site may block automated requests. Try adding custom headers.
+                    {t("settings:market_data_page.fetch_error_headers_hint")}
                   </p>
                 )}
               </div>
@@ -760,17 +891,17 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
       {runtime.testResult && (
         <section className="space-y-2">
           <Label className="text-muted-foreground text-[11px] font-medium uppercase tracking-wide">
-            Extracted
+            {t("settings:market_data_page.extracted")}
           </Label>
           {runtime.testResult.success ? (
             <div className="border-success/30 bg-success/5 divide-success/20 divide-y rounded-lg border">
               <ExtractedRow
                 color="bg-emerald-500"
-                label="Price"
+                label={t("settings:market_data_page.field_price")}
                 display={
                   runtime.testResult.price != null ? (
                     <span className="tabular-nums">
-                      {runtime.testResult.price.toLocaleString()}
+                      {formatting.formatDecimal(runtime.testResult.price)}
                       {runtime.testResult.currency && (
                         <span className="text-muted-foreground ml-1.5 text-xs font-normal">
                           {runtime.testResult.currency}
@@ -783,7 +914,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
               {values.datePath && (
                 <ExtractedRow
                   color="bg-sky-500"
-                  label="As of"
+                  label={t("settings:market_data_page.field_as_of")}
                   display={
                     runtime.testResult.date ? (
                       <span className="font-mono text-xs">{runtime.testResult.date}</span>
@@ -794,11 +925,11 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
               {values.openPath && (
                 <ExtractedRow
                   color="bg-yellow-500"
-                  label="Open"
+                  label={t("settings:market_data_page.field_open")}
                   display={
                     runtime.testResult.open != null ? (
                       <span className="tabular-nums">
-                        {runtime.testResult.open.toLocaleString()}
+                        {formatting.formatDecimal(runtime.testResult.open)}
                       </span>
                     ) : null
                   }
@@ -807,11 +938,11 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
               {values.highPath && (
                 <ExtractedRow
                   color="bg-orange-500"
-                  label="High"
+                  label={t("settings:market_data_page.field_high")}
                   display={
                     runtime.testResult.high != null ? (
                       <span className="tabular-nums">
-                        {runtime.testResult.high.toLocaleString()}
+                        {formatting.formatDecimal(runtime.testResult.high)}
                       </span>
                     ) : null
                   }
@@ -820,11 +951,11 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
               {values.lowPath && (
                 <ExtractedRow
                   color="bg-rose-500"
-                  label="Low"
+                  label={t("settings:market_data_page.field_low")}
                   display={
                     runtime.testResult.low != null ? (
                       <span className="tabular-nums">
-                        {runtime.testResult.low.toLocaleString()}
+                        {formatting.formatDecimal(runtime.testResult.low)}
                       </span>
                     ) : null
                   }
@@ -833,11 +964,11 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
               {values.volumePath && (
                 <ExtractedRow
                   color="bg-violet-500"
-                  label="Volume"
+                  label={t("settings:market_data_page.field_volume")}
                   display={
                     runtime.testResult.volume != null ? (
                       <span className="tabular-nums">
-                        {runtime.testResult.volume.toLocaleString()}
+                        {formatting.formatDecimal(runtime.testResult.volume)}
                       </span>
                     ) : null
                   }
@@ -846,7 +977,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
               {values.currencyPath && (
                 <ExtractedRow
                   color="bg-amber-500"
-                  label="Currency"
+                  label={t("common:currency")}
                   display={
                     runtime.testResult.currency ? (
                       <span className="font-mono text-xs">{runtime.testResult.currency}</span>
@@ -859,7 +990,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
             <div className="border-destructive/30 bg-destructive/5 flex items-start gap-3 rounded-lg border p-3">
               <Icons.XCircle className="text-destructive mt-0.5 h-4 w-4 shrink-0" />
               <p className="text-muted-foreground min-w-0 flex-1 text-xs">
-                {runtime.testResult.error ?? "Could not extract a value with the current mapping."}
+                {runtime.testResult.error ?? t("settings:market_data_page.extraction_failed")}
               </p>
             </div>
           )}
@@ -870,10 +1001,12 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <Label className="text-muted-foreground text-[11px] font-medium uppercase tracking-wide">
-            Field mapping ({isHistorical ? "historical" : "latest"})
+            {isHistorical
+              ? t("settings:market_data_page.field_mapping_historical")
+              : t("settings:market_data_page.field_mapping_latest")}
           </Label>
           <span className="text-muted-foreground text-[11px]">
-            click a row to arm it, then click a value in the response
+            {t("settings:market_data_page.field_mapping_hint")}
           </span>
         </div>
 
@@ -882,7 +1015,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
             <FieldMappingRow
               key={m.field}
               field={m.field}
-              label={m.label}
+              label={t(m.labelKey)}
               color={m.color}
               required={m.required}
               value={values[m.field]}
@@ -901,7 +1034,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
               <Icons.ChevronRight
                 className={cn("h-3 w-3 transition-transform", moreFieldsOpen && "rotate-90")}
               />
-              More mapping fields
+              {t("settings:market_data_page.more_mapping_fields")}
             </button>
           </CollapsibleTrigger>
           <CollapsibleContent className="mt-2 space-y-1.5">
@@ -921,7 +1054,7 @@ export function LivePreviewPane({ form, prefix, runtime }: LivePreviewPaneProps)
                 <FieldMappingRow
                   key={m.field}
                   field={m.field}
-                  label={m.label}
+                  label={t(m.labelKey)}
                   color={m.color}
                   required={m.required}
                   value={values[m.field]}

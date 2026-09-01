@@ -1,5 +1,5 @@
 import { expect, Page, test } from "@playwright/test";
-import { BASE_URL, loginIfNeeded } from "./helpers";
+import { BASE_URL, loginIfNeeded, selectFirstAccount } from "./helpers";
 
 test.describe.configure({ mode: "serial" });
 
@@ -42,33 +42,17 @@ test.describe("Activity Form Validation", () => {
     });
   });
 
-  test("3. Deposit — zero amount shows error", async () => {
-    await page.goto(`${BASE_URL}/activities/manage?type=DEPOSIT`, {
+  test("3. Deposit — explicit zero is accepted", async () => {
+    await page.goto(`${BASE_URL}/activities/manage?type=DEPOSIT&redirect-to=%2Factivities`, {
       waitUntil: "domcontentloaded",
     });
-    await page.waitForTimeout(1000);
 
-    // Select an account
-    const accountSelect = page.getByTestId("account-select");
-    await accountSelect.click();
-    const firstOption = page.getByRole("option").first();
-    await expect(firstOption).toBeVisible({ timeout: 5000 });
-    await firstOption.click();
-    await page.waitForTimeout(200);
+    await selectFirstAccount(page);
 
-    // Fill zero amount (the MoneyInput disallows negatives, so use 0 to trigger the error)
-    const amountInput = page.getByTestId("amount-input");
-    await amountInput.fill("0");
-    await amountInput.blur();
-    await page.waitForTimeout(200);
+    await page.getByTestId("amount-input").fill("0");
+    await page.getByRole("button", { name: /Add Deposit/i }).click();
 
-    const submitButton = page.getByRole("button", { name: /Add Deposit/i });
-    await submitButton.click();
-    await page.waitForTimeout(500);
-
-    await expect(
-      page.getByText("Amount must be greater than 0.", { exact: true }).first(),
-    ).toBeVisible({ timeout: 5000 });
+    await expect(page).toHaveURL(`${BASE_URL}/activities`);
   });
 
   test("4. Buy — missing symbol shows error", async () => {
@@ -76,12 +60,7 @@ test.describe("Activity Form Validation", () => {
     await page.waitForTimeout(1000);
 
     // Select an account
-    const accountSelect = page.getByTestId("account-select");
-    await accountSelect.click();
-    const firstOption = page.getByRole("option").first();
-    await expect(firstOption).toBeVisible({ timeout: 5000 });
-    await firstOption.click();
-    await page.waitForTimeout(200);
+    await selectFirstAccount(page);
 
     // Fill quantity and price but NOT symbol
     const quantityInput = page.getByTestId("quantity-input");
@@ -108,12 +87,7 @@ test.describe("Activity Form Validation", () => {
     await page.waitForTimeout(1000);
 
     // Select an account
-    const accountSelect = page.getByTestId("account-select");
-    await accountSelect.click();
-    const firstOption = page.getByRole("option").first();
-    await expect(firstOption).toBeVisible({ timeout: 5000 });
-    await firstOption.click();
-    await page.waitForTimeout(200);
+    await selectFirstAccount(page);
 
     // Fill quantity as 0
     const quantityInput = page.getByTestId("quantity-input");

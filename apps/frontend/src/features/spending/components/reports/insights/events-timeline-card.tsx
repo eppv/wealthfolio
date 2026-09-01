@@ -3,27 +3,31 @@
  * 4-cell summary strip below. The mobile alternative is `events-calendar-card`.
  */
 import { useEffect, useMemo, useRef, useState, type FC } from "react";
+import { useTranslation } from "react-i18next";
 
+import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
+import type { Activity } from "@/lib/types";
+import { cn, parseLocalDate } from "@/lib/utils";
 import {
   Button,
+  calendarDateFromLocalDate,
   Icons,
   PrivacyAmount,
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-  formatCompactAmount,
+  useAmountFormatting,
+  useDateFormatting,
+  type FormattingApi,
 } from "@wealthfolio/ui";
-import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
-import type { Activity } from "@/lib/types";
-import { cn, parseLocalDate } from "@/lib/utils";
 
-import { useEventDialog } from "../../event-dialog-provider";
 import { useEventsAggregate } from "../../../hooks/use-events-aggregate";
 import { getActivitySpendingAmount } from "../../../lib/constants";
 import { inclusiveDays } from "../../../lib/date-utils";
 import type { EventSpendingSummary } from "../../../types/event";
+import { useEventDialog } from "../../event-dialog-provider";
 import { getEventColors } from "./event-colors";
-import { CARD_CLASS, LABEL_CLASS, MONTH_LABELS } from "./insights-shared";
+import { CARD_CLASS, LABEL_CLASS } from "./insights-shared";
 
 export interface EventsTimelineCardProps {
   events: EventSpendingSummary[];
@@ -56,6 +60,9 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
   onPrevWindow,
   onNextWindow,
 }) => {
+  const amountFormatting = useAmountFormatting();
+  const dateFormatting = useDateFormatting();
+  const { t: tr } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const { openEventDialog } = useEventDialog();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -213,7 +220,7 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
       const c = getEventColors(ev);
       map.set(ev.eventTypeId, {
         id: ev.eventTypeId,
-        name: ev.eventTypeName ?? "Event",
+        name: ev.eventTypeName ?? tr("spending:eventsCard.title"),
         stroke: c.stroke,
         fill: c.fill,
       });
@@ -226,10 +233,14 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
       {/* HEADER */}
       <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
         <div>
-          <div className="text-foreground text-base font-semibold tracking-tight">Events</div>
+          <div className="text-foreground text-base font-semibold tracking-tight">
+            {tr("spending:eventsCard.title")}
+          </div>
           <div className="text-muted-foreground/80 mt-0.5 text-[11px]">
-            {events.length} tagged event{events.length === 1 ? "" : "s"} across{" "}
-            {computed.totalEventDays} days · click any band to inspect
+            {tr("spending:timeline.headerSummary", {
+              events: tr("spending:timeline.taggedEvents", { count: events.length }),
+              days: computed.totalEventDays,
+            })}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
@@ -251,21 +262,21 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
                 <Button
                   variant="outline"
                   size="icon"
-                  aria-label="Previous period"
+                  aria-label={tr("spending:timeline.previousPeriod")}
                   className="h-7 w-7 rounded-full"
                   onClick={onPrevWindow}
                 >
                   <Icons.ChevronLeft className="h-3.5 w-3.5" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>Previous period</TooltipContent>
+              <TooltipContent>{tr("spending:timeline.previousPeriod")}</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   variant="outline"
                   size="icon"
-                  aria-label="Next period"
+                  aria-label={tr("spending:timeline.nextPeriod")}
                   className="h-7 w-7 rounded-full"
                   onClick={onNextWindow}
                   disabled={windowOffset === 0}
@@ -274,7 +285,9 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                {windowOffset === 0 ? "Already at current period" : "Next period"}
+                {windowOffset === 0
+                  ? tr("spending:timeline.alreadyCurrent")
+                  : tr("spending:timeline.nextPeriod")}
               </TooltipContent>
             </Tooltip>
           </div>
@@ -283,7 +296,7 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
               <Button
                 variant="outline"
                 size="icon"
-                aria-label="Create event"
+                aria-label={tr("spending:events.createEvent")}
                 className="h-7 w-7 rounded-full"
                 onClick={() =>
                   openEventDialog({
@@ -295,7 +308,7 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
                 <Icons.Plus className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Create event</TooltipContent>
+            <TooltipContent>{tr("spending:events.createEvent")}</TooltipContent>
           </Tooltip>
         </div>
       </div>
@@ -306,7 +319,11 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
           {/* Month gridlines + labels */}
           {months.map((m, i) => {
             const x = padL + m.idx * dayW;
-            const showYear = m.label === "JAN" || i === 0;
+            const showYear = m.date.getMonth() === 0 || i === 0;
+            const label = dateFormatting.formatCalendarDate(calendarDateFromLocalDate(m.date), {
+              month: "short",
+              ...(showYear ? { year: "numeric" } : {}),
+            });
             return (
               <g key={i}>
                 <line
@@ -325,8 +342,7 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
                   fontSize={10}
                   letterSpacing={0.5}
                 >
-                  {m.label}
-                  {showYear ? ` ${m.year}` : ""}
+                  {label}
                 </text>
               </g>
             );
@@ -350,7 +366,10 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
                 fontSize={9}
                 className="fill-muted-foreground"
               >
-                {isBalanceHidden ? "••••" : formatCompactAmount(computed.normalPace, currency)}/d
+                {isBalanceHidden
+                  ? "••••"
+                  : amountFormatting.formatCompactAmount(computed.normalPace, currency)}
+                {tr("spending:eventDetail.perDayShort")}
               </text>
             </>
           )}
@@ -478,10 +497,12 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
                       className={lift >= 0 ? "fill-destructive" : "fill-success"}
                     >
                       {lift >= 0 ? "+" : "−"}
-                      {isBalanceHidden ? "••••" : formatCompactAmount(Math.abs(lift), currency)}
+                      {isBalanceHidden
+                        ? "••••"
+                        : amountFormatting.formatCompactAmount(Math.abs(lift), currency)}
                     </text>
                     <text x={x1 + 8} y={bandY + 46} fontSize={9} className="fill-muted-foreground">
-                      {days}D · {kindLabel}
+                      {tr("spending:timeline.daysUpper", { count: days })} · {kindLabel}
                     </text>
                   </>
                 ) : (
@@ -526,14 +547,14 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
               />
               <circle cx={todayX} cy={4} r={3} fill="var(--event-today)" />
               <text x={todayX + 6} y={14} fontSize={9.5} fontWeight={600} fill="var(--event-today)">
-                TODAY
+                {tr("spending:timeline.today")}
               </text>
             </>
           )}
 
           {/* Bookend dates */}
           <text x={padL} y={axisTop + 14} fontSize={9.5} className="fill-muted-foreground">
-            {formatBookendDate(rangeStart)}
+            {formatBookendDate(rangeStart, dateFormatting)}
           </text>
           <text
             x={padL + innerW}
@@ -542,7 +563,8 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
             textAnchor="end"
             className="fill-muted-foreground"
           >
-            {formatBookendDate(rangeEnd)} · {periodDays} DAYS
+            {formatBookendDate(rangeEnd, dateFormatting)} ·{" "}
+            {tr("spending:timeline.daysUpper", { count: periodDays })}
           </text>
           <text
             x={padL + innerW / 2}
@@ -551,23 +573,25 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
             textAnchor="middle"
             className="fill-muted-foreground/70"
           >
-            DAILY SPEND
+            {tr("spending:timeline.dailySpend")}
           </text>
         </svg>
       </div>
 
       {/* Summary strip */}
       <div className="border-border/40 mt-3 grid grid-cols-2 gap-x-0 gap-y-3 border-t pt-3 md:grid-cols-4">
-        <SummaryCell label={`ACROSS ${events.length} EVENT${events.length === 1 ? "" : "S"}`}>
+        <SummaryCell label={tr("spending:timeline.acrossEvents", { count: events.length })}>
           <div className="text-foreground text-sm font-semibold tabular-nums tracking-tight">
             <PrivacyAmount value={computed.totalSpent} currency={currency} />
           </div>
           <div className="text-muted-foreground/80 mt-0.5 text-[10px]">
-            {computed.totalEventDays} event-days ·{" "}
-            {Math.round((computed.totalEventDays / periodDays) * 100)}% of period
+            {tr("spending:timeline.eventDaysOfPeriod", {
+              days: computed.totalEventDays,
+              pct: Math.round((computed.totalEventDays / periodDays) * 100),
+            })}
           </div>
         </SummaryCell>
-        <SummaryCell label="COMBINED LIFT" divided>
+        <SummaryCell label={tr("spending:timeline.combinedLift")} divided>
           <div
             className={cn(
               "text-sm font-semibold tabular-nums tracking-tight",
@@ -578,11 +602,11 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
             <PrivacyAmount value={Math.abs(computed.lift)} currency={currency} />
           </div>
           <div className="text-muted-foreground/80 mt-0.5 text-[10px]">
-            on event days, vs normal pace
+            {tr("spending:timeline.onEventDays")}
           </div>
         </SummaryCell>
         {biggest && (
-          <SummaryCell label="BIGGEST EVENT" divided>
+          <SummaryCell label={tr("spending:timeline.biggestEvent")} divided>
             <div className="text-foreground truncate text-sm font-semibold tracking-tight">
               {biggest.eventName}
             </div>
@@ -592,7 +616,7 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
           </SummaryCell>
         )}
         {selected && (
-          <SummaryCell label="SELECTED" divided>
+          <SummaryCell label={tr("spending:timeline.selected")} divided>
             <div className="mt-0.5 inline-flex items-center gap-2">
               <span
                 className="inline-block h-2 w-2 shrink-0 rounded-[2px]"
@@ -609,9 +633,15 @@ export const EventsTimelineCard: FC<EventsTimelineCardProps> = ({
               {formatSelectedRange(
                 parseLocalDate(selected.startDate),
                 parseLocalDate(selected.endDate),
+                dateFormatting,
               )}{" "}
               ·{" "}
-              {inclusiveDays(parseLocalDate(selected.startDate), parseLocalDate(selected.endDate))}D
+              {tr("spending:timeline.daysUpper", {
+                count: inclusiveDays(
+                  parseLocalDate(selected.startDate),
+                  parseLocalDate(selected.endDate),
+                ),
+              })}
             </div>
           </SummaryCell>
         )}
@@ -678,8 +708,7 @@ function buildDailySeries(
 
 interface MonthMarker {
   idx: number;
-  label: string;
-  year: number;
+  date: Date;
 }
 
 function buildMonthMarkers(rangeStart: Date, rangeEnd: Date): MonthMarker[] {
@@ -687,17 +716,28 @@ function buildMonthMarkers(rangeStart: Date, rangeEnd: Date): MonthMarker[] {
   const cursor = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), 1, 12, 0, 0, 0);
   while (cursor <= rangeEnd) {
     const idx = Math.round((cursor.getTime() - rangeStart.getTime()) / 86_400_000);
-    out.push({ idx, label: MONTH_LABELS[cursor.getMonth()], year: cursor.getFullYear() });
+    out.push({ idx, date: new Date(cursor) });
     cursor.setMonth(cursor.getMonth() + 1);
   }
   return out;
 }
 
-function formatBookendDate(d: Date): string {
-  return `${MONTH_LABELS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+function formatBookendDate(d: Date, formatting: Pick<FormattingApi, "formatCalendarDate">): string {
+  return formatting.formatCalendarDate(calendarDateFromLocalDate(d), {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
 }
 
-function formatSelectedRange(start: Date, end: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(start.getMonth() + 1)}/${pad(start.getDate())} – ${pad(end.getMonth() + 1)}/${pad(end.getDate())}`;
+function formatSelectedRange(
+  start: Date,
+  end: Date,
+  formatting: Pick<FormattingApi, "formatCalendarDateRange">,
+): string {
+  return formatting.formatCalendarDateRange(
+    calendarDateFromLocalDate(start),
+    calendarDateFromLocalDate(end),
+    { month: "2-digit", day: "2-digit" },
+  );
 }

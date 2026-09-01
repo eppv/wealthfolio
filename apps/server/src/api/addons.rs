@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
-use crate::{error::ApiResult, main_lib::AppState};
+use crate::{
+    error::{ApiError, ApiResult},
+    main_lib::AppState,
+};
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::Response,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -20,6 +25,8 @@ struct InstallZipBody {
     zip_data_b64: Option<String>,
     #[serde(rename = "enableAfterInstall")]
     enable_after_install: Option<bool>,
+    #[serde(rename = "approvedNetworkHosts")]
+    approved_network_hosts: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -35,7 +42,11 @@ async fn install_addon_zip_web(
     let zip_bytes = decode_zip_data(body.zip_data, body.zip_data_b64)?;
     let metadata = state
         .addon_service
-        .install_addon_zip(zip_bytes, body.enable_after_install.unwrap_or(true))
+        .install_addon_zip(
+            zip_bytes,
+            body.enable_after_install.unwrap_or(true),
+            body.approved_network_hosts.unwrap_or_default(),
+        )
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     Ok(Json(metadata))
@@ -113,6 +124,26 @@ async fn load_addon_for_runtime_web(
         .load_addon_for_runtime(&id)
         .map_err(|e| anyhow::anyhow!(e))?;
     Ok(Json(extracted))
+}
+
+async fn load_addon_asset_web(
+    Path((id, asset_id)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Response> {
+    let addon_service = Arc::clone(&state.addon_service);
+    let asset = tokio::task::spawn_blocking(move || addon_service.load_addon_asset(&id, &asset_id))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Addon asset task failed: {error}")))?
+        .map_err(ApiError::BadRequest)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, asset.mime_type)
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from(asset.bytes))
+        .map_err(|error| {
+            ApiError::Internal(format!("Failed to build addon asset response: {error}"))
+        })
 }
 
 async fn get_enabled_addons_on_startup_web(
@@ -213,6 +244,16 @@ struct InstallFromStagingBody {
     addon_id: String,
     #[serde(rename = "enableAfterInstall")]
     enable_after_install: Option<bool>,
+    #[serde(rename = "approvedNetworkHosts")]
+    approved_network_hosts: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateNetworkApprovalsBody {
+    #[serde(rename = "addonId")]
+    addon_id: String,
+    #[serde(rename = "approvedNetworkHosts")]
+    approved_network_hosts: Vec<String>,
 }
 
 async fn update_addon_from_store_by_id_web(
@@ -227,13 +268,28 @@ async fn update_addon_from_store_by_id_web(
     Ok(Json(metadata))
 }
 
+async fn update_addon_network_approvals_web(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<UpdateNetworkApprovalsBody>,
+) -> ApiResult<Json<AddonManifest>> {
+    let metadata = state
+        .addon_service
+        .update_addon_network_approvals(&body.addon_id, body.approved_network_hosts)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Json(metadata))
+}
+
 async fn install_addon_from_staging_web(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InstallFromStagingBody>,
 ) -> ApiResult<Json<AddonManifest>> {
     let metadata = state
         .addon_service
-        .install_addon_from_staging(&body.addon_id, body.enable_after_install.unwrap_or(true))
+        .install_addon_from_staging(
+            &body.addon_id,
+            body.enable_after_install.unwrap_or(true),
+            body.approved_network_hosts.unwrap_or_default(),
+        )
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     Ok(Json(metadata))
@@ -246,6 +302,50 @@ async fn clear_addon_staging_web(
     state
         .addon_service
         .clear_staging(rq.addon_id.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ====== Addon key-value storage ======
+
+#[derive(serde::Deserialize)]
+struct StorageSetBody {
+    value: String,
+}
+
+async fn get_addon_storage_item_web(
+    Path((addon_id, key)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<Option<String>>> {
+    let value = state
+        .addon_service
+        .get_addon_storage_item(&addon_id, &key)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Json(value))
+}
+
+async fn set_addon_storage_item_web(
+    Path((addon_id, key)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<StorageSetBody>,
+) -> ApiResult<StatusCode> {
+    state
+        .addon_service
+        .set_addon_storage_item(&addon_id, &key, &body.value)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_addon_storage_item_web(
+    Path((addon_id, key)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<StatusCode> {
+    state
+        .addon_service
+        .delete_addon_storage_item(&addon_id, &key)
+        .await
         .map_err(|e| anyhow::anyhow!(e))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -275,6 +375,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/addons/{id}", delete(uninstall_addon_web))
         .route("/addons/runtime/{id}", get(load_addon_for_runtime_web))
         .route(
+            "/addons/runtime/{id}/assets/{asset_id}",
+            get(load_addon_asset_web),
+        )
+        .route(
             "/addons/enabled-on-startup",
             get(get_enabled_addons_on_startup_web),
         )
@@ -285,7 +389,7 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route(
             "/addons/store/ratings",
-            post(submit_addon_rating_web).get(get_addon_ratings_web),
+            get(get_addon_ratings_web).post(submit_addon_rating_web),
         )
         .route("/addons/store/check-update", post(check_addon_update_web))
         .route("/addons/store/check-all", post(check_all_addon_updates_web))
@@ -301,5 +405,15 @@ pub fn router() -> Router<Arc<AppState>> {
             "/addons/store/install-from-staging",
             post(install_addon_from_staging_web),
         )
+        .route(
+            "/addons/network-approvals",
+            post(update_addon_network_approvals_web),
+        )
         .route("/addons/store/staging", delete(clear_addon_staging_web))
+        .route(
+            "/addons/storage/{addon_id}/{key}",
+            get(get_addon_storage_item_web)
+                .put(set_addon_storage_item_web)
+                .delete(delete_addon_storage_item_web),
+        )
 }

@@ -103,6 +103,8 @@ pub struct ActivityDB {
     pub amount: Option<String>,
     #[diesel(treat_none_as_null = true)]
     pub fee: Option<String>,
+    #[diesel(treat_none_as_null = true)]
+    pub tax: Option<String>,
     pub currency: String,
     #[diesel(treat_none_as_null = true)]
     pub fx_rate: Option<String>,
@@ -157,6 +159,8 @@ pub struct ActivityDetailsDB {
     pub currency: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub fee: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub tax: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub amount: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
@@ -218,6 +222,13 @@ impl ActivityDetailsDB {
         self.fee
             .as_ref()
             .map(|s| parse_decimal_string_tolerant(s, "fee"))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn get_tax(&self) -> Decimal {
+        self.tax
+            .as_ref()
+            .map(|s| parse_decimal_string_tolerant(s, "tax"))
             .unwrap_or(Decimal::ZERO)
     }
 
@@ -301,15 +312,6 @@ impl From<ActivityDetailsDB> for wealthfolio_core::activities::ActivityDetails {
             "VOID" => ActivityStatus::Void,
             _ => ActivityStatus::Posted, // Default to Posted for unknown values
         };
-
-        let amount = db.amount.or_else(|| {
-            let q = db.quantity.as_ref()?;
-            let p = db.unit_price.as_ref()?;
-            let qty = parse_decimal_string_tolerant(q, "quantity");
-            let price = parse_decimal_string_tolerant(p, "unit_price");
-            Some((qty * price).to_string())
-        });
-
         Self {
             id: db.id,
             account_id: db.account_id,
@@ -322,7 +324,8 @@ impl From<ActivityDetailsDB> for wealthfolio_core::activities::ActivityDetails {
             unit_price: db.unit_price,
             currency: db.currency,
             fee: db.fee,
-            amount,
+            tax: db.tax,
+            amount: db.amount,
             needs_review: db.needs_review != 0,
             comment: db.notes,
             fx_rate: db.fx_rate,
@@ -337,6 +340,7 @@ impl From<ActivityDetailsDB> for wealthfolio_core::activities::ActivityDetails {
                 .asset_pricing_mode
                 .unwrap_or_else(|| "MARKET".to_string()),
             instrument_type: db.instrument_type,
+            asset_contract_multiplier: None,
             source_system: db.source_system,
             source_record_id: db.source_record_id,
             source_group_id: db.source_group_id,
@@ -459,6 +463,10 @@ impl From<ActivityDB> for Activity {
                 .fee
                 .as_ref()
                 .map(|s| parse_decimal_string_tolerant(s, "fee")),
+            tax: db
+                .tax
+                .as_ref()
+                .map(|s| parse_decimal_string_tolerant(s, "tax")),
             currency: db.currency,
             fx_rate: db
                 .fx_rate
@@ -557,6 +565,7 @@ impl From<NewActivity> for ActivityDB {
             unit_price: domain.unit_price.map(|d| d.to_string()),
             amount: domain.amount.map(|d| d.to_string()),
             fee: domain.fee.map(|d| d.to_string()),
+            tax: domain.tax.map(|d| d.to_string()),
             currency: domain.currency,
             fx_rate: domain.fx_rate.map(|d| d.to_string()),
 
@@ -569,7 +578,7 @@ impl From<NewActivity> for ActivityDB {
             source_record_id: domain.source_record_id,
             source_group_id: domain.source_group_id,
             idempotency_key: domain.idempotency_key,
-            import_run_id: None,
+            import_run_id: domain.import_run_id,
 
             // Sync flags
             is_user_modified: 0,
@@ -646,6 +655,7 @@ impl From<ActivityUpdate> for ActivityDB {
             unit_price: domain.unit_price.flatten().map(|d| d.to_string()),
             amount: domain.amount.flatten().map(|d| d.to_string()),
             fee: domain.fee.flatten().map(|d| d.to_string()),
+            tax: domain.tax.flatten().map(|d| d.to_string()),
             currency: domain.currency,
             fx_rate: domain.fx_rate.flatten().map(|d| d.to_string()),
 
@@ -662,7 +672,7 @@ impl From<ActivityUpdate> for ActivityDB {
 
             // Sync flags - mark as user modified since this is an update
             is_user_modified: 1,
-            needs_review: 0,
+            needs_review: domain.needs_review.map(i32::from).unwrap_or(0),
 
             // Audit
             created_at: now.to_rfc3339(),
@@ -732,6 +742,7 @@ impl From<ActivityUpsert> for ActivityDB {
             unit_price: domain.unit_price.map(|d| d.to_string()),
             amount: domain.amount.map(|d| d.to_string()),
             fee: domain.fee.map(|d| d.to_string()),
+            tax: domain.tax.map(|d| d.to_string()),
             currency: domain.currency,
             fx_rate: domain.fx_rate.map(|d| d.to_string()),
 

@@ -44,11 +44,13 @@ export const COMMANDS: CommandMap = {
   list_database_backups: { method: "GET", path: "/utilities/database/backups" },
   delete_database_backup: { method: "DELETE", path: "/utilities/database/backups" },
   get_holdings: { method: "POST", path: "/holdings/query" },
+  get_holdings_list: { method: "POST", path: "/holdings/list/query" },
   get_holding: { method: "GET", path: "/holdings/item" },
   get_asset_holdings: { method: "GET", path: "/holdings/by-asset" },
   get_asset_lots: { method: "GET", path: "/holdings/lots" },
   get_historical_valuations: { method: "GET", path: "/valuations/history" },
   get_latest_valuations: { method: "GET", path: "/valuations/latest" },
+  get_current_valuation: { method: "POST", path: "/valuations/current/query" },
   get_portfolio_allocations: { method: "POST", path: "/allocations/query" },
   get_holdings_by_allocation: { method: "POST", path: "/allocations/holdings/query" },
   // Snapshot management
@@ -100,6 +102,7 @@ export const COMMANDS: CommandMap = {
   update_exchange_rate: { method: "PUT", path: "/exchange-rates" },
   add_exchange_rate: { method: "POST", path: "/exchange-rates" },
   delete_exchange_rate: { method: "DELETE", path: "/exchange-rates" },
+  get_exchange_rates_for_dates: { method: "POST", path: "/exchange-rates/historical" },
   // Activities
   search_activities: { method: "POST", path: "/activities/search" },
   create_activity: { method: "POST", path: "/activities" },
@@ -162,6 +165,10 @@ export const COMMANDS: CommandMap = {
   set_secret: { method: "POST", path: "/secrets" },
   get_secret: { method: "GET", path: "/secrets" },
   delete_secret: { method: "DELETE", path: "/secrets" },
+  set_addon_secret: { method: "POST", path: "/addons" },
+  get_addon_secret: { method: "GET", path: "/addons" },
+  delete_addon_secret: { method: "DELETE", path: "/addons" },
+  addon_network_request: { method: "POST", path: "/addons" },
   // Taxonomies
   get_taxonomies: { method: "GET", path: "/taxonomies" },
   get_taxonomy: { method: "GET", path: "/taxonomies" },
@@ -202,6 +209,9 @@ export const COMMANDS: CommandMap = {
   get_activity_assignments: { method: "GET", path: "/spending/activities" },
   assign_activity_category: { method: "PUT", path: "/spending/activities" },
   unassign_activity_category: { method: "DELETE", path: "/spending/activities" },
+  get_activity_splits: { method: "GET", path: "/spending/activities" },
+  replace_activity_splits: { method: "PUT", path: "/spending/activities" },
+  clear_activity_splits: { method: "DELETE", path: "/spending/activities" },
   bulk_assign_categories: { method: "POST", path: "/spending/assignments/bulk" },
   // Spending categorization rules
   list_categorization_rules: { method: "GET", path: "/spending/rules" },
@@ -251,7 +261,12 @@ export const COMMANDS: CommandMap = {
   update_addon_from_store_by_id: { method: "POST", path: "/addons/store/update" },
   download_addon_to_staging: { method: "POST", path: "/addons/store/staging/download" },
   install_addon_from_staging: { method: "POST", path: "/addons/store/install-from-staging" },
+  update_addon_network_approvals: { method: "POST", path: "/addons/network-approvals" },
   clear_addon_staging: { method: "DELETE", path: "/addons/store/staging" },
+  // Addon key-value storage
+  get_addon_storage_item: { method: "GET", path: "/addons/storage" },
+  set_addon_storage_item: { method: "PUT", path: "/addons/storage" },
+  delete_addon_storage_item: { method: "DELETE", path: "/addons/storage" },
   // Device Sync - Device management
   register_device: { method: "POST", path: "/sync/device/register" },
   get_device: { method: "GET", path: "/sync/device" },
@@ -289,6 +304,7 @@ export const COMMANDS: CommandMap = {
   cancel_pairing_flow: { method: "POST", path: "/sync/pairing/flow/cancel" },
   // Wealthfolio Connect (Broker Sync)
   store_sync_session: { method: "POST", path: "/connect/session" },
+  post_login_bootstrap: { method: "POST", path: "/connect/post-login-bootstrap" },
   clear_sync_session: { method: "DELETE", path: "/connect/session" },
   get_sync_session_status: { method: "GET", path: "/connect/session/status" },
   restore_sync_session: { method: "GET", path: "/connect/session/restore" },
@@ -382,6 +398,8 @@ export const COMMANDS: CommandMap = {
     path: "/allocation-targets/save-with-weights",
   },
   get_allocation_target_drift: { method: "POST", path: "/allocation-targets" },
+  list_target_constraints: { method: "GET", path: "/allocation-targets" },
+  save_target_constraints: { method: "POST", path: "/allocation-targets" },
   calculate_rebalance_plan: { method: "POST", path: "/allocation-targets/rebalance/calculate" },
   // Alternative Assets
   create_alternative_asset: { method: "POST", path: "/alternative-assets" },
@@ -391,6 +409,13 @@ export const COMMANDS: CommandMap = {
   unlink_liability: { method: "DELETE", path: "/alternative-assets" },
   update_alternative_asset_metadata: { method: "PUT", path: "/alternative-assets" },
   get_alternative_holdings: { method: "GET", path: "/alternative-holdings" },
+  // Agent Access (PATs + audit log)
+  get_agent_access_status: { method: "GET", path: "/agent-access/status" },
+  list_agent_access_tokens: { method: "GET", path: "/agent-access/tokens" },
+  create_agent_access_token: { method: "POST", path: "/agent-access/tokens" },
+  delete_agent_access_token: { method: "DELETE", path: "/agent-access/tokens" },
+  list_agent_audit_log: { method: "GET", path: "/agent-access/audit" },
+  purge_agent_audit_log: { method: "POST", path: "/agent-access/audit/purge" },
 };
 
 /**
@@ -479,13 +504,23 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       body = JSON.stringify(data.settingsUpdate);
       break;
     }
-    case "get_holdings": {
-      const p = payload as { filter: { type: string; accountId?: string } };
+    case "get_holdings":
+    case "get_holdings_list": {
+      const p = payload as {
+        filter: { type: string; accountId?: string };
+        includeClosed?: boolean;
+      };
       if (p.filter?.type === "account" && p.filter.accountId) {
-        url = `${API_PREFIX}/holdings?accountId=${encodeURIComponent(p.filter.accountId)}`;
+        const path = command === "get_holdings_list" ? "/holdings/list" : "/holdings";
+        const params = new URLSearchParams({ accountId: p.filter.accountId });
+        if (p.includeClosed) params.set("includeClosed", "true");
+        url = `${API_PREFIX}${path}?${params.toString()}`;
         method = "GET";
       } else {
-        body = JSON.stringify({ filter: p.filter });
+        body = JSON.stringify({
+          filter: p.filter,
+          ...(p.includeClosed ? { includeClosed: true } : {}),
+        });
       }
       break;
     }
@@ -547,6 +582,14 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       if (qs) url += `?${qs}`;
       break;
     }
+    case "get_current_valuation": {
+      const { filter, includeAccounts } = (payload ?? {}) as {
+        filter?: unknown;
+        includeAccounts?: boolean;
+      };
+      body = JSON.stringify({ filter, includeAccounts: includeAccounts ?? false });
+      break;
+    }
     case "get_portfolio_allocations": {
       const p = payload as { filter: { type: string; accountId?: string } };
       if (p.filter?.type === "account" && p.filter.accountId) {
@@ -602,10 +645,15 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       break;
     }
     case "delete_snapshot": {
-      const { accountId, date } = payload as { accountId: string; date: string };
+      const { accountId, date, snapshotId } = payload as {
+        accountId: string;
+        date: string;
+        snapshotId?: string;
+      };
       const params = new URLSearchParams();
       params.set("accountId", accountId);
       params.set("date", date);
+      if (snapshotId) params.set("snapshotId", snapshotId);
       url += `?${params.toString()}`;
       break;
     }
@@ -792,6 +840,11 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
     case "delete_exchange_rate": {
       const { rateId } = payload as { rateId: string };
       url += `/${encodeURIComponent(rateId)}`;
+      break;
+    }
+    case "get_exchange_rates_for_dates": {
+      const { request } = payload as { request: Record<string, unknown> };
+      body = JSON.stringify(request);
       break;
     }
     case "get_exchanges":
@@ -1079,6 +1132,33 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       url += `?${params.toString()}`;
       break;
     }
+    case "set_addon_secret": {
+      const { addonId, key, secret } = payload as {
+        addonId: string;
+        key: string;
+        secret: string;
+      };
+      url += `/${encodeURIComponent(addonId)}/secrets`;
+      body = JSON.stringify({ key, secret });
+      break;
+    }
+    case "get_addon_secret":
+    case "delete_addon_secret": {
+      const { addonId, key } = payload as { addonId: string; key: string };
+      const params = new URLSearchParams();
+      params.set("key", key);
+      url += `/${encodeURIComponent(addonId)}/secrets?${params.toString()}`;
+      break;
+    }
+    case "addon_network_request": {
+      const { addonId, request } = payload as {
+        addonId: string;
+        request: unknown;
+      };
+      url += `/${encodeURIComponent(addonId)}/network/request`;
+      body = JSON.stringify({ request });
+      break;
+    }
     // Taxonomy commands
     case "get_taxonomies":
       break;
@@ -1333,6 +1413,25 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       url += `/${encodeURIComponent(activityId)}/assignments/${encodeURIComponent(taxonomyId)}`;
       break;
     }
+    case "get_activity_splits": {
+      const { activityId } = payload as { activityId: string };
+      url += `/${encodeURIComponent(activityId)}/splits`;
+      break;
+    }
+    case "replace_activity_splits": {
+      const { activityId, splits } = payload as {
+        activityId: string;
+        splits: unknown[];
+      };
+      url += `/${encodeURIComponent(activityId)}/splits`;
+      body = JSON.stringify(splits);
+      break;
+    }
+    case "clear_activity_splits": {
+      const { activityId } = payload as { activityId: string };
+      url += `/${encodeURIComponent(activityId)}/splits`;
+      break;
+    }
     case "bulk_assign_categories": {
       const { items } = payload as { items: unknown[] };
       body = JSON.stringify(items);
@@ -1452,13 +1551,14 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
     }
     // Addons
     case "install_addon_zip": {
-      const { zipData, enableAfterInstall } = payload as {
+      const { zipData, enableAfterInstall, approvedNetworkHosts } = payload as {
         zipData: Uint8Array | number[];
         enableAfterInstall?: boolean;
+        approvedNetworkHosts?: string[];
       };
       // Send compact base64 payload to avoid gigantic JSON arrays of numbers
       const zipDataB64 = toBase64(zipData);
-      body = JSON.stringify({ zipDataB64, enableAfterInstall });
+      body = JSON.stringify({ zipDataB64, enableAfterInstall, approvedNetworkHosts });
       break;
     }
     case "toggle_addon": {
@@ -1474,6 +1574,18 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
     case "load_addon_for_runtime": {
       const { addonId } = payload as { addonId: string };
       url += `/${encodeURIComponent(addonId)}`;
+      break;
+    }
+    case "get_addon_storage_item":
+    case "delete_addon_storage_item": {
+      const { addonId, key } = payload as { addonId: string; key: string };
+      url += `/${encodeURIComponent(addonId)}/${encodeURIComponent(key)}`;
+      break;
+    }
+    case "set_addon_storage_item": {
+      const { addonId, key, value } = payload as { addonId: string; key: string; value: string };
+      url += `/${encodeURIComponent(addonId)}/${encodeURIComponent(key)}`;
+      body = JSON.stringify({ value });
       break;
     }
     case "extract_addon_zip": {
@@ -1496,11 +1608,20 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       break;
     }
     case "install_addon_from_staging": {
-      const { addonId, enableAfterInstall } = payload as {
+      const { addonId, enableAfterInstall, approvedNetworkHosts } = payload as {
         addonId: string;
         enableAfterInstall?: boolean;
+        approvedNetworkHosts?: string[];
       };
-      body = JSON.stringify({ addonId, enableAfterInstall });
+      body = JSON.stringify({ addonId, enableAfterInstall, approvedNetworkHosts });
+      break;
+    }
+    case "update_addon_network_approvals": {
+      const { addonId, approvedNetworkHosts } = payload as {
+        addonId: string;
+        approvedNetworkHosts: string[];
+      };
+      body = JSON.stringify({ addonId, approvedNetworkHosts });
       break;
     }
     case "clear_addon_staging": {
@@ -1530,9 +1651,10 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
     }
     // Device Sync commands - Device management
     case "register_device": {
-      const { displayName, instanceId } = payload as {
+      const { displayName, deviceNonce, instanceId } = payload as {
         displayName: string;
-        instanceId: string;
+        deviceNonce?: string;
+        instanceId?: string;
       };
       // Detect platform from browser user agent
       const userAgent = navigator.userAgent.toLowerCase();
@@ -1543,7 +1665,7 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       else if (userAgent.includes("android")) platform = "android";
       else if (userAgent.includes("iphone") || userAgent.includes("ipad")) platform = "ios";
 
-      body = JSON.stringify({ displayName, platform, instanceId });
+      body = JSON.stringify({ displayName, platform, deviceNonce: deviceNonce ?? instanceId });
       break;
     }
     case "get_device": {
@@ -1694,6 +1816,7 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
     case "list_devices":
     case "initialize_team_keys":
     case "rotate_team_keys":
+    case "post_login_bootstrap":
     case "clear_sync_session":
     case "get_sync_session_status":
     case "restore_sync_session":
@@ -1867,14 +1990,35 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       body = JSON.stringify({ filter, includeHoldings: includeHoldings ?? false });
       break;
     }
+    case "list_target_constraints": {
+      const { targetId } = payload as { targetId: string };
+      url += `/${encodeURIComponent(targetId)}/constraints`;
+      break;
+    }
+    case "save_target_constraints": {
+      const { targetId, constraints } = payload as {
+        targetId: string;
+        constraints: unknown[];
+      };
+      url += `/${encodeURIComponent(targetId)}/constraints`;
+      body = JSON.stringify(constraints);
+      break;
+    }
     case "calculate_rebalance_plan": {
-      const { targetId, availableCash, filter, scenarioMode } = payload as {
+      const { targetId, availableCash, filter, scenarioMode, eligibleAssetIds } = payload as {
         targetId: string;
         availableCash: number;
         filter: unknown;
         scenarioMode: string;
+        eligibleAssetIds?: string[];
       };
-      body = JSON.stringify({ targetId, availableCash, filter, scenarioMode });
+      body = JSON.stringify({
+        targetId,
+        availableCash,
+        filter,
+        scenarioMode,
+        ...(eligibleAssetIds === undefined ? {} : { eligibleAssetIds }),
+      });
       break;
     }
     // AI Providers
@@ -1958,6 +2102,40 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
     case "get_ai_thread_tags": {
       const { threadId } = payload as { threadId: string };
       url += `/${encodeURIComponent(threadId)}/tags`;
+      break;
+    }
+    // Agent Access
+    case "create_agent_access_token": {
+      const { name, expiresAt, scopes } = payload as {
+        name: string;
+        expiresAt?: string;
+        scopes: string[];
+      };
+      body = JSON.stringify({ name, expiresAt, scopes });
+      break;
+    }
+    case "delete_agent_access_token": {
+      const { id } = payload as { id: string };
+      url += `/${encodeURIComponent(id)}`;
+      break;
+    }
+    case "list_agent_audit_log": {
+      const { page, pageSize, q, tools, outcomes, actorKinds } = payload as {
+        page: number;
+        pageSize: number;
+        q?: string;
+        tools?: string[];
+        outcomes?: string[];
+        actorKinds?: string[];
+      };
+      const params = new URLSearchParams();
+      params.set("page", String(page));
+      params.set("pageSize", String(pageSize));
+      if (q) params.set("q", q);
+      if (tools?.length) params.set("tools", tools.join(","));
+      if (outcomes?.length) params.set("outcomes", outcomes.join(","));
+      if (actorKinds?.length) params.set("actorKinds", actorKinds.join(","));
+      url += `?${params.toString()}`;
       break;
     }
   }

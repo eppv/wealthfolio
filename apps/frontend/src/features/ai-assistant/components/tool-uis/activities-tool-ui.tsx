@@ -1,3 +1,6 @@
+import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
+import { useSettingsContext } from "@/lib/settings-provider";
+import { cn } from "@/lib/utils";
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { makeAssistantToolUI } from "@assistant-ui/react";
 import {
@@ -13,11 +16,11 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  useDateFormatting,
+  useNumberFormatting,
 } from "@wealthfolio/ui";
 import { memo, useMemo } from "react";
-import { cn } from "@/lib/utils";
-import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
-import { useSettingsContext } from "@/lib/settings-provider";
+import { useTranslation } from "react-i18next";
 import {
   CompactToolCard,
   createActivityAmountFormatter,
@@ -112,12 +115,7 @@ function normalizeResult(result: unknown, fallbackCurrency: string): SearchActiv
           : entry.unit_price != null
             ? Number(entry.unit_price)
             : null,
-      amount:
-        entry.amount != null
-          ? Number(entry.amount)
-          : entry.quantity != null && (entry.unitPrice ?? entry.unit_price) != null
-            ? Number(entry.quantity) * Number(entry.unitPrice ?? entry.unit_price)
-            : null,
+      amount: entry.amount != null ? Number(entry.amount) : null,
       fee: entry.fee != null ? Number(entry.fee) : null,
       currency: (entry.currency as string | undefined) ?? fallbackCurrency,
       accountId:
@@ -170,6 +168,10 @@ type ActivitiesContentProps = ToolCallMessagePartProps<
 const ActivitiesContent = memo(ActivitiesContentImpl);
 
 function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps) {
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   const { settings } = useSettingsContext();
   const baseCurrency = settings?.baseCurrency ?? "USD";
   const { isBalanceHidden } = useBalancePrivacy();
@@ -185,8 +187,14 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
     });
   }, [parsed?.activities]);
 
-  const formatter = useMemo(() => createActivityAmountFormatter(), []);
-  const quantityFormatter = useMemo(() => createActivityQuantityFormatter(), []);
+  const formatter = useMemo(
+    () => createActivityAmountFormatter(numberFormatting),
+    [numberFormatting],
+  );
+  const quantityFormatter = useMemo(
+    () => createActivityQuantityFormatter(numberFormatting),
+    [numberFormatting],
+  );
 
   const accountScope = parsed?.accountScope ?? args?.accountId ?? "all";
   // Show account name instead of ID when filtering a single account
@@ -200,9 +208,7 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
   // Compact mode — just show a one-liner when used as a prerequisite
   if (args?.displayMode === "compact" && parsed && !isLoading) {
     return (
-      <CompactToolCard
-        label={`Fetched ${parsed.activities.length} activit${parsed.activities.length !== 1 ? "ies" : "y"}`}
-      />
+      <CompactToolCard label={t("ai:activities.fetched", { count: parsed.activities.length })} />
     );
   }
 
@@ -213,7 +219,7 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
         <CardHeader className="pb-2">
           <div className="flex flex-wrap items-start justify-between gap-2">
             <div>
-              <CardTitle className="text-sm font-medium">Activities</CardTitle>
+              <CardTitle className="text-sm font-medium">{t("ai:activities.title")}</CardTitle>
               <Skeleton className="mt-1 h-3 w-24" />
             </div>
             <Skeleton className="h-5 w-20" />
@@ -224,12 +230,14 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
-                  <TableHead className="pl-4 text-xs">Date</TableHead>
-                  <TableHead className="text-xs">Type</TableHead>
-                  <TableHead className="text-xs">Symbol</TableHead>
-                  <TableHead className="text-right text-xs">Qty</TableHead>
-                  <TableHead className="text-right text-xs">Price</TableHead>
-                  <TableHead className="pr-4 text-right text-xs">Amount</TableHead>
+                  <TableHead className="pl-4 text-xs">{t("ai:activities.date")}</TableHead>
+                  <TableHead className="text-xs">{t("ai:activities.type")}</TableHead>
+                  <TableHead className="text-xs">{t("ai:activities.symbol")}</TableHead>
+                  <TableHead className="text-right text-xs">{t("ai:activities.qty")}</TableHead>
+                  <TableHead className="text-right text-xs">{t("ai:activities.price")}</TableHead>
+                  <TableHead className="pr-4 text-right text-xs">
+                    {t("ai:activities.amount")}
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -268,7 +276,7 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
     return (
       <Card className="bg-muted/40 border-destructive/30 w-full">
         <CardContent className="py-4">
-          <p className="text-destructive text-sm">Failed to load activities data.</p>
+          <p className="text-destructive text-sm">{t("ai:activities.error")}</p>
         </CardContent>
       </Card>
     );
@@ -279,7 +287,7 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
     return (
       <Card className="bg-muted/40 border-primary/10 w-full">
         <CardContent className="py-4">
-          <p className="text-muted-foreground text-sm">No activities found for this query.</p>
+          <p className="text-muted-foreground text-sm">{t("ai:activities.empty")}</p>
         </CardContent>
       </Card>
     );
@@ -291,9 +299,9 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
       <CardHeader className="pb-2">
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div>
-            <CardTitle className="text-sm font-medium">Activities</CardTitle>
+            <CardTitle className="text-sm font-medium">{t("ai:activities.title")}</CardTitle>
             <p className="text-muted-foreground mt-1 text-xs">
-              {activitiesCount} transaction{activitiesCount !== 1 ? "s" : ""}
+              {t("ai:activities.transactions", { count: activitiesCount })}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -315,12 +323,14 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
           <Table>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
-                <TableHead className="pl-4 text-xs">Date</TableHead>
-                <TableHead className="text-xs">Type</TableHead>
-                <TableHead className="text-xs">Symbol</TableHead>
-                <TableHead className="text-right text-xs">Qty</TableHead>
-                <TableHead className="text-right text-xs">Price</TableHead>
-                <TableHead className="pr-4 text-right text-xs">Amount</TableHead>
+                <TableHead className="pl-4 text-xs">{t("ai:activities.date")}</TableHead>
+                <TableHead className="text-xs">{t("ai:activities.type")}</TableHead>
+                <TableHead className="text-xs">{t("ai:activities.symbol")}</TableHead>
+                <TableHead className="text-right text-xs">{t("ai:activities.qty")}</TableHead>
+                <TableHead className="text-right text-xs">{t("ai:activities.price")}</TableHead>
+                <TableHead className="pr-4 text-right text-xs">
+                  {t("ai:activities.amount")}
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -329,7 +339,7 @@ function ActivitiesContentImpl({ args, result, status }: ActivitiesContentProps)
                 return (
                   <TableRow key={activity.id} className="text-xs">
                     <TableCell className="py-2 pl-4 font-medium tabular-nums">
-                      {formatActivityDate(activity.date)}
+                      {formatActivityDate(activity.date, dateFormatting)}
                     </TableCell>
                     <TableCell className="py-2">
                       <Badge

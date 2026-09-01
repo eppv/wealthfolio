@@ -1,3 +1,6 @@
+import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
+import { useSettingsContext } from "@/lib/settings-provider";
+import { cn } from "@/lib/utils";
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { makeAssistantToolUI } from "@assistant-ui/react";
 import {
@@ -6,14 +9,18 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
+  parseDateTimeInTimezone,
   Progress,
   Skeleton,
+  useAmountFormatting,
+  useDateFormatting,
+  useLocalizationSettings,
+  useNumberFormatting,
+  type FormattingApi,
 } from "@wealthfolio/ui";
-import { memo, useMemo } from "react";
-import { cn } from "@/lib/utils";
-import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
-import { useSettingsContext } from "@/lib/settings-provider";
+import { memo, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { CompactToolCard } from "./shared";
 
 // ============================================================================
@@ -110,7 +117,7 @@ function normalizeGoalsResult(candidate: Record<string, unknown>): GetGoalsResul
     .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
     .map((item) => ({
       id: safeString(item.id ?? item.Id, ""),
-      title: safeString(item.title ?? item.Title, "Untitled Goal"),
+      title: safeString(item.title ?? item.Title, ""),
       description:
         (item.description as string | undefined) ??
         (item.Description as string | undefined) ??
@@ -152,14 +159,18 @@ function normalizeGoalsResult(candidate: Record<string, unknown>): GetGoalsResul
  * Green if on track (>= 80% of expected progress), yellow if behind (50-80%), red if far behind (<50%).
  * If deadline is not available, we only use the raw progress percent.
  */
-function getProgressColor(progressPercent: number, deadline?: string | null): string {
+function getProgressColor(
+  progressPercent: number,
+  deadline?: string | null,
+  timezone?: string,
+): string {
   // If there's a deadline, calculate expected progress
   if (deadline) {
     const now = new Date();
-    const deadlineDate = new Date(deadline);
+    const deadlineDate = parseDateTimeInTimezone(`${deadline.slice(0, 10)}T23:59:59.999`, timezone);
     const startDate = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()); // Assume 1 year goal if no start date
 
-    const totalDuration = deadlineDate.getTime() - startDate.getTime();
+    const totalDuration = (deadlineDate?.getTime() ?? 0) - startDate.getTime();
     const elapsed = now.getTime() - startDate.getTime();
 
     if (totalDuration > 0 && elapsed > 0) {
@@ -190,17 +201,15 @@ function getProgressColor(progressPercent: number, deadline?: string | null): st
 /**
  * Formats a date string for display.
  */
-function formatDate(dateStr: string): string {
-  try {
-    const date = new Date(dateStr);
-    return new Intl.DateTimeFormat(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    }).format(date);
-  } catch {
-    return dateStr;
-  }
+function formatDate(
+  dateStr: string,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+): string {
+  return formatting.formatCalendarDate(dateStr.slice(0, 10), {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
 }
 
 // ============================================================================
@@ -237,20 +246,23 @@ function GoalsLoadingSkeleton() {
 
 function GoalCard({
   goal,
-  formatter,
+  formatting,
+  currency,
   isBalanceHidden,
 }: {
   goal: GoalDto;
-  formatter: Intl.NumberFormat;
+  formatting: FormattingApi;
+  currency: string;
   isBalanceHidden: boolean;
 }) {
-  const progressColor = getProgressColor(goal.progressPercent, goal.deadline);
+  const { t } = useTranslation();
+  const progressColor = getProgressColor(goal.progressPercent, goal.deadline, formatting.timezone);
 
   const formatValue = (value: number) => {
     if (isBalanceHidden) {
       return "******";
     }
-    return formatter.format(value);
+    return formatting.formatRoundedAmount(value, currency);
   };
 
   return (
@@ -263,7 +275,9 @@ function GoalCard({
           ) : (
             <Icons.Target className="text-muted-foreground h-4 w-4 flex-shrink-0" />
           )}
-          <span className="text-sm font-medium leading-tight">{goal.title}</span>
+          <span className="text-sm font-medium leading-tight">
+            {goal.title || t("ai:goals.untitled")}
+          </span>
         </div>
         <Badge
           variant={goal.isAchieved ? "default" : "secondary"}
@@ -291,7 +305,7 @@ function GoalCard({
         {goal.deadline && (
           <span className="text-muted-foreground flex items-center gap-1">
             <Icons.Calendar className="h-3 w-3" />
-            {formatDate(goal.deadline)}
+            {formatDate(goal.deadline, formatting)}
           </span>
         )}
       </div>
@@ -305,24 +319,24 @@ function GoalCard({
 }
 
 function EmptyState() {
+  const { t } = useTranslation();
   return (
     <Card className="bg-muted/40 border-primary/10">
       <CardContent className="flex flex-col items-center justify-center py-8 text-center">
         <Icons.Target className="text-muted-foreground mb-2 h-8 w-8" />
-        <p className="text-muted-foreground text-sm">No goals set up yet.</p>
-        <p className="text-muted-foreground mt-1 text-xs">
-          Create investment goals in Settings to track your progress.
-        </p>
+        <p className="text-muted-foreground text-sm">{t("ai:goals.empty")}</p>
+        <p className="text-muted-foreground mt-1 text-xs">{t("ai:goals.emptyHint")}</p>
       </CardContent>
     </Card>
   );
 }
 
 function ErrorState({ message }: { message?: string }) {
+  const { t } = useTranslation();
   return (
     <Card className="border-destructive/30 bg-destructive/5">
       <CardContent className="py-4">
-        <p className="text-destructive text-sm font-medium">Failed to load goals</p>
+        <p className="text-destructive text-sm font-medium">{t("ai:goals.error")}</p>
         {message && <p className="text-muted-foreground mt-1 text-xs">{message}</p>}
       </CardContent>
     </Card>
@@ -336,6 +350,19 @@ function ErrorState({ message }: { message?: string }) {
 type GoalsToolUIContentProps = ToolCallMessagePartProps<GetGoalsArgs, GetGoalsResult>;
 
 function GoalsToolUIContentImpl({ args, result, status }: GoalsToolUIContentProps) {
+  const localizationSettings = useLocalizationSettings();
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const formatting = {
+    ...localizationSettings,
+    ...amountFormatting,
+    ...numberFormatting,
+    ...dateFormatting,
+  };
+
+  const { t } = useTranslation();
   const { settings } = useSettingsContext();
   const baseCurrency = settings?.baseCurrency ?? "USD";
   const { isBalanceHidden } = useBalancePrivacy();
@@ -346,24 +373,8 @@ function GoalsToolUIContentImpl({ args, result, status }: GoalsToolUIContentProp
 
   // Compact mode — just show a one-liner when used as a prerequisite
   if (args?.displayMode === "compact" && parsed && !isLoading) {
-    return (
-      <CompactToolCard
-        label={`Fetched ${parsed.goals.length} goal${parsed.goals.length !== 1 ? "s" : ""}`}
-      />
-    );
+    return <CompactToolCard label={t("ai:goals.fetched", { count: parsed.goals.length })} />;
   }
-
-  // Currency formatter - default to base currency
-  const formatter = useMemo(
-    () =>
-      new Intl.NumberFormat(undefined, {
-        style: "currency",
-        currency: baseCurrency,
-        minimumFractionDigits: 0,
-        maximumFractionDigits: 0,
-      }),
-    [baseCurrency],
-  );
 
   // Show loading skeleton while running
   if (isLoading) {
@@ -372,7 +383,7 @@ function GoalsToolUIContentImpl({ args, result, status }: GoalsToolUIContentProp
 
   // Show error state for incomplete/failed status
   if (isIncomplete) {
-    return <ErrorState message="The request was interrupted or failed." />;
+    return <ErrorState message={t("ai:performance.interrupted")} />;
   }
 
   // Show empty state if no goals
@@ -387,19 +398,19 @@ function GoalsToolUIContentImpl({ args, result, status }: GoalsToolUIContentProp
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <CardTitle className="text-base">Goals</CardTitle>
+            <CardTitle className="text-base">{t("ai:goals.title")}</CardTitle>
             <Badge variant="secondary" className="text-xs">
-              {count} {count === 1 ? "goal" : "goals"}
+              {t("ai:goals.count", { count })}
             </Badge>
             {truncated && originalCount && (
               <Badge variant="outline" className="text-muted-foreground text-xs">
-                of {originalCount}
+                {t("ai:goals.of", { count: originalCount })}
               </Badge>
             )}
           </div>
           {achievedCount > 0 && (
             <Badge variant="default" className="bg-success text-success-foreground text-xs">
-              {achievedCount} achieved
+              {t("ai:goals.achieved", { count: achievedCount })}
             </Badge>
           )}
         </div>
@@ -409,7 +420,8 @@ function GoalsToolUIContentImpl({ args, result, status }: GoalsToolUIContentProp
           <GoalCard
             key={goal.id}
             goal={goal}
-            formatter={formatter}
+            formatting={formatting}
+            currency={baseCurrency}
             isBalanceHidden={isBalanceHidden}
           />
         ))}

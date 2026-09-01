@@ -1,4 +1,5 @@
-import { formatCompactAmount } from "@wealthfolio/ui";
+import { useAmountFormatting, useNumberFormatting } from "@wealthfolio/ui";
+import { useTranslation } from "react-i18next";
 import {
   Area,
   AreaChart,
@@ -41,10 +42,14 @@ function CoverageProjectionTooltip({
   currency: string;
   valueMode: ChartValueMode;
 }) {
+  const formatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const { t } = useTranslation();
   if (!active || !payload?.length) return null;
   const point = payload[0]?.payload as CoverageProjectionPoint | undefined;
   if (!point) return null;
-  const valueLabel = valueMode === "real" ? "today's money" : "nominal money";
+  const valueLabel =
+    valueMode === "real" ? t("goals:value_mode.todays_money") : t("goals:value_mode.nominal_money");
   const funded = point.retirementIncome + point.portfolioWithdrawal;
   const coveragePct =
     point.plannedSpending > 0 ? Math.min(100, (funded / point.plannedSpending) * 100) : 0;
@@ -52,15 +57,17 @@ function CoverageProjectionTooltip({
   return (
     <div className="bg-popover grid grid-cols-1 gap-1.5 rounded-md border p-2.5 shadow-md">
       <p className="text-muted-foreground text-xs font-medium">
-        Age {point.age} · {valueLabel}
+        {t("goals:coverage_chart.age_value", { age: point.age, valueLabel })}
       </p>
       <div className="flex items-center justify-between gap-5">
         <div className="flex items-center gap-1.5">
           <span className="block h-0 w-3 border-b border-dashed border-[#888]" />
-          <span className="text-muted-foreground text-xs">Planned spending/yr:</span>
+          <span className="text-muted-foreground text-xs">
+            {t("goals:coverage_chart.planned_spending_yr")}
+          </span>
         </div>
         <span className="text-xs font-semibold tabular-nums">
-          {formatCompactAmount(point.plannedSpending, currency)}
+          {formatting.formatCompactAmount(point.plannedSpending, currency)}
         </span>
       </div>
       <div className="flex items-center justify-between gap-5">
@@ -69,10 +76,12 @@ function CoverageProjectionTooltip({
             className="block h-2 w-2 rounded-sm"
             style={{ backgroundColor: COVERAGE_COLORS.income }}
           />
-          <span className="text-muted-foreground text-xs">Retirement income used/yr:</span>
+          <span className="text-muted-foreground text-xs">
+            {t("goals:coverage_chart.retirement_income_used_yr")}
+          </span>
         </div>
         <span className="text-xs font-semibold tabular-nums">
-          {formatCompactAmount(point.retirementIncome, currency)}
+          {formatting.formatCompactAmount(point.retirementIncome, currency)}
         </span>
       </div>
       <div className="flex items-center justify-between gap-5">
@@ -81,10 +90,12 @@ function CoverageProjectionTooltip({
             className="block h-2 w-2 rounded-sm"
             style={{ backgroundColor: COVERAGE_COLORS.portfolio }}
           />
-          <span className="text-muted-foreground text-xs">Portfolio withdrawal used/yr:</span>
+          <span className="text-muted-foreground text-xs">
+            {t("goals:coverage_chart.portfolio_withdrawal_used_yr")}
+          </span>
         </div>
         <span className="text-xs font-semibold tabular-nums">
-          {formatCompactAmount(point.portfolioWithdrawal, currency)}
+          {formatting.formatCompactAmount(point.portfolioWithdrawal, currency)}
         </span>
       </div>
       {point.shortfall > 0 && (
@@ -94,23 +105,29 @@ function CoverageProjectionTooltip({
               className="block h-2 w-2 rounded-sm"
               style={{ backgroundColor: COVERAGE_COLORS.shortfall }}
             />
-            <span className="text-muted-foreground text-xs">Unfunded spending/yr:</span>
+            <span className="text-muted-foreground text-xs">
+              {t("goals:coverage_chart.unfunded_spending_yr")}
+            </span>
           </div>
           <span className="text-xs font-semibold tabular-nums text-red-500">
-            {formatCompactAmount(point.shortfall, currency)}
+            {formatting.formatCompactAmount(point.shortfall, currency)}
           </span>
         </div>
       )}
       {point.taxes > 0 && (
         <div className="flex items-center justify-between gap-5">
-          <span className="text-muted-foreground text-xs">Withdrawal taxes/yr:</span>
+          <span className="text-muted-foreground text-xs">
+            {t("goals:coverage_chart.withdrawal_taxes_yr")}
+          </span>
           <span className="text-xs font-semibold tabular-nums">
-            +{formatCompactAmount(point.taxes, currency)}
+            +{formatting.formatCompactAmount(point.taxes, currency)}
           </span>
         </div>
       )}
       <div className="flex items-center justify-between gap-5 border-t pt-1">
-        <span className="text-muted-foreground text-xs">Spending covered:</span>
+        <span className="text-muted-foreground text-xs">
+          {t("goals:coverage_chart.spending_covered")}
+        </span>
         <span
           className={`text-xs font-semibold tabular-nums ${
             coveragePct >= 100
@@ -120,7 +137,7 @@ function CoverageProjectionTooltip({
                 : "text-red-500"
           }`}
         >
-          {coveragePct.toFixed(0)}%
+          {numberFormatting.formatPercent(coveragePct / 100, { digits: 0 })}
         </span>
       </div>
     </div>
@@ -142,6 +159,7 @@ export function RetirementCoverageChart({
   fireAgeForBudget: number;
   referenceLabelPrefix: string;
 }) {
+  const formatting = useAmountFormatting();
   return (
     <ResponsiveContainer width="100%" height={280}>
       <AreaChart data={data} margin={{ top: 16, right: 28, left: 0, bottom: 0 }}>
@@ -172,7 +190,7 @@ export function RetirementCoverageChart({
         />
         <YAxis
           tick={{ fontSize: 10 }}
-          tickFormatter={(v: number) => formatCompactAmount(v, currency)}
+          tickFormatter={(v: number) => formatting.formatCompactAmount(v, currency)}
           width={60}
           axisLine={false}
           tickLine={false}

@@ -2,21 +2,67 @@
 
 use crate::activities::activities_constants::{
     ACTIVITY_SUBTYPE_BONUS, ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND, ACTIVITY_SUBTYPE_DRIP,
-    ACTIVITY_SUBTYPE_OPTION_EXPIRY, ACTIVITY_SUBTYPE_REBATE, ACTIVITY_SUBTYPE_REFUND,
-    ACTIVITY_SUBTYPE_STAKING_REWARD, ACTIVITY_TYPE_ADJUSTMENT, ACTIVITY_TYPE_BUY,
-    ACTIVITY_TYPE_CREDIT, ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_DIVIDEND, ACTIVITY_TYPE_FEE,
-    ACTIVITY_TYPE_INTEREST, ACTIVITY_TYPE_SELL, ACTIVITY_TYPE_SPLIT, ACTIVITY_TYPE_TAX,
-    ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL,
+    ACTIVITY_SUBTYPE_OPTION_EXPIRY, ACTIVITY_SUBTYPE_POSITION_CLOSE,
+    ACTIVITY_SUBTYPE_POSITION_OPEN, ACTIVITY_SUBTYPE_REBATE, ACTIVITY_SUBTYPE_REFUND,
+    ACTIVITY_SUBTYPE_REIMBURSEMENT, ACTIVITY_SUBTYPE_STAKING_REWARD, ACTIVITY_TYPE_ADJUSTMENT,
+    ACTIVITY_TYPE_BUY, ACTIVITY_TYPE_CREDIT, ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_DIVIDEND,
+    ACTIVITY_TYPE_FEE, ACTIVITY_TYPE_INTEREST, ACTIVITY_TYPE_SELL, ACTIVITY_TYPE_SPLIT,
+    ACTIVITY_TYPE_TAX, ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT,
+    ACTIVITY_TYPE_WITHDRAWAL,
 };
 use crate::activities::csv_parser::ParseConfig;
 use crate::assets::NewAsset;
 use crate::Result;
 use crate::{activities::activities_errors::ActivityError, QuoteMode};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono_tz::Tz;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;
+
+pub(crate) fn validate_activity_date(
+    activity_date: &str,
+) -> std::result::Result<NaiveDate, ActivityError> {
+    let date = DateTime::parse_from_rfc3339(activity_date)
+        .map(|date| date.date_naive())
+        .or_else(|_| NaiveDate::parse_from_str(activity_date, "%Y-%m-%d"))
+        .map_err(|_| {
+            ActivityError::InvalidData(
+                "Invalid date format. Expected ISO 8601/RFC3339 or YYYY-MM-DD".to_string(),
+            )
+        })?;
+    let min_date = crate::portfolio::snapshot::min_supported_snapshot_date();
+    if date < min_date {
+        return Err(ActivityError::InvalidData(format!(
+            "Activity date {} isn't supported. Use a date on or after {}.",
+            date, min_date
+        )));
+    }
+    Ok(date)
+}
+
+pub(crate) fn validate_activity_date_in_timezone(
+    activity_date: &str,
+    timezone: Tz,
+) -> std::result::Result<NaiveDate, ActivityError> {
+    let date = DateTime::parse_from_rfc3339(activity_date)
+        .map(|date| date.with_timezone(&timezone).date_naive())
+        .or_else(|_| NaiveDate::parse_from_str(activity_date, "%Y-%m-%d"))
+        .map_err(|_| {
+            ActivityError::InvalidData(
+                "Invalid date format. Expected ISO 8601/RFC3339 or YYYY-MM-DD".to_string(),
+            )
+        })?;
+    let min_date = crate::portfolio::snapshot::min_supported_snapshot_date();
+    if date < min_date {
+        return Err(ActivityError::InvalidData(format!(
+            "Activity date {} isn't supported. Use a date on or after {}.",
+            date, min_date
+        )));
+    }
+    Ok(date)
+}
 
 /// Discriminator values for `import_account_templates.context_kind`.
 pub mod import_type {
@@ -132,6 +178,9 @@ pub struct Activity {
     #[serde(default)]
     #[serde(with = "optional_decimal_format")]
     pub fee: Option<Decimal>,
+    #[serde(default)]
+    #[serde(with = "optional_decimal_format")]
+    pub tax: Option<Decimal>,
     pub currency: String,
     #[serde(default)]
     #[serde(with = "optional_decimal_format")]
@@ -211,6 +260,12 @@ impl Activity {
         self.fee.unwrap_or(Decimal::ZERO).abs()
     }
 
+    /// Get tax or withholding amount, defaulting to zero if not set.
+    /// Always returns absolute value.
+    pub fn tax_amt(&self) -> Decimal {
+        self.tax.unwrap_or(Decimal::ZERO).abs()
+    }
+
     /// Get typed metadata value
     pub fn get_meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.metadata
@@ -282,6 +337,11 @@ pub struct NewActivity {
         default,
         deserialize_with = "decimal_input_format::deserialize_option_decimal"
     )]
+    pub tax: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
     pub amount: Option<Decimal>,
     pub status: Option<ActivityStatus>,
     #[serde(alias = "comment")]
@@ -298,6 +358,7 @@ pub struct NewActivity {
     pub source_record_id: Option<String>, // Provider's record ID
     pub source_group_id: Option<String>,  // Provider grouping key
     pub idempotency_key: Option<String>,  // Stable hash for dedupe
+    pub import_run_id: Option<String>,    // Import batch identifier
 }
 
 impl NewActivity {
@@ -316,13 +377,59 @@ impl NewActivity {
             ACTIVITY_SUBTYPE_REBATE
         } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REFUND) {
             ACTIVITY_SUBTYPE_REFUND
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REIMBURSEMENT) {
+            ACTIVITY_SUBTYPE_REIMBURSEMENT
         } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_OPTION_EXPIRY) {
             ACTIVITY_SUBTYPE_OPTION_EXPIRY
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_OPEN) {
+            ACTIVITY_SUBTYPE_POSITION_OPEN
+        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_CLOSE) {
+            ACTIVITY_SUBTYPE_POSITION_CLOSE
         } else {
             subtype
         };
 
         Some(canonical.to_string())
+    }
+
+    pub fn canonicalize_subtype_for_activity(
+        activity_type: &str,
+        subtype: Option<&str>,
+    ) -> Option<String> {
+        let subtype = subtype.map(str::trim).filter(|value| !value.is_empty())?;
+        let normalized = subtype
+            .chars()
+            .map(|c| match c {
+                ' ' | '-' => '_',
+                _ => c.to_ascii_uppercase(),
+            })
+            .collect::<String>();
+
+        let canonical = if activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_BUY) {
+            match normalized.as_str() {
+                "BTO" | "BUY_TO_OPEN" | "BUY_OPEN" | "OPEN_BUY" => {
+                    Some(ACTIVITY_SUBTYPE_POSITION_OPEN)
+                }
+                "BTC" | "BUY_TO_CLOSE" | "BUY_CLOSE" | "CLOSE_BUY" | "BUY_TO_COVER"
+                | "BUY_COVER" | "COVER_SHORT" => Some(ACTIVITY_SUBTYPE_POSITION_CLOSE),
+                _ => None,
+            }
+        } else if activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_SELL) {
+            match normalized.as_str() {
+                "STO" | "SELL_TO_OPEN" | "SELL_OPEN" | "OPEN_SELL" | "SELL_SHORT"
+                | "SHORT_SELL" | "SELL_SHORT_TO_OPEN" => Some(ACTIVITY_SUBTYPE_POSITION_OPEN),
+                "STC" | "SELL_TO_CLOSE" | "SELL_CLOSE" | "CLOSE_SELL" => {
+                    Some(ACTIVITY_SUBTYPE_POSITION_CLOSE)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        canonical
+            .map(|value| value.to_string())
+            .or_else(|| Self::canonicalize_subtype(Some(subtype)))
     }
 
     pub(crate) fn is_asset_backed_income_subtype(
@@ -399,14 +506,7 @@ impl NewActivity {
             ));
         }
 
-        // Validate date format
-        if DateTime::parse_from_rfc3339(&self.activity_date).is_err()
-            && NaiveDate::parse_from_str(&self.activity_date, "%Y-%m-%d").is_err()
-        {
-            return Err(crate::activities::ActivityError::InvalidData(
-                "Invalid date format. Expected ISO 8601/RFC3339 or YYYY-MM-DD".to_string(),
-            ));
-        }
+        validate_activity_date(&self.activity_date)?;
 
         Self::validate_asset_backed_income_values(
             &self.activity_type,
@@ -507,8 +607,16 @@ pub struct ActivityUpdate {
         default,
         deserialize_with = "decimal_input_format::deserialize_patch_decimal"
     )]
+    pub tax: Option<Option<Decimal>>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_patch_decimal"
+    )]
     pub amount: Option<Option<Decimal>>,
     pub status: Option<ActivityStatus>,
+    /// Review is independent from lifecycle status. Omitted updates preserve the stored flag.
+    #[serde(default)]
+    pub needs_review: Option<bool>,
     #[serde(alias = "comment")]
     pub notes: Option<String>,
     #[serde(
@@ -540,6 +648,7 @@ impl ActivityUpdate {
             )
             .into());
         }
+        validate_activity_date(&self.activity_date)?;
         Ok(())
     }
 
@@ -615,6 +724,29 @@ pub struct ActivityBulkMutationResult {
     pub created_mappings: Vec<ActivityBulkIdentifierMapping>,
     #[serde(default)]
     pub errors: Vec<ActivityBulkMutationError>,
+}
+
+/// Minimal update applied by the removable one-shot final-cash migration.
+#[derive(Debug, Clone)]
+pub struct ActivityFinalCashMigrationUpdate {
+    pub id: String,
+    pub amount: Option<Decimal>,
+    pub needs_review: bool,
+}
+
+/// What storage actually persisted during the final-cash rewrite. Rejected
+/// amount replacements are reported so core can rebuild from the value that
+/// remains authoritative on the row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActivityFinalCashMigrationWriteResult {
+    pub changed: usize,
+    pub unapplied_amount_update_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActivityFinalCashMigrationResult {
+    pub changed: usize,
+    pub affected_account_ids: Vec<String>,
 }
 
 /// Pair-aware request for creating or updating an internal cash transfer.
@@ -713,6 +845,8 @@ pub struct ActivityDetails {
     pub unit_price: Option<String>,
     pub currency: String,
     pub fee: Option<String>,
+    pub tax: Option<String>,
+    /// Authoritative final cash magnitude stored in `amount`.
     pub amount: Option<String>,
     pub needs_review: bool,
     pub comment: Option<String>,
@@ -726,6 +860,8 @@ pub struct ActivityDetails {
     pub exchange_mic: Option<String>,
     pub asset_pricing_mode: String, // MARKET, MANUAL, DERIVED, NONE
     pub instrument_type: Option<String>,
+    /// Effective multiplier resolved from the asset, never from activity metadata.
+    pub asset_contract_multiplier: Option<String>,
     // Sync/source metadata
     pub source_system: Option<String>,
     pub source_record_id: Option<String>,
@@ -755,6 +891,13 @@ impl ActivityDetails {
         self.fee
             .as_ref()
             .map(|s| parse_decimal_string_tolerant(s, "fee"))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn get_tax(&self) -> Decimal {
+        self.tax
+            .as_ref()
+            .map(|s| parse_decimal_string_tolerant(s, "tax"))
             .unwrap_or(Decimal::ZERO)
     }
 
@@ -823,6 +966,11 @@ pub struct ActivityImport {
         default,
         deserialize_with = "decimal_input_format::deserialize_option_decimal"
     )]
+    pub tax: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
     pub amount: Option<Decimal>,
     pub comment: Option<String>,
     pub account_id: Option<String>,
@@ -875,7 +1023,7 @@ pub struct ActivityImport {
     /// DB unique constraint is not violated. Set by the user in the review step.
     #[serde(default)]
     pub force_import: bool,
-    /// True when a TRANSFER_IN/OUT crosses the tracked-account boundary (e.g. RSU grant deposit).
+    /// Whether a transfer or credit crosses the tracked-account boundary.
     /// Persisted as `metadata.flow.is_external` so net-contribution and flow classification work.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1674,6 +1822,7 @@ pub struct ActivityUpsert {
     pub unit_price: Option<Decimal>,
     pub currency: String,
     pub fee: Option<Decimal>,
+    pub tax: Option<Decimal>,
     pub amount: Option<Decimal>,
     pub status: Option<ActivityStatus>,
     pub notes: Option<String>,
@@ -1699,6 +1848,10 @@ pub struct BulkUpsertResult {
     pub updated: usize,
     /// Number of activities skipped (e.g., user-modified)
     pub skipped: usize,
+    /// Asset ids of pre-existing SPLIT rows that were overwritten, so callers can
+    /// emit asset-level split events even when the incoming row is no longer a SPLIT
+    #[serde(skip)]
+    pub updated_split_asset_ids: Vec<String>,
 }
 
 /// Activity ready for persistence
@@ -1757,14 +1910,18 @@ impl From<ActivityImport> for NewActivity {
             Some(ActivityStatus::Posted)
         };
 
-        // Persist `is_external` as flow metadata so net_contribution and flow classification
-        // see this transfer the same way the manual activity form would.
+        // Persist boundary metadata so imported activities and manually entered activities
+        // have the same net-contribution and flow-classification semantics.
         let is_transfer = import.activity_type == ACTIVITY_TYPE_TRANSFER_IN
             || import.activity_type == ACTIVITY_TYPE_TRANSFER_OUT;
-        let metadata = if is_transfer && import.is_external == Some(true) {
-            Some(serde_json::json!({ "flow": { "is_external": true } }).to_string())
-        } else {
-            None
+        let metadata = match (import.activity_type.as_str(), import.is_external) {
+            (ACTIVITY_TYPE_CREDIT, Some(is_external)) => {
+                Some(serde_json::json!({ "flow": { "is_external": is_external } }).to_string())
+            }
+            (_, Some(true)) if is_transfer => {
+                Some(serde_json::json!({ "flow": { "is_external": true } }).to_string())
+            }
+            _ => None,
         };
 
         NewActivity {
@@ -1778,6 +1935,7 @@ impl From<ActivityImport> for NewActivity {
             unit_price: import.unit_price,
             currency: import.currency,
             fee: import.fee,
+            tax: import.tax,
             amount: import.amount,
             status,
             notes: import.comment,
@@ -1788,6 +1946,7 @@ impl From<ActivityImport> for NewActivity {
             source_record_id: None,
             source_group_id: None,
             idempotency_key: None,
+            import_run_id: None,
         }
     }
 }

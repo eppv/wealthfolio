@@ -6,6 +6,7 @@ mod context;
 mod domain_events;
 mod events;
 mod listeners;
+mod mcp;
 mod scheduler;
 mod secret_store;
 mod services;
@@ -115,7 +116,7 @@ mod desktop {
     use super::*;
 
     /// Sets up the application menu and its event handler.
-    pub fn setup_menu(handle: &AppHandle, instance_id: &Arc<String>) {
+    pub fn setup_menu(handle: &AppHandle) {
         match menu::create_menu(handle) {
             Ok(menu) => {
                 if let Err(e) = handle.set_menu(menu) {
@@ -127,9 +128,8 @@ mod desktop {
             }
         }
 
-        let instance_id = Arc::clone(instance_id);
         handle.on_menu_event(move |app, event| {
-            menu::handle_menu_event(app, &instance_id, event.id().as_ref());
+            menu::handle_menu_event(app, event.id().as_ref());
         });
     }
 
@@ -151,6 +151,17 @@ mod desktop {
         // Make context available to all commands
         handle.manage(Arc::clone(&context));
 
+        // Embedded MCP server: clear any stale lock file from an unclean
+        // shutdown, then auto-start when enabled + auto-start are both set.
+        mcp::remove_stale_lock(&handle);
+        {
+            let mcp_handle = handle.clone();
+            let mcp_context = Arc::clone(&context);
+            tauri::async_runtime::spawn(async move {
+                mcp::start_if_enabled(&mcp_handle, &mcp_context).await;
+            });
+        }
+
         #[cfg(feature = "device-sync")]
         start_sync_outbox_wake_worker(sync_outbox_wake_receiver, Arc::clone(&context));
 
@@ -167,7 +178,7 @@ mod desktop {
         });
 
         // Menu setup is synchronous (no I/O)
-        setup_menu(&handle, &context.instance_id);
+        setup_menu(&handle);
 
         // Notify frontend that app is ready
         // The frontend will trigger the initial portfolio update and update check after it's mounted
@@ -365,6 +376,9 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            // Embedded MCP server state (commands need it managed up front)
+            handle.manage(mcp::McpServerState::default());
+
             // Platform-specific plugin initialization
             #[cfg(desktop)]
             desktop::init_plugins(&handle);
@@ -434,6 +448,7 @@ pub fn run() {
             commands::settings::is_auto_update_check_enabled,
             commands::settings::update_settings,
             commands::settings::get_latest_exchange_rates,
+            commands::settings::get_exchange_rates_for_dates,
             commands::settings::update_exchange_rate,
             commands::settings::add_exchange_rate,
             commands::settings::delete_exchange_rate,
@@ -446,6 +461,9 @@ pub fn run() {
             commands::spending::get_activity_assignments,
             commands::spending::assign_activity_category,
             commands::spending::unassign_activity_category,
+            commands::spending::get_activity_splits,
+            commands::spending::replace_activity_splits,
+            commands::spending::clear_activity_splits,
             commands::spending::bulk_assign_categories,
             commands::spending::list_categorization_rules,
             commands::spending::create_categorization_rule,
@@ -501,6 +519,7 @@ pub fn run() {
             commands::portfolios::delete_portfolio_entry,
             // Portfolio commands
             commands::portfolio::get_holdings,
+            commands::portfolio::get_holdings_list,
             commands::portfolio::get_holding,
             commands::portfolio::get_asset_holdings,
             commands::portfolio::get_asset_lots,
@@ -509,6 +528,7 @@ pub fn run() {
             commands::portfolio::get_income_summary,
             commands::portfolio::get_historical_valuations,
             commands::portfolio::get_latest_valuations,
+            commands::portfolio::get_current_valuation,
             commands::portfolio::calculate_accounts_simple_performance,
             commands::portfolio::update_portfolio,
             commands::portfolio::recalculate_portfolio,
@@ -599,6 +619,10 @@ pub fn run() {
             commands::secrets::set_secret,
             commands::secrets::get_secret,
             commands::secrets::delete_secret,
+            commands::secrets::set_addon_secret,
+            commands::secrets::get_addon_secret,
+            commands::secrets::delete_addon_secret,
+            commands::addon_network::addon_network_request,
             // Provider settings commands
             commands::providers_settings::get_market_data_providers_settings,
             commands::providers_settings::update_market_data_provider_settings,
@@ -618,6 +642,18 @@ pub fn run() {
             commands::ai_chat::remove_ai_thread_tag,
             commands::ai_chat::get_ai_thread_tags,
             commands::ai_chat::update_tool_result,
+            // MCP server (Agent Access) commands
+            commands::mcp::mcp_get_status,
+            commands::mcp::mcp_set_enabled,
+            commands::mcp::mcp_set_audit_enabled,
+            commands::mcp::mcp_set_auto_start,
+            commands::mcp::mcp_start,
+            commands::mcp::mcp_stop,
+            commands::mcp::mcp_list_audit_log,
+            commands::mcp::mcp_purge_audit_log,
+            commands::mcp::mcp_list_tokens,
+            commands::mcp::mcp_create_token,
+            commands::mcp::mcp_delete_token,
             // Addon commands
             commands::addon::extract_addon_zip,
             commands::addon::install_addon_zip,
@@ -625,6 +661,7 @@ pub fn run() {
             commands::addon::toggle_addon,
             commands::addon::uninstall_addon,
             commands::addon::load_addon_for_runtime,
+            commands::addon::load_addon_asset,
             commands::addon::get_enabled_addons_on_startup,
             commands::addon::check_addon_update,
             commands::addon::check_all_addon_updates,
@@ -632,11 +669,17 @@ pub fn run() {
             commands::addon::fetch_addon_store_listings,
             commands::addon::download_addon_to_staging,
             commands::addon::install_addon_from_staging,
+            commands::addon::update_addon_network_approvals,
             commands::addon::clear_addon_staging,
             commands::addon::submit_addon_rating,
+            commands::addon::get_addon_storage_item,
+            commands::addon::set_addon_storage_item,
+            commands::addon::delete_addon_storage_item,
             // Sync commands
             #[cfg(any(feature = "connect-sync", feature = "device-sync"))]
             commands::wealthfolio_connect::store_sync_session,
+            #[cfg(any(feature = "connect-sync", feature = "device-sync"))]
+            commands::wealthfolio_connect::post_login_bootstrap,
             #[cfg(any(feature = "connect-sync", feature = "device-sync"))]
             commands::wealthfolio_connect::clear_sync_session,
             #[cfg(any(feature = "connect-sync", feature = "device-sync"))]
@@ -806,6 +849,8 @@ pub fn run() {
             commands::allocation_targets::list_allocation_target_weights,
             commands::allocation_targets::save_allocation_target_weights,
             commands::allocation_targets::save_allocation_target_with_weights,
+            commands::allocation_targets::list_target_constraints,
+            commands::allocation_targets::save_target_constraints,
             commands::allocation_targets::get_allocation_target_drift,
             commands::allocation_targets::calculate_rebalance_plan,
             // RetirementPlan-based FIRE commands
@@ -824,6 +869,14 @@ pub fn run() {
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
+                // Stop the embedded MCP server and delete mcp.lock.
+                if _handle.try_state::<mcp::McpServerState>().is_some() {
+                    let mcp_handle = _handle.clone();
+                    tauri::async_runtime::block_on(async move {
+                        mcp::stop_server(&mcp_handle).await;
+                    });
+                }
+
                 #[cfg(feature = "device-sync")]
                 if let Some(context) = _handle.try_state::<Arc<context::ServiceContext>>() {
                     let context = Arc::clone(context.inner());

@@ -21,6 +21,8 @@ import type {
   ContributionLimit,
   DepositsCalculation,
   ExchangeRate,
+  ExchangeRateDateQuery,
+  ExchangeRateDateResult,
   Goal,
   GoalAllocation,
   Holding,
@@ -379,6 +381,18 @@ export interface ExchangeRatesAPI {
    * @returns Promise resolving to created exchange rate
    */
   add(newRate: Omit<ExchangeRate, 'id'>): Promise<ExchangeRate>;
+
+  /**
+   * Look up historical exchange rates for a batch of (currency pair, date) requests.
+   * Dates must use YYYY-MM-DD. Resolution follows Wealthfolio's core FX rules,
+   * including currency normalization, inverse or triangulated paths, nearest
+   * available quotes, and the existing latest-rate fallback.
+   * Never rejects for an individual unresolvable pair — each result carries
+   * either a rate or an error, so one bad pair doesn't fail the whole batch.
+   * @param pairs Currency pairs and dates to resolve
+   * @returns Promise resolving to one result per requested pair, in the same order
+   */
+  getRatesForDates(pairs: ExchangeRateDateQuery[]): Promise<ExchangeRateDateResult[]>;
 }
 
 /**
@@ -545,6 +559,44 @@ export interface SecretsAPI {
 }
 
 /**
+ * Storage APIs
+ * Durable per-addon key-value storage (SQLite-backed on the host).
+ * Values are opaque strings owned by the addon; storage survives addon
+ * updates and is removed on uninstall. Each addon can only access its own
+ * storage. Use this instead of `localStorage`, which is unavailable in the
+ * sandboxed (opaque-origin) iframe.
+ *
+ * Keys are ≤ 128 characters from the charset `[A-Za-z0-9_.:-]`. Values are
+ * capped at roughly 250 KB each (the storage replicates across a user's paired
+ * devices, which bounds per-item size); `set` rejects an oversized value. Use
+ * many small keys rather than one large blob, and keep device-local caches out
+ * of storage.
+ */
+export interface StorageAPI {
+  /**
+   * Retrieve a stored value for this addon
+   * @param key Storage key identifier
+   * @returns Promise resolving to the stored value or null if not found
+   */
+  get(key: string): Promise<string | null>;
+
+  /**
+   * Store a value for this addon
+   * @param key Storage key identifier
+   * @param value Value to store
+   * @returns Promise that resolves when the value is stored
+   */
+  set(key: string, value: string): Promise<void>;
+
+  /**
+   * Delete a stored value for this addon
+   * @param key Storage key identifier
+   * @returns Promise that resolves when the value is deleted
+   */
+  delete(key: string): Promise<void>;
+}
+
+/**
  * Logger APIs
  * Provides logging functionality with automatic addon prefix
  * All log messages will be prefixed with the addon ID for easy identification
@@ -704,8 +756,10 @@ export interface ToastAPI {
  */
 export interface QueryAPI {
   /**
-   * Get the shared QueryClient instance from the main application
-   * @returns The shared QueryClient instance
+   * Get the QueryClient scoped to this addon sandbox. Its invalidate/refetch
+   * operations are mirrored to the host, but its cache is not shared with the
+   * main application or other addons.
+   * @returns The addon-scoped QueryClient instance
    */
   getClient(): unknown; // QueryClient from @tanstack/react-query
 
@@ -720,6 +774,36 @@ export interface QueryAPI {
    * @param queryKey The query key to refetch
    */
   refetchQueries(queryKey: string | string[]): void;
+}
+
+export interface NetworkRequest {
+  url: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
+  headers?: Record<string, string>;
+  body?: string;
+  auth?: NetworkAuth;
+}
+
+export interface NetworkResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+export interface NetworkAuth {
+  /**
+   * Authorization scheme. For `basic`, the stored secret must be the
+   * base64-encoded `user:pass` value.
+   */
+  type: 'bearer' | 'basic';
+  secretKey: string;
+}
+
+export interface NetworkAPI {
+  /**
+   * Send a brokered HTTPS request to a host declared in the addon manifest.
+   */
+  request(request: NetworkRequest): Promise<NetworkResponse>;
 }
 
 /**
@@ -793,6 +877,9 @@ export interface HostAPI {
   /** Secrets management */
   secrets: SecretsAPI;
 
+  /** Durable per-addon key-value storage */
+  storage: StorageAPI;
+
   /** Logger operations */
   logger: LoggerAPI;
 
@@ -804,6 +891,9 @@ export interface HostAPI {
 
   /** React Query operations */
   query: QueryAPI;
+
+  /** Brokered external network operations */
+  network: NetworkAPI;
 
   /** Toast notification operations */
   toast: ToastAPI;

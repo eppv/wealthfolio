@@ -1,7 +1,9 @@
 # API Reference
 
-Complete reference for Wealthfolio addon APIs. All functions require appropriate
-permissions in `manifest.json`.
+Complete reference for Wealthfolio addon APIs. Data APIs require an appropriate
+permission entry in `manifest.json`. The baseline capabilities — `query`,
+`storage`, `toast`, `logger`, UI integration, and packaged assets — are
+available to every addon and need no declaration.
 
 ## Context Overview
 
@@ -12,25 +14,36 @@ export interface AddonContext {
   api: HostAPI;
   sidebar: SidebarAPI;
   router: RouterAPI;
+  ui: { root: HTMLElement };
+  assets: AddonAssets;
   onDisable: (callback: () => void) => void;
 }
 ```
 
 Basic usage:
 
-````typescript
-export default function enable(ctx: AddonContext) {
-  // Access APIs
+```typescript
+export default async function enable(ctx: AddonContext) {
   const accounts = await ctx.api.accounts.getAll();
-  #### `onDropHover(callback: EventCallback): Promise<UnlistenFn>`
-  Fires when files are hovered over for import.
+  const logoUrl = await ctx.assets.getUrl("assets/logo.png");
+  ctx.api.logger.info(`Loaded ${accounts.length} accounts and ${logoUrl}`);
+}
+```
 
-  ```typescript
-  const unlistenHover = await ctx.api.events.import.onDropHover((event) => {
-    console.log('File hover detected');
-    showDropZone();
-  });
-````
+`ctx.assets` refers to files private to the addon package. The similarly named
+`ctx.api.assets` API manages financial instrument records.
+
+## Import Events
+
+#### `onDropHover(callback: EventCallback): Promise<UnlistenFn>`
+
+Fires when files are hovered over for import.
+
+```typescript
+const unlistenHover = await ctx.api.events.import.onDropHover(() => {
+  showDropZone();
+});
+```
 
 #### `onDrop(callback: EventCallback): Promise<UnlistenFn>`
 
@@ -54,6 +67,54 @@ const unlistenCancel = await ctx.api.events.import.onDropCancelled(() => {
   hideDropZone();
 });
 ```
+
+---
+
+## Packaged Assets API
+
+Access static files indexed from `assets/**` and `dist/assets/**`. No manifest
+field or permission is required. Addons using this v3.7 API must set
+`minWealthfolioVersion` to `3.7.0` or newer.
+
+### Methods
+
+#### `list(): readonly AddonAsset[]`
+
+Returns public metadata (`path`, `mimeType`, and `size`). Host paths and opaque
+asset identifiers are never exposed.
+
+#### `has(path: string): boolean`
+
+Checks a logical package path. Invalid and traversing paths return `false`.
+
+#### `getBlob(path: string): Promise<Blob>`
+
+Loads and verifies asset bytes lazily. Concurrent requests for the same asset
+share a load; a failed load can be retried.
+
+#### `getUrl(path: string): Promise<string>`
+
+Returns a cached, sandbox-local Blob URL. The URL is revoked automatically when
+the addon reloads or stops and must not be persisted.
+
+```typescript
+const [logoUrl, wasm] = await Promise.all([
+  ctx.assets.getUrl("assets/logo.png"),
+  ctx.assets.getBlob("dist/assets/module.wasm"),
+]);
+
+await WebAssembly.instantiate(await wasm.arrayBuffer());
+```
+
+Local CSS `url(...)` references are rewritten automatically relative to the CSS
+file. `data:` and `blob:` URLs are preserved. Remote CSS URLs and `@import` are
+rejected; JavaScript/JSX asset strings are not rewritten, so use `getUrl()`. See
+the [v3.6 to v3.7 migration guide](./addon-migration-guide-v3.6-to-v3.7.md) for
+package limits and compatibility details.
+
+Blob URLs may be used by images, fonts, media elements, and WebAssembly. Worker
+and service-worker entry points, popups, direct network access, and remote CSS
+imports are intentionally unavailable inside the addon sandbox.
 
 ---
 
@@ -89,14 +150,16 @@ await ctx.api.navigation.navigate("/settings");
 
 ## Query API
 
-Access and manipulate the shared React Query client for efficient data
-management.
+Access the QueryClient scoped to this addon and coordinate invalidation with the
+host.
 
 ### Methods
 
 #### `getClient(): QueryClient`
 
-Gets the shared QueryClient instance from the main application.
+Gets the sandbox's addon-local QueryClient. It is reused across this addon's
+routes, but its cache is not shared with the host or other addons. Calls to the
+client's `invalidateQueries()` and `refetchQueries()` are mirrored to the host.
 
 ```typescript
 const queryClient = ctx.api.query.getClient();
@@ -164,9 +227,41 @@ export default function enable(ctx: AddonContext) {
 
 ## UI Integration APIs
 
+### Declarative Navigation (preferred)
+
+Static navigation belongs in `manifest.json`, not in code. The host reads it
+into a registry and renders your sidebar entry **without booting the addon**,
+which is what enables lazy activation. Two primitives:
+
+```jsonc
+"contributes": {
+  "routes": [{ "id": "my-addon" }],
+  "links": {
+    "sidebar": [
+      { "id": "my-addon", "route": "my-addon", "label": "My Addon", "icon": "wallet", "order": 100 }
+    ]
+  }
+}
+```
+
+- A **route** is a durable addon page — host-renderable before the addon boots,
+  and the surface that triggers lazy activation. A route with no link is a legal
+  deep-link-only page.
+- The host owns its URL namespace: a route with no `path` mounts at
+  `/addons/<manifest.id>`. An optional `path` is a relative suffix such as
+  `reports/:year`; absolute paths, traversal, queries, and fragments are
+  rejected.
+- A **link** places a route into a host slot and references a declared route by
+  `id`. Only `"sidebar"` is consumed today; unknown slot names are reserved for
+  future surfaces.
+- **Contract:** the runtime `router.add({ id })` MUST equal the declared
+  `contributes.routes[].id`. A mismatch renders a blank "route is not available"
+  page.
+
 ### Sidebar API
 
-Add navigation items to the main application sidebar.
+Runtime sidebar registration still exists for **genuinely dynamic** items;
+static nav should be declared in the manifest instead.
 
 #### `addItem(item: SidebarItem): SidebarItemHandle`
 
@@ -174,8 +269,8 @@ Add navigation items to the main application sidebar.
 const sidebarItem = ctx.sidebar.addItem({
   id: "my-addon",
   label: "My Addon",
-  route: "/addon/my-addon",
-  icon: MyAddonIcon, // Optional React component
+  route: "/addons/my-addon",
+  icon: "puzzle-piece", // Optional host icon name; see the migration guide for the full list
   order: 100, // Lower numbers appear first
 });
 
@@ -187,22 +282,49 @@ ctx.onDisable(() => {
 
 ### Router API
 
-Register routes for your addon's pages.
+Register the component that renders your addon's page. The host owns a single
+React root and mounts the component itself.
 
 #### `add(route: RouteConfig): void`
 
 ```typescript
-ctx.router.add({
-  path: "/addon/my-addon",
-  component: React.lazy(() => Promise.resolve({ default: MyAddonComponent })),
-});
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
-// Multiple routes
-ctx.router.add({
-  path: "/addon/my-addon/settings",
-  component: React.lazy(() => Promise.resolve({ default: MyAddonSettings })),
-});
+// The host mounts the route component with no ctx, so capture it at enable time.
+let addonCtx: AddonContext | undefined;
+
+const MyAddonRoute = () => (
+  <QueryClientProvider client={addonCtx!.api.query.getClient() as QueryClient}>
+    <MyAddonComponent ctx={addonCtx!} />
+  </QueryClientProvider>
+);
+
+const enable: AddonEnableFunction = (ctx) => {
+  addonCtx = ctx;
+
+  // `id` MUST match the declared `contributes.routes[].id`.
+  ctx.router.add({
+    id: "my-addon",
+    path: "/addons/my-addon",
+    component: MyAddonRoute,
+  });
+
+  ctx.onDisable(() => {
+    addonCtx = undefined;
+  });
+};
 ```
+
+- **Do not call `createRoot` yourself.** The host owns the root; a per-route
+  `createRoot` orphans the React tree so re-renders never reach the DOM (the
+  "buttons do nothing" bug). Provide **exactly one** of `component` or `render`;
+  if both are set, `component` wins.
+- The component receives a `{ location }` prop (`AddonRouteLocation` with
+  `pathname/search/hash/params`). The sandbox has **no** react-router provider,
+  so do not call `useLocation()` / `useParams()` — read `location` from props.
+- `render` still exists as a legacy/imperative escape hatch (it receives
+  `{ root, location }` and you mount into `root` yourself), but `component` is
+  preferred.
 
 ---
 
@@ -570,6 +692,32 @@ const newRate = await ctx.api.exchangeRates.add({
 });
 ```
 
+#### `getRatesForDates(pairs: ExchangeRateDateQuery[]): Promise<ExchangeRateDateResult[]>`
+
+Gets one resolved exchange rate for each requested currency pair and date. Dates
+must use `YYYY-MM-DD`. Resolution follows Wealthfolio's standard FX rules,
+including currency normalization, inverse and triangulated rates, nearest-date
+lookup, and latest-rate fallback. The returned rate is therefore not guaranteed
+to come from an exact quote on the requested date.
+
+Results preserve the input order. A pair that cannot be resolved returns
+`rate: null` and an `error` without failing the rest of the batch.
+
+```typescript
+const results = await ctx.api.exchangeRates.getRatesForDates([
+  { fromCurrency: "USD", toCurrency: "EUR", date: "2024-01-15" },
+  { fromCurrency: "CAD", toCurrency: "JPY", date: "2024-01-15" },
+]);
+
+for (const result of results) {
+  if (result.rate !== null) {
+    console.log(result.fromCurrency, result.toCurrency, result.rate);
+  } else {
+    console.error(result.error);
+  }
+}
+```
+
 ---
 
 ## Contribution Limits API
@@ -767,6 +915,47 @@ const result = await ctx.api.files.openSaveDialog(fileContent, "export.csv");
 
 ---
 
+## Storage API
+
+Durable, per-addon key/value storage. This is a **baseline capability** (no
+permission declaration needed) and the correct replacement for `localStorage`,
+which throws inside the sandbox. Values survive addon updates, are cleared on
+uninstall, and replicate across paired devices.
+
+### Methods
+
+#### `get(key: string): Promise<string | null>`
+
+Reads a stored value, or `null` if the key is unset.
+
+```typescript
+const raw = await ctx.api.storage.get("prefs");
+const prefs = raw ? JSON.parse(raw) : defaults;
+```
+
+#### `set(key: string, value: string): Promise<void>`
+
+Writes a value. Keys are ≤128 chars from the charset `[A-Za-z0-9_.:-]`; values
+are ≤1 MiB. Serialize objects yourself (e.g. with `JSON.stringify`).
+
+```typescript
+await ctx.api.storage.set("prefs", JSON.stringify(prefs));
+```
+
+#### `delete(key: string): Promise<void>`
+
+Removes a stored value.
+
+```typescript
+await ctx.api.storage.delete("prefs");
+```
+
+> **Info** **Storage vs. Secrets**: use `storage` for ordinary addon preferences
+> and state; use `secrets` (below) for sensitive tokens and API keys, which are
+> encrypted at rest.
+
+---
+
 ## Secrets API
 
 Securely store and retrieve sensitive data like API keys and tokens. All data is
@@ -793,10 +982,16 @@ Retrieves a secret value (returns null if not found).
 ```typescript
 const apiKey = await ctx.api.secrets.get("api-key");
 if (apiKey) {
-  // Use the API key
-  const data = await fetch(`https://api.example.com/data?key=${apiKey}`);
+  const response = await ctx.api.network.request({
+    url: "https://api.example.com/data",
+    auth: { type: "bearer", secretKey: "api-key" },
+  });
 }
 ```
+
+Prefer brokered `ctx.api.network.request()` over reading a secret into addon
+JavaScript. The request host must be declared in `network.allowedHosts` and its
+response body is text, not a binary transport.
 
 #### `delete(key: string): Promise<void>`
 

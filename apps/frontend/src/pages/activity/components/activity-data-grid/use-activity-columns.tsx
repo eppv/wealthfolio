@@ -3,35 +3,48 @@ import {
   isAssetBackedIncomeSubtype,
   isAssetIdentityRequired,
   isCashActivity,
+  localizeActivitySubtypeName,
+  localizeActivityTypeName,
+  supportsPerformanceBoundary,
 } from "@/lib/activity-utils";
 import {
   ActivityStatus,
   ActivityType,
-  ActivityTypeNames,
-  INSTRUMENT_TYPE_OPTIONS,
   getExchangeDisplayName,
-  SUBTYPE_DISPLAY_NAMES,
+  INSTRUMENT_TYPE_OPTIONS,
   SUBTYPES_BY_ACTIVITY_TYPE,
 } from "@/lib/constants";
-import { parseOccSymbol } from "@/lib/occ-symbol";
+import { formatOptionSubtitle, parseOccSymbol } from "@/lib/occ-symbol";
 import type { Account, ActivityDetails } from "@/lib/types";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Badge, Checkbox, type SymbolSearchResult } from "@wealthfolio/ui";
+import {
+  Badge,
+  Checkbox,
+  type SymbolSearchResult,
+  useDateFormatting,
+  useNumberFormatting,
+} from "@wealthfolio/ui";
+import type { TFunction } from "i18next";
 import { useCallback, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { ActivityOperations } from "../activity-operations";
 import { ActivityTypeBadge } from "../activity-type-badge";
 import { StatusHeaderIndicator, StatusIndicator } from "./status-indicator";
 import { isPendingReview, type LocalTransaction } from "./types";
 
-// Status display names and colors
-const STATUS_DISPLAY: Record<
-  string,
-  { label: string; variant: "default" | "secondary" | "outline" | "destructive" }
-> = {
-  [ActivityStatus.POSTED]: { label: "Posted", variant: "default" },
-  [ActivityStatus.PENDING]: { label: "Pending", variant: "secondary" },
-  [ActivityStatus.DRAFT]: { label: "Draft", variant: "outline" },
-  [ActivityStatus.VOID]: { label: "Void", variant: "destructive" },
+// Status badge variants (labels are resolved via translation at render time)
+const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
+  [ActivityStatus.POSTED]: "default",
+  [ActivityStatus.PENDING]: "secondary",
+  [ActivityStatus.DRAFT]: "outline",
+  [ActivityStatus.VOID]: "destructive",
+};
+
+const STATUS_LABEL_KEY: Record<string, string> = {
+  [ActivityStatus.POSTED]: "activity:detail.status_posted",
+  [ActivityStatus.PENDING]: "activity:detail.status_pending",
+  [ActivityStatus.DRAFT]: "activity:detail.status_draft",
+  [ActivityStatus.VOID]: "activity:detail.status_void",
 };
 
 const isTransferActivity = (activityType: string | undefined): boolean => {
@@ -55,13 +68,9 @@ const shouldDisplaySubtype = (
   );
 };
 
-const getSubtypeDisplayLabel = (subtype: string, optionLabel?: string): string => {
-  const normalizedSubtype = normalizeActivityToken(subtype);
-  return optionLabel ?? SUBTYPE_DISPLAY_NAMES[normalizedSubtype] ?? subtype;
+const getSubtypeDisplayLabel = (t: TFunction, subtype: string, optionLabel?: string): string => {
+  return optionLabel ?? localizeActivitySubtypeName(t, subtype);
 };
-
-const UNIT_PRICE_HELP_TEXT =
-  "For buys and sells, enter the trade price. For staking rewards and in-kind dividends, enter the fair market value per unit at receipt; it sets income amount and cost basis.";
 
 interface UseActivityColumnsOptions {
   accounts: Account[];
@@ -89,13 +98,20 @@ export function useActivityColumns({
   onSymbolSelect,
   onCreateCustomAsset,
 }: UseActivityColumnsOptions) {
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const formatting = { ...dateFormatting, ...numberFormatting };
+
+  const { t } = useTranslation();
+
   const activityTypeOptions = useMemo(
     () =>
       (Object.values(ActivityType) as ActivityType[]).map((type) => ({
         value: type,
-        label: ActivityTypeNames[type],
+        label: localizeActivityTypeName(t, type),
       })),
-    [],
+    [t],
   );
 
   const accountOptions = useMemo(
@@ -123,14 +139,14 @@ export function useActivityColumns({
               table.getIsAllRowsSelected() || (table.getIsSomeRowsSelected() && "indeterminate")
             }
             onCheckedChange={(checked) => table.toggleAllRowsSelected(Boolean(checked))}
-            aria-label="Select all rows"
+            aria-label={t("activity:datagrid.select_all_rows")}
           />
         ),
         cell: ({ row }) => (
           <Checkbox
             checked={row.getIsSelected()}
             onCheckedChange={(checked) => row.toggleSelected(Boolean(checked))}
-            aria-label="Select row"
+            aria-label={t("activity:datagrid.select_row")}
           />
         ),
         size: 40,
@@ -163,7 +179,7 @@ export function useActivityColumns({
       {
         id: "date",
         accessorKey: "date",
-        header: "Date & Time",
+        header: t("activity:datagrid.column.date_time"),
         size: 180,
         meta: { cell: { variant: "datetime" } },
       },
@@ -171,7 +187,7 @@ export function useActivityColumns({
       {
         id: "accountName",
         accessorKey: "accountId",
-        header: "Account",
+        header: t("activity:datagrid.column.account"),
         size: 180,
         meta: { cell: { variant: "select", options: accountOptions } },
       },
@@ -180,7 +196,7 @@ export function useActivityColumns({
       // 5. Type
       {
         accessorKey: "activityType",
-        header: "Type",
+        header: t("activity:datagrid.column.type"),
         size: 150,
         enablePinning: false,
         meta: {
@@ -206,7 +222,7 @@ export function useActivityColumns({
       {
         id: "subtype",
         accessorKey: "subtype",
-        header: "Subtype",
+        header: t("activity:datagrid.column.subtype"),
         size: 160,
         enableSorting: false,
         enableHiding: true,
@@ -221,18 +237,18 @@ export function useActivityColumns({
               const allowedSubtypes = SUBTYPES_BY_ACTIVITY_TYPE[activityType] || [];
               return allowedSubtypes.map((subtype) => ({
                 value: subtype,
-                label: SUBTYPE_DISPLAY_NAMES[subtype] || subtype,
+                label: localizeActivitySubtypeName(t, subtype),
               }));
             }) as any,
             allowEmpty: true,
-            emptyLabel: "None",
+            emptyLabel: t("activity:form.subtype_none"),
             valueRenderer: (value: string, option, rowData) => {
               const transaction = rowData as LocalTransaction | undefined;
               if (!shouldDisplaySubtype(transaction, transaction?.activityType, value)) {
                 return null;
               }
 
-              const displayLabel = getSubtypeDisplayLabel(value, option?.label);
+              const displayLabel = getSubtypeDisplayLabel(t, value, option?.label);
 
               return (
                 <Badge
@@ -247,25 +263,20 @@ export function useActivityColumns({
           },
         },
       },
-      // 7. External (checkbox for TRANSFER_IN/TRANSFER_OUT only)
+      // 7. Explicit performance boundary for transfers and credits
       {
         id: "isExternal",
         accessorKey: "isExternal",
-        header: "External",
+        header: t("activity:datagrid.column.external"),
         size: 80,
         enableSorting: false,
         enableHiding: true,
         meta: {
           cell: {
             variant: "checkbox",
-            // Only enabled for transfer types
             isDisabled: (rowData: unknown) => {
               const row = rowData as LocalTransaction;
-              const activityType = row.activityType?.toUpperCase();
-              return (
-                activityType !== ActivityType.TRANSFER_IN &&
-                activityType !== ActivityType.TRANSFER_OUT
-              );
+              return !supportsPerformanceBoundary(row.activityType);
             },
           },
         },
@@ -273,7 +284,7 @@ export function useActivityColumns({
       // 8. Symbol
       {
         accessorKey: "assetSymbol",
-        header: "Symbol",
+        header: t("activity:datagrid.column.symbol"),
         size: 160,
         meta: {
           cell: {
@@ -295,11 +306,7 @@ export function useActivityColumns({
               // Show contract description for options
               const parsed = row.instrumentType === "OPTION" ? parseOccSymbol(symbol) : null;
               if (parsed) {
-                const expDisplay = new Date(parsed.expiration + "T12:00:00").toLocaleDateString(
-                  "en-US",
-                  { month: "short", day: "numeric" },
-                );
-                return `${expDisplay} $${parsed.strikePrice} ${parsed.optionType}`;
+                return formatOptionSubtitle(parsed, formatting);
               }
               return getExchangeDisplayName(row.exchangeMic);
             },
@@ -324,7 +331,7 @@ export function useActivityColumns({
       {
         id: "instrumentType",
         accessorKey: "instrumentType",
-        header: "Instrument",
+        header: t("activity:datagrid.column.instrument"),
         size: 120,
         enableSorting: false,
         enableHiding: true,
@@ -336,7 +343,7 @@ export function useActivityColumns({
               label: opt.label,
             })),
             allowEmpty: true,
-            emptyLabel: "Auto",
+            emptyLabel: t("activity:datagrid.instrument_auto"),
           },
         },
       },
@@ -345,7 +352,7 @@ export function useActivityColumns({
       // 10. Quantity
       {
         accessorKey: "quantity",
-        header: "Quantity",
+        header: t("activity:datagrid.column.quantity"),
         size: 120,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
@@ -353,18 +360,18 @@ export function useActivityColumns({
       // 9. Price
       {
         accessorKey: "unitPrice",
-        header: "Price",
+        header: t("activity:datagrid.column.price"),
         size: 120,
         enableSorting: false,
         meta: {
-          helpText: UNIT_PRICE_HELP_TEXT,
+          helpText: t("activity:datagrid.unit_price_help"),
           cell: { variant: "number", step: 0.000001, valueType: "string" },
         },
       },
       // 10. Amount (most important money column)
       {
         accessorKey: "amount",
-        header: "Amount",
+        header: t("activity:datagrid.column.amount"),
         size: 120,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
@@ -372,7 +379,7 @@ export function useActivityColumns({
       // 11. Currency
       {
         accessorKey: "currency",
-        header: "Currency",
+        header: t("activity:datagrid.column.currency"),
         size: 110,
         enableSorting: false,
         meta: { cell: { variant: "currency" } },
@@ -380,15 +387,23 @@ export function useActivityColumns({
       // 12. Fee
       {
         accessorKey: "fee",
-        header: "Fee",
+        header: t("activity:datagrid.column.fee"),
         size: 100,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
       },
-      // 13. FX Rate (lowest priority; often hidden)
+      // 13. Tax
+      {
+        accessorKey: "tax",
+        header: t("activity:datagrid.column.tax"),
+        size: 100,
+        enableSorting: false,
+        meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
+      },
+      // 14. FX Rate (lowest priority; often hidden)
       {
         accessorKey: "fxRate",
-        header: "FX Rate",
+        header: t("activity:datagrid.column.fx_rate"),
         size: 100,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
@@ -398,7 +413,7 @@ export function useActivityColumns({
       // 14. Comment
       {
         accessorKey: "comment",
-        header: "Comment",
+        header: t("activity:datagrid.column.comment"),
         size: 260,
         enableSorting: false,
         meta: { cell: { variant: "long-text" } },
@@ -407,20 +422,19 @@ export function useActivityColumns({
       {
         id: "activityStatus",
         accessorKey: "status",
-        header: "Status",
+        header: t("activity:datagrid.column.status"),
         size: 100,
         enableSorting: false,
         enableHiding: true,
         cell: ({ row }) => {
           const status = row.original.status;
           if (!status) return <span className="text-muted-foreground">—</span>;
-          const displayInfo = STATUS_DISPLAY[status] || {
-            label: status,
-            variant: "default" as const,
-          };
+          const variant = STATUS_VARIANT[status] ?? "default";
+          const labelKey = STATUS_LABEL_KEY[status];
+          const label = labelKey ? t(labelKey) : status;
           return (
-            <Badge variant={displayInfo.variant} className="text-xs font-normal">
-              {displayInfo.label}
+            <Badge variant={variant} className="text-xs font-normal">
+              {label}
             </Badge>
           );
         },
@@ -450,6 +464,7 @@ export function useActivityColumns({
     [
       accountOptions,
       activityTypeOptions,
+      formatting,
       handleSymbolSearch,
       onCreateCustomAsset,
       onDelete,
@@ -458,6 +473,7 @@ export function useActivityColumns({
       onLinkTransfer,
       onUnlinkTransfer,
       onSymbolSelect,
+      t,
     ],
   );
 

@@ -11,6 +11,7 @@ import {
   Skeleton,
 } from "@wealthfolio/ui";
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 interface DrillableDonutChartProps {
   title: string;
@@ -34,6 +35,7 @@ export function DrillableDonutChart({
   onCategoryClick,
   onCardClick,
 }: DrillableDonutChartProps) {
+  const { t } = useTranslation();
   const [activeIndex, setActiveIndex] = useState(0);
   const { path, drillDown, navigateTo, isAtRoot } = useDrillDownState();
 
@@ -79,6 +81,15 @@ export function DrillableDonutChart({
   }, [path, allocation, baseCurrency]);
 
   const data = isAtRoot ? rootData : drilledData;
+
+  // The selection points at a category, not at a position — reset it when the categories
+  // change (re-classification, account-scope change) instead of pointing at a new one.
+  const categoryKey = data.map((item) => item.id).join("|");
+  const [renderedCategoryKey, setRenderedCategoryKey] = useState(categoryKey);
+  if (categoryKey !== renderedCategoryKey) {
+    setRenderedCategoryKey(categoryKey);
+    setActiveIndex(0);
+  }
 
   const handleSectionClick = (
     sectionData: { name: string; value: number; currency: string },
@@ -155,7 +166,7 @@ export function DrillableDonutChart({
           />
         ) : (
           <EmptyPlaceholder
-            description={`No ${title.toLowerCase()} data available.`}
+            description={t("holdings:no_typed_data_available", { type: title.toLowerCase() })}
             className="max-h-[160px]"
           />
         )}

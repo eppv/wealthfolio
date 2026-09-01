@@ -22,6 +22,7 @@ const GOAL_LIFECYCLE_ARCHIVED: &str = "archived";
 const RETIREMENT_MIN_ANNUAL_RETURN: f64 = -0.20;
 const RETIREMENT_MAX_ANNUAL_RETURN: f64 = 0.50;
 const RETIREMENT_MAX_ANNUAL_INVESTMENT_FEE: f64 = 0.10;
+const RETIREMENT_MAX_DC_PAYOUT_RATE: f64 = 0.25;
 const RETIREMENT_MAX_ANNUAL_VOLATILITY: f64 = 1.0;
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -321,6 +322,30 @@ pub fn validate_retirement_plan(plan: &RetirementPlan) -> Result<()> {
                 RETIREMENT_MIN_ANNUAL_RETURN,
                 RETIREMENT_MAX_ANNUAL_RETURN,
             )?;
+        }
+        if let Some(value) = stream.payout_rate {
+            validate_finite_range(
+                "Defined-contribution payout rate",
+                value,
+                0.0,
+                RETIREMENT_MAX_DC_PAYOUT_RATE,
+            )?;
+        }
+        if let Some(value) = stream.post_payout_return {
+            validate_finite_range(
+                "Defined-contribution return during payout",
+                value,
+                RETIREMENT_MIN_ANNUAL_RETURN,
+                RETIREMENT_MAX_ANNUAL_RETURN,
+            )?;
+        }
+        if stream.is_drawdown()
+            && stream.current_value.unwrap_or(0.0) <= 0.0
+            && stream.monthly_contribution.unwrap_or(0.0) <= 0.0
+        {
+            return invalid_input(
+                "A drawdown fund needs a balance or contributions to draw against",
+            );
         }
     }
     if let Some(ref tax) = plan.tax {
@@ -1489,6 +1514,9 @@ mod tests {
             current_value: None,
             monthly_contribution: None,
             accumulation_return: None,
+            payout_rate: None,
+            payout_mode: None,
+            post_payout_return: None,
         });
         assert!(validate_retirement_plan(&plan)
             .expect_err("negative income should be rejected")
@@ -1512,6 +1540,47 @@ mod tests {
     }
 
     #[test]
+    fn retirement_plan_validation_covers_drawdown_funds() {
+        let drawdown_fund =
+            |current_value: Option<f64>, post_payout_return: Option<f64>| RetirementIncomeStream {
+                id: "dc".into(),
+                label: "RRSP".into(),
+                stream_type: StreamKind::DefinedContribution,
+                start_age: 65,
+                adjust_for_inflation: false,
+                annual_growth_rate: None,
+                monthly_amount: None,
+                linked_account_id: None,
+                current_value,
+                monthly_contribution: None,
+                accumulation_return: None,
+                payout_rate: Some(0.08),
+                payout_mode: Some(PayoutMode::Drawdown),
+                post_payout_return,
+            };
+
+        let mut plan = valid_retirement_plan();
+        plan.income_streams.push(drawdown_fund(None, None));
+        assert!(validate_retirement_plan(&plan)
+            .expect_err("a drawdown fund with nothing in it should be rejected")
+            .to_string()
+            .contains("drawdown fund"));
+
+        let mut plan = valid_retirement_plan();
+        plan.income_streams
+            .push(drawdown_fund(Some(100_000.0), Some(0.99)));
+        assert!(validate_retirement_plan(&plan)
+            .expect_err("an out-of-range payout-phase return should be rejected")
+            .to_string()
+            .contains("return during payout"));
+
+        let mut plan = valid_retirement_plan();
+        plan.income_streams
+            .push(drawdown_fund(Some(100_000.0), Some(0.04)));
+        validate_retirement_plan(&plan).expect("a funded drawdown should validate");
+    }
+
+    #[test]
     fn retirement_plan_validation_accepts_frontend_assumption_caps() {
         let mut plan = valid_retirement_plan();
         plan.investment.pre_retirement_annual_return = RETIREMENT_MAX_ANNUAL_RETURN;
@@ -1530,6 +1599,9 @@ mod tests {
             current_value: Some(10_000.0),
             monthly_contribution: Some(100.0),
             accumulation_return: Some(RETIREMENT_MAX_ANNUAL_RETURN),
+            payout_rate: None,
+            payout_mode: None,
+            post_payout_return: None,
         });
 
         validate_retirement_plan(&plan).expect("frontend caps should validate");

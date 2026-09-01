@@ -6,13 +6,15 @@ import { useAssets } from "@/pages/asset/hooks/use-assets";
 import type { SortingState, Updater, VisibilityState } from "@tanstack/react-table";
 import { DataGrid, useDataGrid, type SymbolSearchResult } from "@wealthfolio/ui";
 import { useCallback, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { resolveSymbolQuote } from "@/adapters";
 import { CreateCustomAssetDialog } from "@/components/create-custom-asset-dialog";
-import { ActivityType } from "@/lib/constants";
+import { ActivityStatus, ActivityType } from "@/lib/constants";
 import { isManualSearchResult, quoteModeFromSearchResult } from "@/lib/asset-utils";
 import { generateId } from "@/lib/id";
 import { LinkTransferModal } from "../link-transfer-modal";
 import { TransferMatchDialog } from "../transfer-match-dialog";
+import { isSameAccountCashFxConversion, nonCashTransferAssetKey } from "../transfer-link-utils";
 import { ActivityDeleteModal } from "../activity-delete-modal";
 import { useActivityMutations } from "../../hooks/use-activity-mutations";
 import { ActivityDataGridPagination } from "./activity-data-grid-pagination";
@@ -21,6 +23,7 @@ import {
   applyTransactionUpdate,
   createCurrencyResolver,
   createDraftTransaction,
+  partitionReviewRowsForApproval,
   PINNED_COLUMNS,
   TRACKED_FIELDS,
   valuesAreEqual,
@@ -83,6 +86,8 @@ export function ActivityDataGrid({
   onPageChange,
   onPageSizeChange,
 }: ActivityDataGridProps) {
+  const { t } = useTranslation();
+
   // State management
   const {
     localTransactions,
@@ -165,13 +170,13 @@ export function ActivityDataGrid({
         createdAt: now,
         updatedAt: now,
         isNew: true,
-        comment: "Duplicated",
+        comment: t("activity:datagrid.duplicated_comment"),
         idempotencyKey: generateId("manual-duplicate"),
       };
       setLocalTransactions((prev) => [duplicated, ...prev]);
       markDirtyBatch([duplicated.id]);
     },
-    [markDirtyBatch, setLocalTransactions],
+    [markDirtyBatch, setLocalTransactions, t],
   );
 
   const [pendingDeleteActivity, setPendingDeleteActivity] = useState<ActivityDetails | null>(null);
@@ -211,30 +216,30 @@ export function ActivityDataGrid({
     (activity: ActivityDetails) => {
       if ((activity as LocalTransaction).isNew || dirtyTransactionIds.has(activity.id)) {
         toast({
-          title: "Save edits first",
-          description: "Save or discard pending edits before linking this transfer.",
+          title: t("activity:datagrid.save_edits_first"),
+          description: t("activity:datagrid.save_before_link"),
           variant: "destructive",
         });
         return;
       }
       setRowTransferDialog({ open: true, mode: "link", activity });
     },
-    [dirtyTransactionIds],
+    [dirtyTransactionIds, t],
   );
 
   const handleRowUnlinkTransfer = useCallback(
     (activity: ActivityDetails) => {
       if ((activity as LocalTransaction).isNew || dirtyTransactionIds.has(activity.id)) {
         toast({
-          title: "Save edits first",
-          description: "Save or discard pending edits before unlinking this transfer.",
+          title: t("activity:datagrid.save_edits_first"),
+          description: t("activity:datagrid.save_before_unlink"),
           variant: "destructive",
         });
         return;
       }
       setRowTransferDialog({ open: true, mode: "unlink", activity });
     },
-    [dirtyTransactionIds],
+    [dirtyTransactionIds, t],
   );
 
   // Race condition guard for async quote resolution
@@ -544,13 +549,13 @@ export function ActivityDataGrid({
     if (first.isNew || second.isNew) {
       return {
         canLink: false,
-        reason: "Save new activities before linking",
+        reason: t("activity:datagrid.link_reason_save_new"),
       } as const;
     }
     if (dirtyTransactionIds.has(first.id) || dirtyTransactionIds.has(second.id)) {
       return {
         canLink: false,
-        reason: "Save or discard pending edits on the selected rows before linking",
+        reason: t("activity:datagrid.link_reason_save_pending"),
       } as const;
     }
     const types = new Set([first.activityType, second.activityType]);
@@ -561,25 +566,28 @@ export function ActivityDataGrid({
     ) {
       return {
         canLink: false,
-        reason: "Select one TRANSFER_IN and one TRANSFER_OUT activity",
+        reason: t("activity:datagrid.link_reason_select_pair"),
       } as const;
     }
     if (first.sourceGroupId || second.sourceGroupId) {
       return {
         canLink: false,
-        reason: "One of the selected activities is already linked",
+        reason: t("activity:datagrid.link_reason_already_linked"),
       } as const;
     }
     const transferIn = first.activityType === ActivityType.TRANSFER_IN ? first : second;
     const transferOut = first.activityType === ActivityType.TRANSFER_OUT ? first : second;
-    if (transferIn.accountId === transferOut.accountId) {
+    if (
+      transferIn.accountId === transferOut.accountId &&
+      !isSameAccountCashFxConversion(transferIn, transferOut)
+    ) {
       return {
         canLink: false,
-        reason: "Both legs share the same account",
+        reason: t("activity:datagrid.link_reason_same_account_fx"),
       } as const;
     }
     return { canLink: true, transferIn, transferOut } as const;
-  }, [selectedRows, dirtyTransactionIds]);
+  }, [selectedRows, dirtyTransactionIds, t]);
 
   const unlinkValidation = useMemo(() => {
     if (selectedRows.length !== 2) {
@@ -589,13 +597,13 @@ export function ActivityDataGrid({
     if (first.isNew || second.isNew) {
       return {
         canUnlink: false,
-        reason: "Save new activities before unlinking",
+        reason: t("activity:datagrid.unlink_reason_save_new"),
       } as const;
     }
     if (dirtyTransactionIds.has(first.id) || dirtyTransactionIds.has(second.id)) {
       return {
         canUnlink: false,
-        reason: "Save or discard pending edits on the selected rows before unlinking",
+        reason: t("activity:datagrid.unlink_reason_save_pending"),
       } as const;
     }
     const types = new Set([first.activityType, second.activityType]);
@@ -606,25 +614,25 @@ export function ActivityDataGrid({
     ) {
       return {
         canUnlink: false,
-        reason: "Select one TRANSFER_IN and one TRANSFER_OUT activity",
+        reason: t("activity:datagrid.link_reason_select_pair"),
       } as const;
     }
     if (!first.sourceGroupId || !second.sourceGroupId) {
       return {
         canUnlink: false,
-        reason: "Both selected activities must already be linked",
+        reason: t("activity:datagrid.unlink_reason_must_be_linked"),
       } as const;
     }
     if (first.sourceGroupId !== second.sourceGroupId) {
       return {
         canUnlink: false,
-        reason: "Selected activities belong to different linked transfers",
+        reason: t("activity:datagrid.unlink_reason_different_transfers"),
       } as const;
     }
     const transferIn = first.activityType === ActivityType.TRANSFER_IN ? first : second;
     const transferOut = first.activityType === ActivityType.TRANSFER_OUT ? first : second;
     return { canUnlink: true, transferIn, transferOut } as const;
-  }, [selectedRows, dirtyTransactionIds]);
+  }, [selectedRows, dirtyTransactionIds, t]);
 
   const showUnlinkSelected = useMemo(
     () => selectedRows.length === 2 && selectedRows.every((row) => !!row.original.sourceGroupId),
@@ -635,17 +643,36 @@ export function ActivityDataGrid({
     if (!linkValidation.canLink) return [] as string[];
     const { transferIn, transferOut } = linkValidation;
     const warnings: string[] = [];
+    const sameAccountFx = isSameAccountCashFxConversion(transferIn, transferOut);
+    if (sameAccountFx) {
+      const inDate = new Date(transferIn.date).getTime();
+      const outDate = new Date(transferOut.date).getTime();
+      if (Number.isFinite(inDate) && Number.isFinite(outDate)) {
+        const dayDiff = Math.abs(inDate - outDate) / (1000 * 60 * 60 * 24);
+        if (dayDiff > 7) {
+          warnings.push(t("activity:datagrid.warn_dates_differ", { count: Math.round(dayDiff) }));
+        }
+      }
+      return warnings;
+    }
     if (transferIn.currency !== transferOut.currency) {
       warnings.push(
-        `Currencies differ (${transferOut.currency} → ${transferIn.currency}). The pair will still be linked.`,
+        t("activity:datagrid.warn_currencies_differ", {
+          from: transferOut.currency,
+          to: transferIn.currency,
+        }),
       );
     }
-    const inAmount = Number(transferIn.amount ?? transferIn.unitPrice ?? 0);
-    const outAmount = Number(transferOut.amount ?? transferOut.unitPrice ?? 0);
+    const inAmount = Number(
+      transferIn.amount ?? (nonCashTransferAssetKey(transferIn) ? transferIn.unitPrice : 0),
+    );
+    const outAmount = Number(
+      transferOut.amount ?? (nonCashTransferAssetKey(transferOut) ? transferOut.unitPrice : 0),
+    );
     if (Number.isFinite(inAmount) && Number.isFinite(outAmount) && inAmount && outAmount) {
       const diff = Math.abs(inAmount - outAmount) / Math.max(inAmount, outAmount);
       if (diff > 0.01) {
-        warnings.push("Amounts differ by more than 1%.");
+        warnings.push(t("activity:datagrid.warn_amounts_differ"));
       }
     }
     const inDate = new Date(transferIn.date).getTime();
@@ -653,11 +680,11 @@ export function ActivityDataGrid({
     if (Number.isFinite(inDate) && Number.isFinite(outDate)) {
       const dayDiff = Math.abs(inDate - outDate) / (1000 * 60 * 60 * 24);
       if (dayDiff > 7) {
-        warnings.push(`Dates differ by ${Math.round(dayDiff)} days.`);
+        warnings.push(t("activity:datagrid.warn_dates_differ", { count: Math.round(dayDiff) }));
       }
     }
     return warnings;
-  }, [linkValidation]);
+  }, [linkValidation, t]);
 
   const handleLinkConfirm = useCallback(async () => {
     if (!linkValidation.canLink) return;
@@ -700,21 +727,41 @@ export function ActivityDataGrid({
 
     if (pendingToApprove.length === 0) return;
 
-    // Mark all pending activities as approved (needsReview=false) and mark them as dirty
-    setLocalTransactions((prev) =>
-      prev.map((transaction) => {
-        const shouldApprove = pendingToApprove.some((p) => p.id === transaction.id);
-        if (shouldApprove) {
-          return { ...transaction, needsReview: false };
-        }
-        return transaction;
-      }),
-    );
+    const { approvable, incomplete } = partitionReviewRowsForApproval(pendingToApprove);
+    const approvableIds = new Set(approvable.map((transaction) => transaction.id));
 
-    // Mark them as dirty so they will be saved
-    markDirtyBatch(pendingToApprove.map((transaction) => transaction.id));
+    // Draft review rows require an explicit lifecycle transition. Posted and
+    // Pending rows keep their existing lifecycle.
+    if (approvable.length > 0) {
+      setLocalTransactions((prev) =>
+        prev.map((transaction) => {
+          if (approvableIds.has(transaction.id)) {
+            return {
+              ...transaction,
+              needsReview: false,
+              status:
+                transaction.status === ActivityStatus.DRAFT
+                  ? ActivityStatus.POSTED
+                  : transaction.status,
+            };
+          }
+          return transaction;
+        }),
+      );
+
+      // Mark only complete approvals as dirty so unresolved rows remain in review.
+      markDirtyBatch(approvable.map((transaction) => transaction.id));
+    }
     dataGrid.table.resetRowSelection();
-  }, [dataGrid.table, markDirtyBatch, setLocalTransactions]);
+
+    if (incomplete.length > 0) {
+      toast({
+        title: t("activity:datagrid.approve_missing_amount", { count: incomplete.length }),
+        description: t("activity:datagrid.approve_missing_amount_description"),
+        variant: "destructive",
+      });
+    }
+  }, [dataGrid.table, markDirtyBatch, setLocalTransactions, t]);
 
   // Save activities hook with validation and error handling
   const { saveActivities, isSaving } = useSaveActivities({
@@ -744,11 +791,11 @@ export function ActivityDataGrid({
     setLocalTransactions((prev) => prev.filter((transaction) => !transaction.isNew));
     onRefetch();
     toast({
-      title: "Changes discarded",
-      description: "Unsaved edits and drafts have been cleared.",
+      title: t("activity:datagrid_changes_discarded"),
+      description: t("activity:datagrid_unsaved_cleared"),
       variant: "default",
     });
-  }, [dataGrid.table, onRefetch, resetChangeState, setLocalTransactions]);
+  }, [dataGrid.table, onRefetch, resetChangeState, setLocalTransactions, t]);
 
   // Get default currency for custom asset dialog from the row's account
   const dialogDefaultCurrency =

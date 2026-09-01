@@ -8,9 +8,12 @@ use rust_decimal::Decimal;
 
 use crate::errors::Result;
 use crate::health::model::{
-    AffectedItem, FixAction, HealthCategory, HealthIssue, NavigateAction, Severity,
+    AffectedItem, DiagnosticDomain, DiagnosticLevel, Evidence, FixAction, HealthCategory,
+    HealthDiagnostic, HealthEntityRef, HealthIssue, NavigateAction, Severity,
 };
 use crate::health::traits::{HealthCheck, HealthContext};
+
+const MAX_VALUATION_DIAGNOSTICS: usize = 100;
 
 /// Types of data consistency issues.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -29,6 +32,56 @@ pub enum ConsistencyIssueType {
     NegativeCashBalance,
     /// A sell activity has no matching lot disposal row for realized P&L attribution
     MissingLotDisposalForSell,
+    /// Holdings snapshots exist for a date but the generated valuation read model has no row
+    MissingGeneratedValuation,
+    /// A generated valuation row has incomplete value coverage
+    IncompleteValuationValue,
+    /// A generated valuation row has incomplete cost-basis coverage
+    IncompleteValuationBasis,
+    /// A generated valuation row has an unknown performance flow boundary
+    UnknownPerformanceFlowSource,
+    /// Activity was stored without a currency, so FX conversion fails (#1388)
+    MissingActivityCurrency,
+    /// A stored snapshot falls outside the supported date policy.
+    InvalidSnapshotDate,
+}
+
+/// Root cause classification for valuation-quality issues (incomplete value /
+/// missing generated row). Drives the structured diagnostic `code`, wording and
+/// remediation action shown to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValuationIssueReason {
+    /// A held asset has no market quotes at all (unresolved symbol / provider gap).
+    MissingMarketQuote,
+    /// A manual/custom asset has no manual valuation entered.
+    MissingManualValuation,
+    /// A required FX rate is missing for the account/base currency conversion.
+    MissingFxRate,
+    /// The row is fully unavailable for returns (nothing priced, no cash).
+    Unavailable,
+    /// Cause could not be pinned to a specific asset (generic fallback).
+    Unknown,
+    /// Incomplete cost basis on a TRANSACTIONS-tracked account (an acquiring
+    /// activity has no cost basis).
+    IncompleteBasisActivity,
+    /// Incomplete cost basis on a HOLDINGS-tracked account (the holdings
+    /// snapshot has no cost basis; there are no transactions to fix).
+    IncompleteBasisSnapshot,
+}
+
+impl ValuationIssueReason {
+    /// Stable machine code used as the diagnostic `code`.
+    pub fn code(self) -> &'static str {
+        match self {
+            ValuationIssueReason::MissingMarketQuote => "MISSING_MARKET_QUOTE",
+            ValuationIssueReason::MissingManualValuation => "MISSING_MANUAL_VALUATION",
+            ValuationIssueReason::MissingFxRate => "MISSING_FX_RATE",
+            ValuationIssueReason::Unavailable => "UNAVAILABLE_VALUATION",
+            ValuationIssueReason::Unknown => "INCOMPLETE_VALUATION",
+            ValuationIssueReason::IncompleteBasisActivity => "INCOMPLETE_BASIS_ACTIVITY",
+            ValuationIssueReason::IncompleteBasisSnapshot => "INCOMPLETE_BASIS_SNAPSHOT",
+        }
+    }
 }
 
 /// Data about a consistency issue.
@@ -62,6 +115,19 @@ pub struct ConsistencyIssueInfo {
     pub quantity: Option<Decimal>,
     /// Activity proceeds for activity-specific issues
     pub proceeds: Option<Decimal>,
+    /// Root cause classification for valuation-quality issues (drives diagnostics).
+    pub reason: Option<ValuationIssueReason>,
+    /// The specific activity to deep-link to (e.g. the acquiring transaction that
+    /// lacks a cost basis), when the issue traces to one activity row.
+    pub activity_id: Option<String>,
+    /// Raw stored snapshot date when it could not be parsed.
+    pub snapshot_date_raw: Option<String>,
+    /// Snapshot source for snapshot-specific consistency issues.
+    pub snapshot_source: Option<String>,
+    /// Earliest supported date for snapshot-specific consistency issues.
+    pub snapshot_min_date: Option<NaiveDate>,
+    /// Latest supported date for snapshot-specific consistency issues.
+    pub snapshot_max_date: Option<NaiveDate>,
 }
 
 /// Health check that detects data consistency problems.
@@ -98,6 +164,191 @@ impl DataConsistencyCheck {
                 .push(issue);
         }
 
+        if let Some(invalid_snapshots) = by_type.get(&ConsistencyIssueType::InvalidSnapshotDate) {
+            let mut invalid_date_groups: std::collections::BTreeMap<
+                (String, String, String),
+                Vec<&ConsistencyIssueInfo>,
+            > = std::collections::BTreeMap::new();
+            for issue in invalid_snapshots {
+                let Some(account_id) = issue.account_id.as_deref() else {
+                    continue;
+                };
+                let Some(snapshot_date) = issue
+                    .snapshot_date_raw
+                    .clone()
+                    .or_else(|| issue.activity_date.map(|date| date.to_string()))
+                else {
+                    continue;
+                };
+                let source = issue.snapshot_source.as_deref().unwrap_or("UNKNOWN");
+                invalid_date_groups
+                    .entry((account_id.to_string(), snapshot_date, source.to_string()))
+                    .or_default()
+                    .push(issue);
+            }
+
+            for ((account_id, snapshot_date, source), issues) in invalid_date_groups {
+                let issue = issues[0];
+                let count = issues.len();
+                let supported_range = match (issue.snapshot_min_date, issue.snapshot_max_date) {
+                    (Some(min_date), Some(max_date)) => format!("{} to {}", min_date, max_date),
+                    _ => "Not available".to_string(),
+                };
+                let mut data_keys: Vec<String> =
+                    issues.iter().map(|issue| issue.record_id.clone()).collect();
+                data_keys.sort();
+                let data_hash = compute_data_hash(&data_keys);
+                let is_activity = issue.activity_id.is_some();
+                let is_malformed_snapshot = issue.snapshot_date_raw.is_some();
+                let (
+                    title,
+                    navigate,
+                    message,
+                    diagnostic_title,
+                    diagnostic_explanation,
+                    diagnostic_code,
+                ) = if is_activity {
+                    let activity_date = issue
+                        .activity_date
+                        .expect("activity date issues always include a parsed date");
+                    let title = if count == 1 {
+                        "1 activity has an unsupported date".to_string()
+                    } else {
+                        format!("{} activities have unsupported dates", count)
+                    };
+                    let message = if count == 1 {
+                        "This account wasn't recalculated because an activity is earlier than January 1, 1970. Change its date to January 1, 1970 or later, or delete it if it should not be kept."
+                            .to_string()
+                    } else {
+                        format!(
+                            "This account wasn't recalculated because {} activities are earlier than January 1, 1970. Change their dates to January 1, 1970 or later, or delete activities that should not be kept.",
+                            count
+                        )
+                    };
+                    (
+                        title,
+                        NavigateAction {
+                            route: "/activities".to_string(),
+                            query: Some(serde_json::json!({
+                                "account": &account_id,
+                                "from": activity_date.to_string(),
+                                "to": activity_date.to_string(),
+                                "healthContext": "activity"
+                            })),
+                            label: if count == 1 {
+                                "Review activity".to_string()
+                            } else {
+                                "Review activities".to_string()
+                            },
+                        },
+                        message,
+                        "Why these activities were skipped".to_string(),
+                        "The account's existing portfolio history remains unchanged until these source activities are corrected.",
+                        "INVALID_ACTIVITY_DATE",
+                    )
+                } else if is_malformed_snapshot {
+                    (
+                        "A holdings entry has a malformed date".to_string(),
+                        NavigateAction {
+                            route: format!("/accounts/{}", urlencoding::encode(&account_id)),
+                            query: Some(serde_json::json!({
+                                "tab": "snapshots",
+                                "snapshotId": issue.record_id,
+                                "snapshotDate": snapshot_date,
+                                "healthContext": "invalidSnapshot"
+                            })),
+                            label: "Review entry".to_string(),
+                        },
+                        format!(
+                            "The stored date '{}' cannot be read. Delete this holdings entry, then add a replacement with a valid date if needed.",
+                            snapshot_date
+                        ),
+                        "Why this holdings entry was skipped".to_string(),
+                        "This source holdings entry has a malformed stored date, so it cannot be included in holdings and valuation calculations.",
+                        "INVALID_HOLDINGS_DATE",
+                    )
+                } else {
+                    let parsed_snapshot_date = issue
+                        .activity_date
+                        .expect("supported-range issues always include a parsed date");
+                    let message = match (issue.snapshot_min_date, issue.snapshot_max_date) {
+                        (Some(min_date), _) if parsed_snapshot_date < min_date => format!(
+                            "Portfolio history starts on {}. This earlier holdings entry was not included. Delete it, then add a replacement dated {} or later if needed.",
+                            min_date, min_date
+                        ),
+                        (_, Some(max_date)) if parsed_snapshot_date > max_date => format!(
+                            "Portfolio history currently supports holdings dates through {}. This later entry was not included. Delete it, then add a replacement within the supported range if needed.",
+                            max_date
+                        ),
+                        _ => "This holdings entry is outside the supported portfolio-history range and was not included. Delete it, then add a replacement within the supported range if needed."
+                            .to_string(),
+                    };
+                    (
+                        "A holdings entry has an unsupported date".to_string(),
+                        NavigateAction {
+                            route: format!("/accounts/{}", urlencoding::encode(&account_id)),
+                            query: Some(serde_json::json!({
+                                "tab": "snapshots",
+                                "snapshotId": issue.record_id,
+                                "snapshotDate": snapshot_date,
+                                "healthContext": "invalidSnapshot"
+                            })),
+                            label: "Review entry".to_string(),
+                        },
+                        message,
+                        "Why this holdings entry was skipped".to_string(),
+                        "This source holdings entry is outside the supported portfolio-history range, so it is excluded from holdings and valuation calculations.",
+                        "INVALID_HOLDINGS_DATE",
+                    )
+                };
+
+                let mut diagnostic = HealthDiagnostic::new(
+                    diagnostic_code,
+                    diagnostic_title,
+                    diagnostic_explanation,
+                )
+                .domain(DiagnosticDomain::Ledger)
+                .level(DiagnosticLevel::Source)
+                .severity(Severity::Error)
+                .fingerprint(data_hash.clone())
+                .entity(
+                    HealthEntityRef::new("account", account_id.clone())
+                        .label(issue.description.clone()),
+                )
+                .date(snapshot_date.clone())
+                .evidence(Evidence::new("Account", issue.description.clone()))
+                .evidence(Evidence::new("Date", snapshot_date.clone()))
+                .evidence(Evidence::new("Allowed range", supported_range.clone()))
+                .navigate(true, navigate);
+                if is_activity {
+                    diagnostic = diagnostic
+                        .evidence(Evidence::new("Affected activities", count.to_string()));
+                }
+
+                health_issues.push(
+                    HealthIssue::builder()
+                        .id(format!("invalid_snapshot_date:{}", data_hash))
+                        .severity(Severity::Error)
+                        .category(HealthCategory::DataConsistency)
+                        .code("INVALID_SNAPSHOT_DATE")
+                        .title(title)
+                        .message(message)
+                        .details(format!(
+                            "Account: {}\nDate: {}\nAdded from: {}\nAffected records: {}\nDates you can use: {}",
+                            issue.description,
+                            snapshot_date,
+                            snapshot_source_label(&source),
+                            count,
+                            supported_range
+                        ))
+                        .affected_count(count as u32)
+                        .diagnostics(vec![diagnostic])
+                        .data_hash(data_hash)
+                        .build(),
+                );
+            }
+        }
+
         // Emit health issue for orphan activities (account references)
         if let Some(orphan_account_issues) =
             by_type.get(&ConsistencyIssueType::OrphanActivityAccount)
@@ -114,6 +365,8 @@ impl DataConsistencyCheck {
                     .id(format!("orphan_activity_account:{}", data_hash))
                     .severity(Severity::Error)
                     .category(HealthCategory::DataConsistency)
+                    .code("data_orphan_activity_account")
+                    .param("count", count as u32)
                     .title(if count == 1 {
                         "Transaction references missing account".to_string()
                     } else {
@@ -123,7 +376,10 @@ impl DataConsistencyCheck {
                         "Some transactions point to accounts that no longer exist. This may cause calculation errors.",
                     )
                     .affected_count(count as u32)
-                    .navigate_action(NavigateAction::to_activities(Some("orphan")))
+                    // Orphan activities reference a missing account, so they cannot
+                    // be surfaced by the account-scoped activity search; link to the
+                    // full activities view rather than an unsupported filter.
+                    .navigate_action(NavigateAction::to_activities(None))
                     .data_hash(data_hash)
                     .build(),
             );
@@ -143,6 +399,8 @@ impl DataConsistencyCheck {
                     .id(format!("orphan_activity_asset:{}", data_hash))
                     .severity(Severity::Error)
                     .category(HealthCategory::DataConsistency)
+                    .code("data_orphan_activity_asset")
+                    .param("count", count as u32)
                     .title(if count == 1 {
                         "Transaction references missing asset".to_string()
                     } else {
@@ -152,7 +410,8 @@ impl DataConsistencyCheck {
                         "Some transactions point to assets that no longer exist. This may cause calculation errors.",
                     )
                     .affected_count(count as u32)
-                    .navigate_action(NavigateAction::to_activities(Some("orphan")))
+                    // No orphan filter on the activity search; link to the full view.
+                    .navigate_action(NavigateAction::to_activities(None))
                     .data_hash(data_hash)
                     .build(),
             );
@@ -172,6 +431,8 @@ impl DataConsistencyCheck {
                     .id(format!("negative_position:{}", data_hash))
                     .severity(Severity::Warning)
                     .category(HealthCategory::DataConsistency)
+                    .code("data_negative_position")
+                    .param("count", count as u32)
                     .title(if count == 1 {
                         "Holding has negative quantity".to_string()
                     } else {
@@ -201,6 +462,8 @@ impl DataConsistencyCheck {
                     .id(format!("legacy_classification:{}", data_hash))
                     .severity(Severity::Info)
                     .category(HealthCategory::DataConsistency)
+                    .code("data_legacy_classification")
+                    .param("count", count as u32)
                     .title(if count == 1 {
                         "1 asset has old classification data".to_string()
                     } else {
@@ -210,7 +473,7 @@ impl DataConsistencyCheck {
                         "Some assets have legacy sector/country data that can be migrated to the new classification system.",
                     )
                     .affected_count(count as u32)
-                    .fix_action(FixAction::migrate_classifications(asset_ids))
+                    .navigate_action(NavigateAction::to_taxonomies())
                     .data_hash(data_hash)
                     .build(),
             );
@@ -269,6 +532,8 @@ impl DataConsistencyCheck {
                 .id(format!("negative_account_balance:{}", data_hash))
                 .severity(Severity::Warning)
                 .category(HealthCategory::DataConsistency)
+                .code("data_negative_account_balance")
+                .param("count", count as u32)
                 .title(if count == 1 {
                     "Account has negative portfolio balance".to_string()
                 } else {
@@ -320,6 +585,8 @@ impl DataConsistencyCheck {
                 .id(format!("negative_cash_balance:{}", data_hash))
                 .severity(Severity::Info)
                 .category(HealthCategory::DataConsistency)
+                .code("data_negative_cash_balance")
+                .param("count", count as u32)
                 .title(if count == 1 {
                     "Cash account had a negative balance".to_string()
                 } else {
@@ -408,6 +675,8 @@ impl DataConsistencyCheck {
                 .id(format!("missing_lot_disposal_for_sell:{}", data_hash))
                 .severity(Severity::Warning)
                 .category(HealthCategory::DataConsistency)
+                .code("data_missing_lot_disposal_for_sell")
+                .param("count", count as u32)
                 .title(if count == 1 {
                     "Sale missing cost-basis match".to_string()
                 } else {
@@ -420,7 +689,7 @@ impl DataConsistencyCheck {
                 .navigate_action(NavigateAction {
                     route: "/activities".to_string(),
                     query: Some(serde_json::json!({ "types": "SELL" })),
-                    label: "View Activities".to_string(),
+                    label: "Review Transactions".to_string(),
                 })
                 .data_hash(data_hash);
             if !affected_items.is_empty() {
@@ -432,8 +701,757 @@ impl DataConsistencyCheck {
             health_issues.push(builder.build());
         }
 
+        if let Some(missing_currency_issues) =
+            by_type.get(&ConsistencyIssueType::MissingActivityCurrency)
+        {
+            let count = missing_currency_issues.len();
+            let record_ids: Vec<String> = missing_currency_issues
+                .iter()
+                .map(|i| i.record_id.clone())
+                .collect();
+            let data_hash = compute_data_hash(&record_ids);
+
+            // One entry per broken transaction, deep-linking to the row in the
+            // activities grid so the user can set the currency in place.
+            let affected_items: Vec<AffectedItem> = missing_currency_issues
+                .iter()
+                .map(|i| {
+                    let date = i
+                        .activity_date
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "unknown date".to_string());
+                    AffectedItem::activity(
+                        i.record_id.clone(),
+                        format!("{} — {}", i.description, date),
+                    )
+                })
+                .collect();
+
+            let details = missing_currency_issues
+                .iter()
+                .map(|i| {
+                    let date = i
+                        .activity_date
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "unknown date".to_string());
+                    let suggestion = i
+                        .account_currency
+                        .as_deref()
+                        .map(|currency| format!("The account's currency is {}.", currency))
+                        .unwrap_or_else(|| "The account has no currency either.".to_string());
+                    format!("{}\nTransaction on {}\n{}", i.description, date, suggestion)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            let mut builder = HealthIssue::builder()
+                .id(format!("missing_activity_currency:{}", data_hash))
+                .severity(Severity::Error)
+                .category(HealthCategory::DataConsistency)
+                .code("data_missing_activity_currency")
+                .param("count", count as u32)
+                .title(if count == 1 {
+                    "Transaction has no currency".to_string()
+                } else {
+                    format!("{} transactions have no currency", count)
+                })
+                .message(
+                    "Some transactions were saved without a currency, so they can't be converted \
+                     to your base currency and account values fail to calculate. Open each \
+                     transaction and set its currency — usually the account's own currency.",
+                )
+                .affected_count(count as u32)
+                .navigate_action(NavigateAction::to_activities(None))
+                .data_hash(data_hash);
+            if !affected_items.is_empty() {
+                builder = builder.affected_items(affected_items);
+            }
+            if !details.is_empty() {
+                builder = builder.details(details);
+            }
+            health_issues.push(builder.build());
+        }
+
+        if let Some(missing_issues) = by_type.get(&ConsistencyIssueType::MissingGeneratedValuation)
+        {
+            health_issues.push(build_valuation_quality_issue(
+                "missing_generated_valuation",
+                "data_missing_generated_valuation",
+                missing_issues,
+                Severity::Warning,
+                "Account history needs rebuilding",
+                "daily account values are missing",
+                "Some daily account values are missing. Fix any missing prices, manual values, or exchange rates, then rebuild account history.",
+            ));
+        }
+
+        if let Some(value_issues) = by_type.get(&ConsistencyIssueType::IncompleteValuationValue) {
+            let copy = value_issue_copy(value_issues);
+            health_issues.push(build_valuation_quality_issue(
+                "incomplete_valuation_value",
+                "data_incomplete_valuation_value",
+                value_issues,
+                Severity::Warning,
+                copy.title,
+                copy.plural_title,
+                copy.message,
+            ));
+        }
+
+        if let Some(basis_issues) = by_type.get(&ConsistencyIssueType::IncompleteValuationBasis) {
+            let copy = basis_issue_copy(basis_issues);
+            health_issues.push(build_valuation_quality_issue(
+                "incomplete_valuation_basis",
+                "data_incomplete_valuation_basis",
+                basis_issues,
+                Severity::Warning,
+                copy.title,
+                copy.plural_title,
+                copy.message,
+            ));
+        }
+
+        if let Some(flow_issues) = by_type.get(&ConsistencyIssueType::UnknownPerformanceFlowSource)
+        {
+            health_issues.push(build_unknown_performance_flow_issue(
+                "unknown_performance_flow_source",
+                "data_unknown_performance_flow_source",
+                flow_issues,
+                Severity::Error,
+                "Transfer date needs review",
+                "transfer dates need review",
+                "Some transfers are unclear: Wealthfolio cannot tell if money moved between your own accounts or entered/left your portfolio. Review those transfers so returns are not overstated or understated.",
+            ));
+        }
+
         health_issues
     }
+}
+
+fn snapshot_source_label(source: &str) -> &str {
+    match source {
+        "ACCOUNT_ACTIVITY" | "CALCULATED" => "Account activity",
+        "MANUAL_ENTRY" => "Manual entry",
+        "BROKER_IMPORTED" => "Connected account",
+        "CSV_IMPORT" => "CSV import",
+        _ => "Unknown",
+    }
+}
+
+struct IssueCopy {
+    title: &'static str,
+    plural_title: &'static str,
+    message: &'static str,
+}
+
+fn value_issue_copy(issues: &[&ConsistencyIssueInfo]) -> IssueCopy {
+    let has_market_quote = issues
+        .iter()
+        .any(|issue| issue.reason == Some(ValuationIssueReason::MissingMarketQuote));
+    let has_manual_value = issues
+        .iter()
+        .any(|issue| issue.reason == Some(ValuationIssueReason::MissingManualValuation));
+    let has_fx = issues
+        .iter()
+        .any(|issue| issue.reason == Some(ValuationIssueReason::MissingFxRate));
+    let has_generic = issues.iter().any(|issue| {
+        matches!(
+            issue.reason,
+            None | Some(ValuationIssueReason::Unavailable) | Some(ValuationIssueReason::Unknown)
+        )
+    });
+
+    if has_market_quote && !has_manual_value && !has_fx && !has_generic {
+        return IssueCopy {
+            title: "Price date needs review",
+            plural_title: "price dates need review",
+            message: "Some trading days are missing exact market prices. Wealthfolio can carry forward the last available price, but syncing or adding the missing prices keeps daily values and returns accurate. If a date was a market holiday or the investment did not trade, dismiss this issue.",
+        };
+    }
+
+    if has_manual_value && !has_market_quote && !has_fx && !has_generic {
+        return IssueCopy {
+            title: "Manual price date needs review",
+            plural_title: "manual price dates need review",
+            message: "Some manual holdings are missing values on days they were held. Wealthfolio can carry forward the last value, but adding the missing dates keeps daily values and returns accurate. If a separate value is not needed for the date, dismiss this issue.",
+        };
+    }
+
+    if has_fx && !has_market_quote && !has_manual_value && !has_generic {
+        return IssueCopy {
+            title: "Exchange rate is missing",
+            plural_title: "exchange rates are missing",
+            message: "Some holdings need exchange rates before Wealthfolio can convert them to your base currency.",
+        };
+    }
+
+    IssueCopy {
+        title: "Holding value is missing",
+        plural_title: "prices or values are missing",
+        message: "Some holdings are missing a market price, manual value, or exchange rate. Add the missing data so Wealthfolio can calculate their value and returns.",
+    }
+}
+
+fn basis_issue_copy(issues: &[&ConsistencyIssueInfo]) -> IssueCopy {
+    let has_activity = issues
+        .iter()
+        .any(|issue| issue.reason == Some(ValuationIssueReason::IncompleteBasisActivity));
+    let has_snapshot = issues
+        .iter()
+        .any(|issue| issue.reason == Some(ValuationIssueReason::IncompleteBasisSnapshot));
+    let has_unclassified = issues.iter().any(|issue| issue.reason.is_none());
+
+    if has_activity && !has_snapshot && !has_unclassified {
+        return IssueCopy {
+            title: "Transaction is missing a purchase price",
+            plural_title: "transactions are missing purchase prices",
+            message: "Some buys or transfer-ins are missing the price paid. Add the price to each transaction so Wealthfolio can calculate cost basis, gains/losses, and returns.",
+        };
+    }
+
+    if has_snapshot && !has_activity && !has_unclassified {
+        return IssueCopy {
+            title: "Holding is missing cost basis",
+            plural_title: "holdings are missing cost basis",
+            message: "Some holdings are missing what you paid for them. Add the cost basis so Wealthfolio can calculate gains/losses and returns.",
+        };
+    }
+
+    IssueCopy {
+        title: "Cost basis input needs review",
+        plural_title: "cost basis inputs need review",
+        message: "Some transactions or holdings are missing what you paid. Add the missing cost basis so gains/losses and returns can be calculated.",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_unknown_performance_flow_issue(
+    id_prefix: &str,
+    code: &str,
+    issues: &[&ConsistencyIssueInfo],
+    severity: Severity,
+    title: &str,
+    plural_title: &str,
+    message: &str,
+) -> HealthIssue {
+    let mut data_keys: Vec<String> = issues
+        .iter()
+        .map(|i| {
+            format!(
+                "{}:{}",
+                i.record_id,
+                i.activity_date
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    data_keys.sort();
+    let data_hash = compute_data_hash(&data_keys);
+
+    let affected_items: Vec<AffectedItem> = issues
+        .iter()
+        .map(|issue| {
+            let query = unknown_transfer_issue_query(issue);
+            let date = issue
+                .activity_date
+                .map(|date| date.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "unknown date".to_string());
+            AffectedItem {
+                id: issue.record_id.clone(),
+                name: format!("{} transfer on {}", issue.description, date),
+                symbol: None,
+                route: Some(activity_route_from_query(&query)),
+            }
+        })
+        .collect();
+
+    let details = issues
+        .iter()
+        .map(|issue| {
+            let date = issue
+                .activity_date
+                .map(|date| date.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "unknown date".to_string());
+            format!(
+                "{}\nDate: {}\nReview transfer transactions for this account and date.",
+                issue.description, date
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let diagnostics: Vec<HealthDiagnostic> = issues
+        .iter()
+        .map(|issue| unknown_transfer_diagnostic(issue))
+        .collect();
+
+    let mut builder = HealthIssue::builder()
+        .id(format!("{}:{}", id_prefix, data_hash))
+        .severity(severity)
+        .category(HealthCategory::DataConsistency)
+        .code(code)
+        .param("count", issues.len() as u32)
+        .title(if issues.len() == 1 {
+            title.to_string()
+        } else {
+            format!("{} {}", issues.len(), plural_title)
+        })
+        .message(message)
+        .affected_count(issues.len() as u32)
+        .navigate_action(NavigateAction {
+            route: "/activities".to_string(),
+            query: Some(unknown_transfer_review_query(issues)),
+            label: "Review Transactions".to_string(),
+        })
+        .diagnostics(diagnostics)
+        .data_hash(data_hash);
+
+    if !affected_items.is_empty() {
+        builder = builder.affected_items(affected_items);
+    }
+    if !details.is_empty() {
+        builder = builder.details(details);
+    }
+
+    builder.build()
+}
+
+fn unknown_transfer_review_query(issues: &[&ConsistencyIssueInfo]) -> serde_json::Value {
+    let mut query = serde_json::Map::new();
+    query.insert(
+        "types".to_string(),
+        serde_json::json!("TRANSFER_IN,TRANSFER_OUT"),
+    );
+    query.insert("healthContext".to_string(), serde_json::json!("activity"));
+
+    let mut dates: Vec<_> = issues.iter().filter_map(|i| i.activity_date).collect();
+    dates.sort_unstable();
+    if let Some(first_date) = dates.first() {
+        query.insert(
+            "from".to_string(),
+            serde_json::json!(first_date.to_string()),
+        );
+    }
+    if let Some(last_date) = dates.last() {
+        query.insert("to".to_string(), serde_json::json!(last_date.to_string()));
+    }
+
+    let mut account_ids: Vec<_> = issues
+        .iter()
+        .filter_map(|i| i.account_id.as_ref())
+        .collect();
+    account_ids.sort();
+    account_ids.dedup();
+    if let [account_id] = account_ids.as_slice() {
+        query.insert("account".to_string(), serde_json::json!(account_id));
+    }
+
+    serde_json::Value::Object(query)
+}
+
+fn unknown_transfer_issue_query(
+    issue: &ConsistencyIssueInfo,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut query = serde_json::Map::new();
+    query.insert(
+        "types".to_string(),
+        serde_json::json!("TRANSFER_IN,TRANSFER_OUT"),
+    );
+    query.insert("healthContext".to_string(), serde_json::json!("activity"));
+    if let Some(account_id) = issue.account_id.as_ref() {
+        query.insert("account".to_string(), serde_json::json!(account_id));
+    }
+    if let Some(date) = issue.activity_date {
+        let date = date.format("%Y-%m-%d").to_string();
+        query.insert("from".to_string(), serde_json::json!(date.clone()));
+        query.insert("to".to_string(), serde_json::json!(date));
+    }
+    query
+}
+
+fn activity_route_from_query(query: &serde_json::Map<String, serde_json::Value>) -> String {
+    let params = query
+        .iter()
+        .filter_map(|(key, value)| {
+            let value = value.as_str()?;
+            Some(format!(
+                "{}={}",
+                urlencoding::encode(key),
+                urlencoding::encode(value)
+            ))
+        })
+        .collect::<Vec<_>>();
+    format!("/activities?{}", params.join("&"))
+}
+
+fn unknown_transfer_diagnostic(issue: &ConsistencyIssueInfo) -> HealthDiagnostic {
+    let query = unknown_transfer_issue_query(issue);
+    let route = activity_route_from_query(&query);
+    let navigate = NavigateAction {
+        route: "/activities".to_string(),
+        query: Some(serde_json::Value::Object(query)),
+        label: "Review Transactions".to_string(),
+    };
+
+    let mut diagnostic = HealthDiagnostic::new(
+        "TRANSFER_DATE_NEEDS_REVIEW",
+        "Transfer needs review",
+        "Review the transfers on this date. Match the two transactions if money moved between your accounts, or mark it external if money entered or left your portfolio.",
+    )
+    .domain(DiagnosticDomain::Ledger)
+    .level(DiagnosticLevel::Source)
+    .entity(
+        HealthEntityRef::new("transferDate", issue.record_id.clone())
+            .label(issue.description.clone())
+            .route(route.clone()),
+    )
+    .evidence(Evidence::new("Transfer", issue.description.clone()).with_route(route))
+    .navigate(true, navigate);
+
+    if let Some(date) = issue.activity_date {
+        let date = date.format("%Y-%m-%d").to_string();
+        diagnostic = diagnostic
+            .date(date.clone())
+            .evidence(Evidence::new("Date", date));
+    }
+
+    diagnostic
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_valuation_quality_issue(
+    id_prefix: &str,
+    code: &str,
+    issues: &[&ConsistencyIssueInfo],
+    severity: Severity,
+    title: &str,
+    plural_title: &str,
+    message: &str,
+) -> HealthIssue {
+    let mut data_keys: Vec<String> = issues
+        .iter()
+        .map(|i| {
+            format!(
+                "{}:{}",
+                i.record_id,
+                i.activity_date
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    data_keys.sort();
+    let data_hash = compute_data_hash(&data_keys);
+
+    let mut seen_items = std::collections::HashSet::new();
+    let affected_items: Vec<AffectedItem> = issues
+        .iter()
+        .filter_map(|i| {
+            if let Some(asset_id) = i.asset_id.as_ref() {
+                if !seen_items.insert(format!("asset:{asset_id}")) {
+                    return None;
+                }
+                let symbol = i.asset_symbol.clone().unwrap_or_else(|| asset_id.clone());
+                return Some(AffectedItem::asset_with_name(
+                    asset_id.clone(),
+                    symbol,
+                    i.asset_name.clone(),
+                ));
+            }
+
+            let account_id = i.account_id.as_ref()?;
+            if !seen_items.insert(format!("account:{account_id}")) {
+                return None;
+            }
+            Some(AffectedItem::account(
+                account_id.clone(),
+                i.description.clone(),
+            ))
+        })
+        .collect();
+
+    let mut details = issues
+        .iter()
+        .take(MAX_VALUATION_DIAGNOSTICS)
+        .map(|i| {
+            let date = i
+                .activity_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "unknown date".to_string());
+            format!("{}\nDate: {}", i.description, date)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if issues.len() > MAX_VALUATION_DIAGNOSTICS {
+        details.push_str(&format!(
+            "\n\n…and {} more. The affected count includes all records.",
+            issues.len() - MAX_VALUATION_DIAGNOSTICS
+        ));
+    }
+
+    let diagnostics: Vec<HealthDiagnostic> = issues
+        .iter()
+        .take(MAX_VALUATION_DIAGNOSTICS)
+        .filter_map(|i| valuation_diagnostic(i))
+        .collect();
+
+    let mut builder = HealthIssue::builder()
+        .id(format!("{}:{}", id_prefix, data_hash))
+        .severity(severity)
+        .category(HealthCategory::DataConsistency)
+        .code(code)
+        .param("count", issues.len() as u32)
+        .title(if issues.len() == 1 {
+            title.to_string()
+        } else {
+            format!("{} {}", issues.len(), plural_title)
+        })
+        .message(message)
+        .affected_count(issues.len() as u32)
+        .navigate_action(NavigateAction::to_activities(None))
+        .data_hash(data_hash);
+    if !affected_items.is_empty() {
+        builder = builder.affected_items(affected_items);
+    }
+    if !details.is_empty() {
+        builder = builder.details(details);
+    }
+    if !diagnostics.is_empty() {
+        builder = builder.diagnostics(diagnostics);
+    }
+    builder.build()
+}
+
+fn asset_quote_route(asset_id: &str, date: Option<&str>) -> String {
+    let encoded_asset_id = urlencoding::encode(asset_id);
+    match date {
+        Some(date) => format!(
+            "/holdings/{}?tab=quotes&healthContext=price&date={}",
+            encoded_asset_id,
+            urlencoding::encode(date)
+        ),
+        None => format!("/holdings/{encoded_asset_id}?tab=quotes&healthContext=price"),
+    }
+}
+
+fn asset_quote_navigate_action(asset_id: String, date: Option<&str>) -> NavigateAction {
+    let query = match date {
+        Some(date) => {
+            serde_json::json!({ "tab": "quotes", "healthContext": "price", "date": date })
+        }
+        None => serde_json::json!({ "tab": "quotes", "healthContext": "price" }),
+    };
+
+    NavigateAction {
+        route: format!("/holdings/{}", urlencoding::encode(&asset_id)),
+        query: Some(query),
+        label: "Add Price".to_string(),
+    }
+}
+
+/// Builds a structured diagnostic (root cause, evidence, ordered actions) for a
+/// classified valuation-quality issue. Returns `None` for issues without a
+/// classified `reason` so the UI falls back to the flat `details` rendering.
+fn valuation_diagnostic(issue: &ConsistencyIssueInfo) -> Option<HealthDiagnostic> {
+    let reason = issue.reason?;
+
+    let (title, explanation) = match reason {
+        ValuationIssueReason::MissingMarketQuote => (
+            "No price found",
+            "Wealthfolio is missing the exact market price for this holding on the affected date. \
+             It can carry forward the last available price, but syncing or adding the exact price keeps daily returns accurate. \
+             If this was a market holiday or the investment did not trade, dismiss this issue.",
+        ),
+        ValuationIssueReason::MissingManualValuation => (
+            "No value entered",
+            "This manual holding has no value entered for the affected date. Wealthfolio can carry forward the last value, but adding this date keeps daily returns accurate. If a separate value is not needed for this date, dismiss this issue.",
+        ),
+        ValuationIssueReason::MissingFxRate => (
+            "No exchange rate",
+            "An exchange rate is missing, so this holding cannot be converted to your base currency.",
+        ),
+        ValuationIssueReason::Unavailable => (
+            "Account value is missing",
+            "This account could not be valued on the affected date. Wealthfolio hides returns for that period instead of showing a misleading number.",
+        ),
+        ValuationIssueReason::Unknown => (
+            "Holding value needs review",
+            "At least one holding could not be valued on the affected date. Add the missing price or value to restore complete returns.",
+        ),
+        ValuationIssueReason::IncompleteBasisActivity => (
+            "Missing purchase price",
+            "This transaction has no price, so Wealthfolio cannot calculate what you paid or your gain/loss. \
+             Add the price you paid. If the shares were free, record them as a Transfer In.",
+        ),
+        ValuationIssueReason::IncompleteBasisSnapshot => (
+            "Missing cost basis",
+            "This holding has no cost basis, so Wealthfolio cannot calculate gain/loss. \
+             Add what you paid in the holdings entry.",
+        ),
+    };
+
+    let (domain, level) = match reason {
+        ValuationIssueReason::MissingMarketQuote | ValuationIssueReason::MissingManualValuation => {
+            (DiagnosticDomain::MarketData, DiagnosticLevel::Source)
+        }
+        ValuationIssueReason::MissingFxRate => (DiagnosticDomain::Fx, DiagnosticLevel::Source),
+        ValuationIssueReason::Unavailable | ValuationIssueReason::Unknown => {
+            (DiagnosticDomain::GeneratedData, DiagnosticLevel::Generated)
+        }
+        ValuationIssueReason::IncompleteBasisActivity
+        | ValuationIssueReason::IncompleteBasisSnapshot => {
+            (DiagnosticDomain::PerformanceInputs, DiagnosticLevel::Source)
+        }
+    };
+
+    let mut diagnostic = HealthDiagnostic::new(reason.code(), title, explanation)
+        .domain(domain)
+        .level(level);
+
+    if let Some(asset_id) = issue.asset_id.as_ref() {
+        let label = issue
+            .asset_symbol
+            .clone()
+            .map(|symbol| match issue.asset_name.as_ref() {
+                Some(name) => format!("{symbol} — {name}"),
+                None => symbol,
+            })
+            .unwrap_or_else(|| asset_id.clone());
+        let issue_date = issue
+            .activity_date
+            .map(|date| date.format("%Y-%m-%d").to_string());
+        let asset_route = match reason {
+            ValuationIssueReason::MissingMarketQuote
+            | ValuationIssueReason::MissingManualValuation => {
+                asset_quote_route(asset_id, issue_date.as_deref())
+            }
+            ValuationIssueReason::IncompleteBasisSnapshot => {
+                format!(
+                    "/holdings/{}?tab=snapshots&healthContext=basis",
+                    urlencoding::encode(asset_id)
+                )
+            }
+            ValuationIssueReason::IncompleteBasisActivity => {
+                format!(
+                    "/holdings/{}?tab=activities&healthContext=activity",
+                    urlencoding::encode(asset_id)
+                )
+            }
+            _ => format!("/holdings/{}", urlencoding::encode(asset_id)),
+        };
+        let evidence_label = match reason {
+            ValuationIssueReason::IncompleteBasisActivity => "Transaction",
+            _ => "Asset",
+        };
+        diagnostic = diagnostic
+            .evidence(Evidence::new(evidence_label, label.clone()).with_route(asset_route.clone()));
+        diagnostic = diagnostic.entity(
+            HealthEntityRef::new("asset", asset_id.clone())
+                .label(label)
+                .route(asset_route),
+        );
+    } else {
+        diagnostic = diagnostic.evidence(Evidence::new("Account", issue.description.clone()));
+    }
+
+    if let Some(account_id) = issue.account_id.as_ref() {
+        diagnostic = diagnostic.entity(
+            HealthEntityRef::new("account", account_id.clone()).label(issue.description.clone()),
+        );
+    }
+
+    if let Some(activity_id) = issue.activity_id.as_ref() {
+        diagnostic = diagnostic.entity(
+            HealthEntityRef::new("activity", activity_id.clone()).route(format!(
+                "/activities?activity={}&healthContext=activity",
+                urlencoding::encode(activity_id)
+            )),
+        );
+    }
+
+    if let Some(date) = issue.activity_date {
+        let label = match reason {
+            ValuationIssueReason::IncompleteBasisActivity => "Trade date",
+            _ => "Date",
+        };
+        let date = date.format("%Y-%m-%d").to_string();
+        diagnostic = diagnostic
+            .date(date.clone())
+            .evidence(Evidence::new(label, date));
+    }
+
+    match reason {
+        ValuationIssueReason::MissingMarketQuote => {
+            if let Some(asset_id) = issue.asset_id.clone() {
+                let issue_date = issue
+                    .activity_date
+                    .map(|date| date.format("%Y-%m-%d").to_string());
+                diagnostic = diagnostic
+                    .fix(true, FixAction::sync_prices(vec![asset_id.clone()]))
+                    .navigate(
+                        false,
+                        asset_quote_navigate_action(asset_id, issue_date.as_deref()),
+                    );
+            } else {
+                diagnostic = diagnostic.navigate(true, NavigateAction::to_market_data());
+            }
+        }
+        ValuationIssueReason::MissingManualValuation => {
+            if let Some(asset_id) = issue.asset_id.clone() {
+                let issue_date = issue
+                    .activity_date
+                    .map(|date| date.format("%Y-%m-%d").to_string());
+                diagnostic = diagnostic.navigate(
+                    true,
+                    asset_quote_navigate_action(asset_id, issue_date.as_deref()),
+                );
+            }
+        }
+        ValuationIssueReason::MissingFxRate => {
+            diagnostic = diagnostic.navigate(true, NavigateAction::to_market_data());
+        }
+        ValuationIssueReason::Unavailable | ValuationIssueReason::Unknown => {
+            diagnostic = diagnostic.navigate(true, NavigateAction::to_activities(None));
+            // Once the underlying prices/valuations are fixed, an account-scoped
+            // rebuild regenerates the affected history rows.
+            if let Some(account_id) = issue.account_id.clone() {
+                diagnostic =
+                    diagnostic.fix(false, FixAction::rebuild_account_history(vec![account_id]));
+            }
+        }
+        ValuationIssueReason::IncompleteBasisActivity => {
+            // Transaction-tracked: the acquiring activity lacks a cost basis.
+            // Prefer an exact deep-link to that activity; otherwise fall back to
+            // the asset's own activities tab (asset-scoped).
+            if let Some(activity_id) = issue.activity_id.clone() {
+                diagnostic = diagnostic.navigate(true, NavigateAction::to_activity(activity_id));
+            } else if let Some(asset_id) = issue.asset_id.clone() {
+                diagnostic =
+                    diagnostic.navigate(true, NavigateAction::to_asset_activities(asset_id));
+            } else {
+                diagnostic = diagnostic.navigate(true, NavigateAction::to_activities(None));
+            }
+            if let Some(account_id) = issue.account_id.clone() {
+                diagnostic =
+                    diagnostic.fix(false, FixAction::rebuild_account_history(vec![account_id]));
+            }
+        }
+        ValuationIssueReason::IncompleteBasisSnapshot => {
+            // Holdings-tracked: there is no transaction; edit the holdings
+            // snapshot's cost basis for the asset.
+            if let Some(asset_id) = issue.asset_id.clone() {
+                diagnostic =
+                    diagnostic.navigate(true, NavigateAction::to_asset_snapshots(asset_id));
+            }
+            if let Some(account_id) = issue.account_id.clone() {
+                diagnostic =
+                    diagnostic.fix(false, FixAction::rebuild_account_history(vec![account_id]));
+            }
+        }
+    }
+
+    Some(diagnostic)
 }
 
 impl Default for DataConsistencyCheck {
@@ -498,6 +1516,12 @@ mod tests {
             asset_name: None,
             quantity: None,
             proceeds: None,
+            reason: None,
+            activity_id: None,
+            snapshot_date_raw: None,
+            snapshot_source: None,
+            snapshot_min_date: None,
+            snapshot_max_date: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
@@ -526,11 +1550,170 @@ mod tests {
             asset_name: None,
             quantity: None,
             proceeds: None,
+            reason: None,
+            activity_id: None,
+            snapshot_date_raw: None,
+            snapshot_source: None,
+            snapshot_min_date: None,
+            snapshot_max_date: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn invalid_snapshot_date_links_to_exact_snapshot() {
+        let check = DataConsistencyCheck::new();
+        let ctx = HealthContext::new(HealthConfig::default(), "USD", 100_000.0);
+        let date = chrono::NaiveDate::from_ymd_opt(224, 7, 20).unwrap();
+        let issues = check.analyze(
+            &[ConsistencyIssueInfo {
+                issue_type: ConsistencyIssueType::InvalidSnapshotDate,
+                record_id: format!("acc-1:{}", date),
+                description: "Brokerage".to_string(),
+                account_id: Some("acc-1".to_string()),
+                asset_id: None,
+                first_negative_date: None,
+                cash_balance: None,
+                total_value_at_date: None,
+                account_currency: None,
+                activity_date: Some(date),
+                asset_symbol: None,
+                asset_name: None,
+                quantity: None,
+                proceeds: None,
+                reason: None,
+                activity_id: None,
+                snapshot_date_raw: None,
+                snapshot_source: Some("CSV_IMPORT".to_string()),
+                snapshot_min_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1),
+                snapshot_max_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 6),
+            }],
+            &ctx,
+        );
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code.as_deref(), Some("INVALID_SNAPSHOT_DATE"));
+        assert!(issues[0]
+            .details
+            .as_deref()
+            .unwrap()
+            .contains("Dates you can use: 1970-01-01 to 2026-08-06"));
+        let navigate = issues[0].navigate_action.as_ref().unwrap();
+        assert_eq!(navigate.route, "/accounts/acc-1");
+        assert_eq!(
+            navigate.query.as_ref().unwrap().get("snapshotDate"),
+            Some(&serde_json::json!("0224-07-20"))
+        );
+        assert_eq!(
+            navigate.query.as_ref().unwrap().get("snapshotId"),
+            Some(&serde_json::json!(format!("acc-1:{}", date)))
+        );
+    }
+
+    #[test]
+    fn malformed_snapshot_date_links_to_snapshot_id() {
+        let check = DataConsistencyCheck::new();
+        let ctx = HealthContext::new(HealthConfig::default(), "USD", 100_000.0);
+        let issues = check.analyze(
+            &[ConsistencyIssueInfo {
+                issue_type: ConsistencyIssueType::InvalidSnapshotDate,
+                record_id: "snapshot-1".to_string(),
+                description: "Brokerage".to_string(),
+                account_id: Some("acc-1".to_string()),
+                asset_id: None,
+                first_negative_date: None,
+                cash_balance: None,
+                total_value_at_date: None,
+                account_currency: None,
+                activity_date: None,
+                asset_symbol: None,
+                asset_name: None,
+                quantity: None,
+                proceeds: None,
+                reason: None,
+                activity_id: None,
+                snapshot_date_raw: Some("not-a-date".to_string()),
+                snapshot_source: Some("CSV_IMPORT".to_string()),
+                snapshot_min_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1),
+                snapshot_max_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 6),
+            }],
+            &ctx,
+        );
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, "A holdings entry has a malformed date");
+        let query = issues[0]
+            .navigate_action
+            .as_ref()
+            .unwrap()
+            .query
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            query.get("snapshotId"),
+            Some(&serde_json::json!("snapshot-1"))
+        );
+        assert_eq!(
+            query.get("snapshotDate"),
+            Some(&serde_json::json!("not-a-date"))
+        );
+    }
+
+    #[test]
+    fn invalid_activities_on_same_date_are_counted_and_explained() {
+        let check = DataConsistencyCheck::new();
+        let ctx = HealthContext::new(HealthConfig::default(), "USD", 100_000.0);
+        let date = chrono::NaiveDate::from_ymd_opt(1969, 12, 31).unwrap();
+        let first = ConsistencyIssueInfo {
+            issue_type: ConsistencyIssueType::InvalidSnapshotDate,
+            record_id: "activity-1".to_string(),
+            description: "TD Invest".to_string(),
+            account_id: Some("acc-1".to_string()),
+            asset_id: None,
+            first_negative_date: None,
+            cash_balance: None,
+            total_value_at_date: None,
+            account_currency: None,
+            activity_date: Some(date),
+            asset_symbol: None,
+            asset_name: None,
+            quantity: None,
+            proceeds: None,
+            reason: None,
+            activity_id: Some("activity-1".to_string()),
+            snapshot_date_raw: None,
+            snapshot_source: Some("ACCOUNT_ACTIVITY".to_string()),
+            snapshot_min_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1),
+            snapshot_max_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 6),
+        };
+        let mut second = first.clone();
+        second.record_id = "activity-2".to_string();
+        second.activity_id = Some("activity-2".to_string());
+
+        let issues = check.analyze(&[first, second], &ctx);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].affected_count, 2);
+        assert_eq!(issues[0].title, "2 activities have unsupported dates");
+        assert!(issues[0]
+            .message
+            .contains("This account wasn't recalculated"));
+        assert!(issues[0]
+            .message
+            .contains("Change their dates to January 1, 1970 or later"));
+        let diagnostic = &issues[0].diagnostics.as_ref().unwrap()[0];
+        assert_eq!(diagnostic.code, "INVALID_ACTIVITY_DATE");
+        assert!(diagnostic
+            .evidence
+            .iter()
+            .any(|evidence| evidence.label == "Affected activities" && evidence.value == "2"));
+        assert_eq!(
+            issues[0].navigate_action.as_ref().unwrap().label,
+            "Review activities"
+        );
     }
 
     #[test]
@@ -553,12 +1736,22 @@ mod tests {
             asset_name: None,
             quantity: None,
             proceeds: None,
+            reason: None,
+            activity_id: None,
+            snapshot_date_raw: None,
+            snapshot_source: None,
+            snapshot_min_date: None,
+            snapshot_max_date: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Info);
-        assert!(issues[0].fix_action.is_some());
+        // The legacy-classification finding routes to taxonomy settings rather
+        // than offering the old unimplemented per-asset classification fix action;
+        // the working migration lives on the ClassificationCheck finding.
+        assert!(issues[0].fix_action.is_none());
+        assert!(issues[0].navigate_action.is_some());
     }
 
     #[test]
@@ -582,6 +1775,12 @@ mod tests {
                 asset_name: None,
                 quantity: None,
                 proceeds: None,
+                reason: None,
+                activity_id: None,
+                snapshot_date_raw: None,
+                snapshot_source: None,
+                snapshot_min_date: None,
+                snapshot_max_date: None,
             },
             ConsistencyIssueInfo {
                 issue_type: ConsistencyIssueType::OrphanActivityAccount,
@@ -598,6 +1797,12 @@ mod tests {
                 asset_name: None,
                 quantity: None,
                 proceeds: None,
+                reason: None,
+                activity_id: None,
+                snapshot_date_raw: None,
+                snapshot_source: None,
+                snapshot_min_date: None,
+                snapshot_max_date: None,
             },
             ConsistencyIssueInfo {
                 issue_type: ConsistencyIssueType::NegativePosition,
@@ -614,6 +1819,12 @@ mod tests {
                 asset_name: None,
                 quantity: None,
                 proceeds: None,
+                reason: None,
+                activity_id: None,
+                snapshot_date_raw: None,
+                snapshot_source: None,
+                snapshot_min_date: None,
+                snapshot_max_date: None,
             },
         ];
 
@@ -642,6 +1853,12 @@ mod tests {
             asset_name: None,
             quantity: None,
             proceeds: None,
+            reason: None,
+            activity_id: None,
+            snapshot_date_raw: None,
+            snapshot_source: None,
+            snapshot_min_date: None,
+            snapshot_max_date: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
@@ -671,6 +1888,12 @@ mod tests {
             asset_name: Some("Apple Inc.".to_string()),
             quantity: Some(rust_decimal_macros::dec!(1)),
             proceeds: Some(rust_decimal_macros::dec!(291.10598755)),
+            reason: None,
+            activity_id: None,
+            snapshot_date_raw: None,
+            snapshot_source: None,
+            snapshot_min_date: None,
+            snapshot_max_date: None,
         }];
 
         let issues = check.analyze(&issues_data, &ctx);
@@ -695,6 +1918,178 @@ mod tests {
                 .and_then(|query| query.get("types")),
             Some(&serde_json::json!("SELL"))
         );
+    }
+
+    #[test]
+    fn valuation_quality_plural_titles_are_specific() {
+        fn valuation_issue(
+            issue_type: ConsistencyIssueType,
+            record_id: &str,
+            reason: Option<ValuationIssueReason>,
+        ) -> ConsistencyIssueInfo {
+            let is_basis_activity = reason == Some(ValuationIssueReason::IncompleteBasisActivity);
+            let activity_date = if record_id.ends_with("-2") {
+                chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap()
+            } else {
+                chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
+            };
+            ConsistencyIssueInfo {
+                issue_type,
+                record_id: record_id.to_string(),
+                description: "TFSA".to_string(),
+                account_id: Some("acc_tfsa".to_string()),
+                asset_id: is_basis_activity.then(|| "asset_aapl".to_string()),
+                first_negative_date: None,
+                cash_balance: None,
+                total_value_at_date: None,
+                account_currency: None,
+                activity_date: Some(activity_date),
+                asset_symbol: is_basis_activity.then(|| "AAPL".to_string()),
+                asset_name: is_basis_activity.then(|| "Apple Inc.".to_string()),
+                quantity: None,
+                proceeds: None,
+                reason,
+                activity_id: is_basis_activity.then(|| record_id.to_string()),
+                snapshot_date_raw: None,
+                snapshot_source: None,
+                snapshot_min_date: None,
+                snapshot_max_date: None,
+            }
+        }
+
+        let check = DataConsistencyCheck::new();
+        let ctx = HealthContext::new(HealthConfig::default(), "USD", 100_000.0);
+        let issues_data = vec![
+            valuation_issue(
+                ConsistencyIssueType::MissingGeneratedValuation,
+                "missing-1",
+                None,
+            ),
+            valuation_issue(
+                ConsistencyIssueType::MissingGeneratedValuation,
+                "missing-2",
+                None,
+            ),
+            valuation_issue(
+                ConsistencyIssueType::IncompleteValuationValue,
+                "value-1",
+                None,
+            ),
+            valuation_issue(
+                ConsistencyIssueType::IncompleteValuationValue,
+                "value-2",
+                None,
+            ),
+            valuation_issue(
+                ConsistencyIssueType::IncompleteValuationBasis,
+                "basis-1",
+                Some(ValuationIssueReason::IncompleteBasisActivity),
+            ),
+            valuation_issue(
+                ConsistencyIssueType::IncompleteValuationBasis,
+                "basis-2",
+                Some(ValuationIssueReason::IncompleteBasisActivity),
+            ),
+            valuation_issue(
+                ConsistencyIssueType::UnknownPerformanceFlowSource,
+                "flow-1",
+                None,
+            ),
+            valuation_issue(
+                ConsistencyIssueType::UnknownPerformanceFlowSource,
+                "flow-2",
+                None,
+            ),
+        ];
+
+        let issues = check.analyze(&issues_data, &ctx);
+        let title_for = |prefix: &str| {
+            issues
+                .iter()
+                .find(|issue| issue.id.starts_with(prefix))
+                .map(|issue| issue.title.as_str())
+        };
+
+        assert_eq!(
+            title_for("missing_generated_valuation:"),
+            Some("2 daily account values are missing")
+        );
+        assert_eq!(
+            title_for("incomplete_valuation_value:"),
+            Some("2 prices or values are missing")
+        );
+        assert_eq!(
+            title_for("incomplete_valuation_basis:"),
+            Some("2 transactions are missing purchase prices")
+        );
+        assert_eq!(
+            title_for("unknown_performance_flow_source:"),
+            Some("2 transfer dates need review")
+        );
+
+        let unknown_flow_issue = issues
+            .iter()
+            .find(|issue| issue.id.starts_with("unknown_performance_flow_source:"))
+            .expect("unknown flow issue");
+        let navigate_query = unknown_flow_issue
+            .navigate_action
+            .as_ref()
+            .and_then(|action| action.query.as_ref())
+            .expect("unknown flow activity query");
+        assert_eq!(
+            navigate_query.get("types"),
+            Some(&serde_json::json!("TRANSFER_IN,TRANSFER_OUT"))
+        );
+        assert!(navigate_query.get("q").is_none());
+        assert_eq!(
+            navigate_query.get("account"),
+            Some(&serde_json::json!("acc_tfsa"))
+        );
+        assert_eq!(
+            navigate_query.get("from"),
+            Some(&serde_json::json!("2026-06-01"))
+        );
+        assert_eq!(
+            navigate_query.get("to"),
+            Some(&serde_json::json!("2026-06-01"))
+        );
+        assert_eq!(
+            navigate_query.get("healthContext"),
+            Some(&serde_json::json!("activity"))
+        );
+        let transfer_diagnostics = unknown_flow_issue
+            .diagnostics
+            .as_ref()
+            .expect("transfer diagnostics");
+        assert_eq!(transfer_diagnostics.len(), 2);
+        assert!(transfer_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == "TRANSFER_DATE_NEEDS_REVIEW"));
+        assert!(transfer_diagnostics.iter().all(|diagnostic| diagnostic
+            .evidence
+            .iter()
+            .any(|evidence| evidence.label == "Transfer")));
+        let transfer_dates: Vec<_> = transfer_diagnostics
+            .iter()
+            .flat_map(|diagnostic| diagnostic.evidence.iter())
+            .filter(|evidence| evidence.label == "Date")
+            .map(|evidence| evidence.value.as_str())
+            .collect();
+        assert!(transfer_dates.contains(&"2026-06-01"));
+        assert!(transfer_dates.contains(&"2026-06-02"));
+        assert!(transfer_diagnostics
+            .iter()
+            .flat_map(|diagnostic| diagnostic.evidence.iter())
+            .filter(|evidence| evidence.label == "Transfer")
+            .filter_map(|evidence| evidence.route.as_deref())
+            .any(|route| route.contains("from=2026-06-02")));
+
+        let basis_issue = issues
+            .iter()
+            .find(|issue| issue.id.starts_with("incomplete_valuation_basis:"))
+            .expect("basis issue");
+        let diagnostic = &basis_issue.diagnostics.as_ref().expect("basis diagnostics")[0];
+        assert_eq!(diagnostic.evidence[0].label, "Transaction");
     }
 
     #[test]

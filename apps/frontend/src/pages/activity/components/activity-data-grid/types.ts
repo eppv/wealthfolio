@@ -1,4 +1,5 @@
 import type { ActivityDetails, AssetResolutionInput } from "@/lib/types";
+import type { ActivityStatus } from "@/lib/constants";
 
 /**
  * Represents a local transaction that extends ActivityDetails with draft state
@@ -20,7 +21,7 @@ export interface LocalTransaction extends ActivityDetails {
   pendingProviderSymbol?: string;
   /** Persisted asset id selected from symbol search, if the result already exists */
   pendingAssetId?: string;
-  /** Whether this transfer is external (from/to outside tracked accounts). Stored in metadata.flow.is_external */
+  /** Explicit performance boundary marker stored in metadata.flow.is_external. */
   isExternal?: boolean;
   /** Original asset symbol from server - used to detect symbol changes for updates */
   _originalAssetSymbol?: string;
@@ -30,6 +31,10 @@ export interface LocalTransaction extends ActivityDetails {
   _originalInstrumentType?: string;
   /** Original asset ID from server - sent for updates when symbol hasn't changed */
   _originalAssetId?: string;
+  /** Original review flag from server - an update only sends needsReview when it changed */
+  _originalNeedsReview?: boolean;
+  /** Session-only: direct Total edit disables further automatic calculation. */
+  _amountEdited?: boolean;
 }
 
 /**
@@ -46,9 +51,9 @@ export function toLocalTransaction(activity: ActivityDetails): LocalTransaction 
   if (isLocalTransaction(activity)) {
     return activity;
   }
-  // Extract isExternal from metadata.flow.is_external
+  // Preserve both explicit boundary values; absence must remain distinguishable from false.
   const flowMeta = activity.metadata?.flow as Record<string, unknown> | undefined;
-  const isExternal = flowMeta?.is_external === true;
+  const isExternal = typeof flowMeta?.is_external === "boolean" ? flowMeta.is_external : undefined;
   return {
     ...activity,
     isNew: false,
@@ -58,12 +63,13 @@ export function toLocalTransaction(activity: ActivityDetails): LocalTransaction 
     _originalExchangeMic: activity.exchangeMic,
     _originalInstrumentType: activity.instrumentType,
     _originalAssetId: activity.assetId,
+    _originalNeedsReview: activity.needsReview,
+    _amountEdited: false,
   };
 }
 
 /**
- * Checks if a transaction is pending review (synced but not yet approved)
- * A transaction is pending review if needsReview=true AND it's not a locally created new row
+ * Checks if a persisted transaction needs user review.
  */
 export function isPendingReview(transaction: LocalTransaction): boolean {
   return transaction.needsReview === true && transaction.isNew !== true;
@@ -126,7 +132,7 @@ export interface SavePayloadResult {
 
 /**
  * Base activity payload fields (shared between create and update)
- * Note: Decimal fields (quantity, unitPrice, amount, fee, fxRate) use strings
+ * Note: Decimal fields (quantity, unitPrice, amount, fee, tax, fxRate) use strings
  * to preserve precision for very small values like 0.000000099
  */
 interface ActivityBasePayload {
@@ -142,9 +148,11 @@ interface ActivityBasePayload {
   amount?: string | null;
   currency?: string;
   fee?: string | null;
+  tax?: string | null;
+  status?: ActivityStatus;
   fxRate?: string | null;
   notes?: string | null;
-  /** JSON blob for metadata (e.g., flow.is_external for transfers) */
+  /** JSON blob for metadata, including explicit transfer and credit boundaries. */
   metadata?: string;
 }
 
@@ -160,6 +168,8 @@ export interface ActivityCreatePayload extends ActivityBasePayload {
   idempotencyKey?: string;
   /** Asset resolution input - id plus natural identity and creation hints */
   asset?: AssetResolutionInput;
+  /** Attestation: false marks a user-typed custom total as already reviewed. */
+  needsReview?: boolean;
 }
 
 /**
@@ -172,6 +182,8 @@ export interface ActivityCreatePayload extends ActivityBasePayload {
 export interface ActivityUpdatePayload extends ActivityBasePayload {
   /** Asset resolution input - id plus natural identity and creation hints */
   asset?: AssetResolutionInput;
+  /** Explicit review patch; false approves a flagged activity. */
+  needsReview?: boolean;
 }
 
 /**

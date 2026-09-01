@@ -1,8 +1,15 @@
 import { useAccountsSimplePerformance } from "@/hooks/use-accounts-simple-performance";
-import type { Account, Holding, PortfolioAllocations, TaxonomyAllocation } from "@/lib/types";
+import type {
+  Account,
+  AccountValueSource,
+  Holding,
+  PortfolioAllocations,
+  TaxonomyAllocation,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Card, Icons, PrivacyAmount, Skeleton } from "@wealthfolio/ui";
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   accountTreeWeights,
   buildBreakdownTree,
@@ -18,6 +25,7 @@ interface PortfolioExplorerProps {
   accounts: Account[];
   /** In-scope account ids — drives per-account valuations for the Accounts/Groups lenses. */
   accountIds?: string[];
+  accountValuations?: AccountValueSource[];
   currency: string;
   isLoading?: boolean;
   onOpenAllocation: (allocation: TaxonomyAllocation, categoryId?: string) => void;
@@ -28,6 +36,8 @@ interface Lens {
   label: string;
   unit: string;
   nodes: BreakdownNode[];
+  /** Underlying item count when it differs from the top-level row count (grouped rows). */
+  count?: number;
   /** Taxonomy backing the lens; when present, leaf rows open the detail sheet. */
   allocation?: TaxonomyAllocation;
 }
@@ -100,15 +110,28 @@ function taxonomyLens(
   };
 }
 
+/** Accounts lens: rows are groups, so the count has to reach through to the accounts. */
+function accountsLens(label: string, unit: string, nodes: BreakdownNode[]): Lens {
+  return {
+    key: "accounts",
+    label,
+    unit,
+    nodes,
+    count: nodes.reduce((s, n) => s + (n.children?.length ?? 1), 0),
+  };
+}
+
 export function PortfolioExplorer({
   allocations,
   holdings,
   accounts,
   accountIds,
+  accountValuations,
   currency,
   isLoading,
   onOpenAllocation,
 }: PortfolioExplorerProps) {
+  const { t } = useTranslation();
   const [activeKey, setActiveKey] = useState("allocation");
   const [showAll, setShowAll] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -117,36 +140,70 @@ export function PortfolioExplorer({
     () => (accountIds ? accounts.filter((a) => accountIds.includes(a.id)) : accounts),
     [accounts, accountIds],
   );
-  const { data: performance = [] } = useAccountsSimplePerformance(scopedAccounts);
+  const { data: performance = [] } = useAccountsSimplePerformance(scopedAccounts, {
+    enabled: accountValuations === undefined,
+  });
+  const accountValues = accountValuations ?? performance;
 
   const lenses = useMemo<Lens[]>(() => {
     const list: Lens[] = [
-      taxonomyLens("allocation", "Allocation", "categories", allocations?.assetClasses),
-      {
-        key: "accounts",
-        label: "Accounts",
-        unit: "accounts",
-        nodes: accountTreeWeights(performance, scopedAccounts),
-      },
-      taxonomyLens("sectors", "Sectors", "sectors", allocations?.sectors),
-      taxonomyLens("regions", "Regions", "regions", allocations?.regions),
-      taxonomyLens("risk", "Risk", "levels", allocations?.riskCategory),
-      taxonomyLens("security", "Security types", "types", allocations?.securityTypes),
+      taxonomyLens(
+        "allocation",
+        t("insights:insights.explorer.lens_allocation"),
+        t("insights:insights.explorer.unit_categories"),
+        allocations?.assetClasses,
+      ),
+      accountsLens(
+        t("insights:insights.explorer.lens_accounts"),
+        t("insights:insights.explorer.unit_accounts"),
+        accountTreeWeights(accountValues, scopedAccounts),
+      ),
+      taxonomyLens(
+        "sectors",
+        t("insights:insights.explorer.lens_sectors"),
+        t("insights:insights.explorer.unit_sectors"),
+        allocations?.sectors,
+      ),
+      taxonomyLens(
+        "regions",
+        t("insights:insights.explorer.lens_regions"),
+        t("insights:insights.explorer.unit_regions"),
+        allocations?.regions,
+      ),
+      taxonomyLens(
+        "risk",
+        t("insights:insights.explorer.lens_risk"),
+        t("insights:insights.explorer.unit_levels"),
+        allocations?.riskCategory,
+      ),
+      taxonomyLens(
+        "security",
+        t("insights:insights.explorer.lens_security"),
+        t("insights:insights.explorer.unit_types"),
+        allocations?.securityTypes,
+      ),
       {
         key: "currency",
-        label: "Currency",
-        unit: "currencies",
+        label: t("insights:insights.explorer.lens_currency"),
+        unit: t("insights:insights.explorer.unit_currencies"),
         nodes: toBreakdownNodes(currencyLensItems(holdings)),
       },
     ];
     // Each custom-group taxonomy becomes its own lens.
     for (const taxonomy of allocations?.customGroups ?? []) {
       if (taxonomy.categories.some((c) => c.value > 0)) {
-        list.push(taxonomyLens(taxonomy.taxonomyId, taxonomy.taxonomyName, "groups", taxonomy));
+        list.push(
+          taxonomyLens(
+            taxonomy.taxonomyId,
+            taxonomy.taxonomyName,
+            t("insights:insights.explorer.unit_groups"),
+            taxonomy,
+          ),
+        );
       }
     }
     return list;
-  }, [allocations, holdings, scopedAccounts, performance]);
+  }, [allocations, holdings, scopedAccounts, accountValues, t]);
 
   const active = lenses.find((l) => l.key === activeKey) ?? lenses[0];
 
@@ -177,13 +234,10 @@ export function PortfolioExplorer({
 
   const total = sumValue(active.nodes);
   const collapsible = active.nodes.length > 6;
-  const barWeights = collapsible
-    ? collapseWeights(active.nodes, 5, `Other ${active.unit}`)
-    : active.nodes;
+  const otherLabel = t("insights:insights.explorer.other_units", { unit: active.unit });
+  const barWeights = collapsible ? collapseWeights(active.nodes, 5, otherLabel) : active.nodes;
   const listWeights =
-    collapsible && !showAll
-      ? collapseWeights(active.nodes, 5, `Other ${active.unit}`)
-      : active.nodes;
+    collapsible && !showAll ? collapseWeights(active.nodes, 5, otherLabel) : active.nodes;
 
   function renderNode(node: BreakdownNode): React.ReactNode[] {
     const hasChildren = !!node.children?.length;
@@ -263,7 +317,7 @@ export function PortfolioExplorer({
     <div>
       <div className="mb-2">
         <span className="text-muted-foreground text-sm font-medium uppercase tracking-wider">
-          Breakdown
+          {t("insights:insights.explorer.breakdown")}
         </span>
       </div>
 
@@ -292,14 +346,16 @@ export function PortfolioExplorer({
           <div className="mb-3.5 flex items-baseline justify-between gap-3.5">
             <span className="text-[13.5px] font-bold">{active.label}</span>
             <span className="text-muted-foreground text-[12.5px] tabular-nums">
-              <PrivacyAmount value={total} currency={currency} /> · {active.nodes.length}{" "}
-              {active.unit}
+              <PrivacyAmount value={total} currency={currency} /> ·{" "}
+              {active.count ?? active.nodes.length} {active.unit}
             </span>
           </div>
           <SegmentedBar nodes={barWeights} />
           <div className="mb-1 mt-4 flex items-baseline justify-between">
             <span className="text-muted-foreground text-[10.5px] font-semibold uppercase tracking-wider">
-              {collapsible && !showAll ? `Top ${active.unit}` : active.label}
+              {collapsible && !showAll
+                ? t("insights:insights.explorer.top_units", { unit: active.unit })
+                : active.label}
             </span>
             {collapsible && (
               <button
@@ -307,7 +363,9 @@ export function PortfolioExplorer({
                 onClick={() => setShowAll((v) => !v)}
                 className="text-muted-foreground hover:text-foreground text-[12px] font-semibold"
               >
-                {showAll ? "Show less" : "Show all"}
+                {showAll
+                  ? t("insights:insights.explorer.show_less")
+                  : t("insights:insights.explorer.show_all")}
               </button>
             )}
           </div>

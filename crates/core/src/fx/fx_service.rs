@@ -204,7 +204,16 @@ impl FxServiceTrait for FxService {
             timestamp: Utc::now(),
         };
 
-        self.repository.save_exchange_rate(rate).await
+        // Only MANUAL rates carry a user-supplied value worth persisting. For
+        // provider-backed sources the rate is fetched by the market-data sync;
+        // persisting the request's placeholder here would write a fake quote
+        // (e.g. "1") stamped on a non-trading day that the sync can never
+        // overwrite, since providers only return quotes for trading days (#1143).
+        if rate.source == DATA_SOURCE_MANUAL {
+            self.repository.save_exchange_rate(rate).await
+        } else {
+            Ok(rate)
+        }
     }
 
     fn get_historical_rates(&self, from: &str, to: &str, days: i64) -> Result<Vec<ExchangeRate>> {
@@ -438,6 +447,7 @@ impl FxServiceTrait for FxService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fx::fx_model::ExchangeRateDateQuery;
     use crate::quotes::Quote;
     use chrono::NaiveDateTime;
     use rust_decimal::Decimal;
@@ -446,6 +456,8 @@ mod tests {
     #[derive(Default)]
     struct MockFxRepository {
         created_pairs: Mutex<Vec<(String, String, String)>>,
+        saved_rates: Mutex<Vec<ExchangeRate>>,
+        historical_rates: Mutex<Vec<ExchangeRate>>,
     }
 
     #[async_trait]
@@ -455,7 +467,7 @@ mod tests {
         }
 
         fn get_historical_exchange_rates(&self) -> Result<Vec<ExchangeRate>> {
-            Ok(vec![])
+            Ok(self.historical_rates.lock().unwrap().clone())
         }
 
         fn get_latest_exchange_rate(&self, _from: &str, _to: &str) -> Result<Option<ExchangeRate>> {
@@ -489,6 +501,7 @@ mod tests {
         }
 
         async fn save_exchange_rate(&self, rate: ExchangeRate) -> Result<ExchangeRate> {
+            self.saved_rates.lock().unwrap().push(rate.clone());
             Ok(rate)
         }
 
@@ -555,5 +568,160 @@ mod tests {
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].0, "USD");
         assert_eq!(created[0].1, "CAD");
+    }
+
+    #[tokio::test]
+    async fn add_exchange_rate_manual_persists_quote() {
+        let repo = Arc::new(MockFxRepository::default());
+        let service = FxService::new(repo.clone());
+
+        service
+            .add_exchange_rate(NewExchangeRate {
+                from_currency: "EUR".to_string(),
+                to_currency: "USD".to_string(),
+                rate: Decimal::new(11, 1), // 1.1
+                source: DATA_SOURCE_MANUAL.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let saved = repo.saved_rates.lock().unwrap();
+        assert_eq!(saved.len(), 1, "manual rate should be persisted as a quote");
+        assert_eq!(saved[0].rate, Decimal::new(11, 1));
+    }
+
+    #[tokio::test]
+    async fn add_exchange_rate_provider_does_not_persist_placeholder_quote() {
+        let repo = Arc::new(MockFxRepository::default());
+        let service = FxService::new(repo.clone());
+
+        // Provider-backed add with the frontend placeholder rate. The real rate
+        // is fetched by the market-data sync, so no quote should be stored (#1143).
+        service
+            .add_exchange_rate(NewExchangeRate {
+                from_currency: "EUR".to_string(),
+                to_currency: "USD".to_string(),
+                rate: Decimal::ONE,
+                source: DATA_SOURCE_YAHOO.to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            repo.saved_rates.lock().unwrap().is_empty(),
+            "provider-backed add must not persist a placeholder quote"
+        );
+        assert_eq!(
+            repo.created_pairs.lock().unwrap().len(),
+            1,
+            "provider-backed add should still register the FX asset for syncing"
+        );
+    }
+
+    fn make_historical_rate(from: &str, to: &str, rate: Decimal, date: NaiveDate) -> ExchangeRate {
+        ExchangeRate {
+            id: format!("FX:{}/{}", from, to),
+            from_currency: from.to_string(),
+            to_currency: to.to_string(),
+            rate,
+            source: DATA_SOURCE_MANUAL.to_string(),
+            timestamp: date.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+        }
+    }
+
+    #[test]
+    fn get_exchange_rate_for_date_returns_exact_match() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+        let repo = Arc::new(MockFxRepository::default());
+        repo.historical_rates
+            .lock()
+            .unwrap()
+            .push(make_historical_rate(
+                "USD",
+                "EUR",
+                Decimal::new(90, 2),
+                date,
+            ));
+        let service = FxService::new(repo);
+        service.initialize().unwrap();
+
+        let rate = service
+            .get_exchange_rate_for_date("USD", "EUR", date)
+            .unwrap();
+        assert_eq!(rate, Decimal::new(90, 2));
+    }
+
+    #[test]
+    fn get_exchange_rate_for_date_falls_back_to_nearest_when_no_exact_match() {
+        // Only a rate on 2026-05-10 exists; a lookup for 2026-05-18 (no quote,
+        // e.g. a weekend/holiday) should fall back to the nearest available
+        // rate rather than erroring — this is what unblocks addons resolving
+        // a rate for an arbitrary transaction date.
+        let quoted_date = NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        let requested_date = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+        let repo = Arc::new(MockFxRepository::default());
+        repo.historical_rates
+            .lock()
+            .unwrap()
+            .push(make_historical_rate(
+                "USD",
+                "EUR",
+                Decimal::new(90, 2),
+                quoted_date,
+            ));
+        let service = FxService::new(repo);
+        service.initialize().unwrap();
+
+        let rate = service
+            .get_exchange_rate_for_date("USD", "EUR", requested_date)
+            .unwrap();
+        assert_eq!(rate, Decimal::new(90, 2));
+    }
+
+    #[test]
+    fn get_exchange_rate_for_date_errors_when_pair_has_no_history() {
+        let repo = Arc::new(MockFxRepository::default());
+        let service = FxService::new(repo);
+        service.initialize().unwrap();
+
+        let date = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+        let result = service.get_exchange_rate_for_date("USD", "JPY", date);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_exchange_rates_for_dates_isolates_errors_per_pair() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+        let repo = Arc::new(MockFxRepository::default());
+        repo.historical_rates
+            .lock()
+            .unwrap()
+            .push(make_historical_rate(
+                "USD",
+                "EUR",
+                Decimal::new(90, 2),
+                date,
+            ));
+        let service = FxService::new(repo);
+        service.initialize().unwrap();
+
+        let results = service.get_exchange_rates_for_dates(vec![
+            ExchangeRateDateQuery {
+                from_currency: "USD".to_string(),
+                to_currency: "EUR".to_string(),
+                date,
+            },
+            ExchangeRateDateQuery {
+                from_currency: "USD".to_string(),
+                to_currency: "JPY".to_string(),
+                date,
+            },
+        ]);
+
+        assert_eq!(results.len(), 2, "one bad pair must not drop the batch");
+        assert_eq!(results[0].rate, Some(Decimal::new(90, 2)));
+        assert!(results[0].error.is_none());
+        assert!(results[1].rate.is_none());
+        assert!(results[1].error.is_some());
     }
 }

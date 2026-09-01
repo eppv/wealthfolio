@@ -1,6 +1,7 @@
 import { useNetWorth, useNetWorthHistory } from "@/hooks/use-alternative-assets";
 import { usePortfolioAllocations } from "@/hooks/use-portfolio-allocations";
 import { useIsMobileViewport } from "@/hooks/use-platform";
+import { getNetWorthCategoryLabel } from "@/lib/net-worth-category-label";
 import { useSettingsContext } from "@/lib/settings-provider";
 import type { DateRange } from "@/lib/types";
 import { formatDateISO } from "@/lib/utils";
@@ -12,6 +13,7 @@ import {
   GainPercent,
   IntervalSelector,
   getInitialIntervalData,
+  useNumberFormatting,
   usePersistentState,
   type TimePeriod,
 } from "@wealthfolio/ui";
@@ -24,6 +26,7 @@ import {
   TooltipTrigger,
 } from "@wealthfolio/ui/components/ui/tooltip";
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import { BreakdownTable } from "./components/breakdown-table";
 import { CategoryDetailSheet } from "./components/category-detail-sheet";
@@ -34,8 +37,12 @@ import {
   averageMonthlyChange,
   computeMomentum,
   computeVelocity,
+  deriveChange,
+  formatChangePercent,
   investmentAllocation,
+  isPlainPercent,
   parseHistory,
+  toneClass,
   type ParsedNetWorth,
   type SelectedCategory,
 } from "./components/utils";
@@ -47,6 +54,8 @@ const INTERVAL_STORAGE_KEY = "networth-interval";
 const MS_PER_DAY = 86_400_000;
 
 export function NetWorthContent() {
+  const { t } = useTranslation();
+  const formatting = useNumberFormatting();
   const { settings } = useSettingsContext();
   const { data: netWorthData, isLoading, isError, error } = useNetWorth();
   const isMobile = useIsMobileViewport();
@@ -55,9 +64,6 @@ export function NetWorthContent() {
 
   const [dateRange, setDateRange] = useState<DateRange | undefined>(
     () => getInitialIntervalData(intervalCode).range,
-  );
-  const [selectedIntervalDescription, setSelectedIntervalDescription] = useState<string>(
-    () => getInitialIntervalData(intervalCode).description,
   );
   const [periodCode, setPeriodCode] = useState<TimePeriod>(intervalCode);
 
@@ -96,10 +102,9 @@ export function NetWorthContent() {
 
   const handleIntervalSelect = (
     code: TimePeriod,
-    description: string,
+    _description: string,
     range: DateRange | undefined,
   ) => {
-    setSelectedIntervalDescription(description);
     setPeriodCode(code);
     setDateRange(range);
   };
@@ -112,7 +117,7 @@ export function NetWorthContent() {
         total: parseFloat(netWorthData.assets.total) || 0,
         breakdown: (netWorthData.assets.breakdown || []).map((item) => ({
           category: item.category,
-          name: item.name,
+          name: getNetWorthCategoryLabel(t, item.category, item.name),
           value: parseFloat(item.value) || 0,
           assetId: item.assetId,
           children: (item.children ?? []).map((child) => ({
@@ -133,7 +138,7 @@ export function NetWorthContent() {
         })),
       },
     };
-  }, [netWorthData]);
+  }, [netWorthData, t]);
 
   const parsedHistory = useMemo(() => parseHistory(historyData), [historyData]);
   const longHistory = useMemo(() => parseHistory(longHistoryData), [longHistoryData]);
@@ -149,19 +154,21 @@ export function NetWorthContent() {
     return computeMomentum(longHistory, historyDates.startDate, historyDates.endDate);
   }, [longHistory, historyDates, periodCode]);
 
-  // Net worth change over the selected range (simple delta).
-  const { gainLossAmount, gainLossPercent } = useMemo(() => {
-    if (parsedHistory.length < 2) return { gainLossAmount: 0, gainLossPercent: 0 };
-    const first = parsedHistory[0].netWorth;
-    const last = parsedHistory[parsedHistory.length - 1].netWorth;
-    const change = last - first;
-    const base = first !== 0 ? Math.abs(first) : 1;
-    return { gainLossAmount: change, gainLossPercent: change / base };
-  }, [parsedHistory]);
+  // Net worth change over the selected range, on the same baseline rules as the
+  // breakdown rows so the header and the table agree.
+  const netWorthChange = useMemo(
+    () =>
+      deriveChange(
+        parsedHistory.map((point) => point.netWorth),
+        false,
+      ),
+    [parsedHistory],
+  );
 
   const currency = netWorthData?.currency || settings?.baseCurrency || "USD";
   const hasStaleValuations = netWorthData && netWorthData.staleAssets.length > 0;
   const periodLabel = periodCode;
+  const localizedPeriodLabel = t(`ui:interval.${periodCode}`);
 
   // Breakdown row → detail drawer. Investments open the existing asset-class
   // allocation sheet; every other row opens the category detail sheet.
@@ -181,7 +188,9 @@ export function NetWorthContent() {
           <div className="bg-destructive/10 mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full">
             <Icons.AlertTriangle className="text-destructive h-6 w-6" />
           </div>
-          <p className="text-destructive text-lg font-medium">Failed to load net worth</p>
+          <p className="text-destructive text-lg font-medium">
+            {t("insights:networth.failed_to_load")}
+          </p>
           <p className="text-muted-foreground mt-2 text-sm">{error?.message}</p>
         </div>
       </div>
@@ -212,7 +221,9 @@ export function NetWorthContent() {
                       </div>
                     </TooltipTrigger>
                     <TooltipContent side="bottom" className="max-w-[280px]">
-                      <p className="mb-2 text-xs font-medium">Stale valuations (90+ days):</p>
+                      <p className="mb-2 text-xs font-medium">
+                        {t("insights:networth.stale_valuations_tooltip")}
+                      </p>
                       <ul className="space-y-1 text-xs">
                         {netWorthData?.staleAssets.map((asset) => (
                           <li
@@ -221,7 +232,7 @@ export function NetWorthContent() {
                           >
                             <span className="truncate">{asset.name ?? asset.assetId}</span>
                             <span className="text-muted-foreground shrink-0">
-                              {asset.daysStale}d ago
+                              {t("insights:networth.days_ago", { count: asset.daysStale })}
                             </span>
                           </li>
                         ))}
@@ -242,21 +253,33 @@ export function NetWorthContent() {
                 <>
                   <GainAmount
                     className="lg:text-md text-sm font-light"
-                    value={gainLossAmount}
+                    value={netWorthChange.amount}
                     currency={currency}
                     displayCurrency={false}
                   />
                   <div className="border-secondary my-1 border-r pr-2" />
-                  <GainPercent
-                    className="lg:text-md text-sm font-light"
-                    value={gainLossPercent}
-                    animated={true}
-                  />
+                  {isPlainPercent(netWorthChange.percent) ? (
+                    <GainPercent
+                      className="lg:text-md text-sm font-light"
+                      value={netWorthChange.percent}
+                      animated={true}
+                    />
+                  ) : (
+                    <span
+                      className={`lg:text-md text-sm font-light ${toneClass(netWorthChange.amount)}`}
+                    >
+                      {formatChangePercent(
+                        netWorthChange,
+                        t("insights:networth.breakdown_table.new"),
+                        formatting,
+                      )}
+                    </span>
+                  )}
                 </>
               )}
-              {selectedIntervalDescription && (
+              {periodCode && (
                 <span className="lg:text-md text-muted-foreground ml-1 text-sm font-light">
-                  {selectedIntervalDescription}
+                  {t(`ui:interval.${periodCode}`)}
                 </span>
               )}
             </div>
@@ -285,7 +308,9 @@ export function NetWorthContent() {
           ) : (
             <div className="flex h-full flex-col items-center justify-center">
               <Icons.TrendingUp className="text-muted-foreground/30 mb-3 h-12 w-12" />
-              <p className="text-muted-foreground text-sm">No history data available</p>
+              <p className="text-muted-foreground text-sm">
+                {t("insights:networth.no_history_data")}
+              </p>
             </div>
           )}
           {historyData && historyData.length > 0 && (
@@ -307,7 +332,7 @@ export function NetWorthContent() {
             {/* Left column: Breakdown */}
             <div className="lg:col-span-2">
               {isLoading || isHistoryLoading ? (
-                <DashboardCard title="Breakdown">
+                <DashboardCard title={t("insights:networth.breakdown")}>
                   <div className="space-y-4">
                     {Array.from({ length: 5 }).map((_, i) => (
                       <div key={i} className="flex items-center justify-between">
@@ -330,12 +355,12 @@ export function NetWorthContent() {
                   className="rounded-xl border border-orange-200/50 p-6 text-center md:p-8 dark:border-orange-800/50"
                   style={{ backgroundColor: THEME_COLOR_LIGHT }}
                 >
-                  <p className="text-sm">No assets found.</p>
+                  <p className="text-sm">{t("insights:networth.no_assets_found")}</p>
                   <Link
                     to="/holdings"
                     className="text-muted-foreground hover:text-foreground mt-2 inline-flex items-center gap-1 text-xs underline-offset-4 hover:underline"
                   >
-                    Add your first asset
+                    {t("insights:networth.add_first_asset")}
                     <Icons.ChevronRight className="h-3 w-3" />
                   </Link>
                 </div>
@@ -349,7 +374,7 @@ export function NetWorthContent() {
                   velocity={velocity}
                   trailingYearMonthly={trailingYearMonthly}
                   currency={currency}
-                  periodLabel={periodLabel}
+                  periodLabel={localizedPeriodLabel}
                 />
               )}
 
@@ -363,14 +388,17 @@ export function NetWorthContent() {
                   <div className="mb-2 flex items-center gap-2">
                     <Icons.AlertCircle className="text-warning h-4 w-4 shrink-0" />
                     <h3 className="text-foreground text-sm font-semibold">
-                      Update your valuations
+                      {t("insights:networth.update_valuations")}
                     </h3>
                     <span className="text-muted-foreground/70 ml-auto text-xs">
-                      {netWorthData?.staleAssets.length}{" "}
-                      {netWorthData?.staleAssets.length === 1 ? "asset" : "assets"}
+                      {t("insights:networth.assets_count", {
+                        count: netWorthData?.staleAssets.length ?? 0,
+                      })}
                     </span>
                   </div>
-                  <p className="text-muted-foreground ml-6 text-xs">Not updated in over 90 days.</p>
+                  <p className="text-muted-foreground ml-6 text-xs">
+                    {t("insights:networth.not_updated_over_90_days")}
+                  </p>
                   <div className="ml-6 mt-3 space-y-1.5">
                     {netWorthData?.staleAssets.map((asset) => (
                       <Link
@@ -382,7 +410,7 @@ export function NetWorthContent() {
                           {asset.name ?? asset.assetId}
                         </span>
                         <span className="text-muted-foreground ml-2 shrink-0 text-xs">
-                          {asset.daysStale}d ago
+                          {t("insights:networth.days_ago", { count: asset.daysStale })}
                         </span>
                       </Link>
                     ))}

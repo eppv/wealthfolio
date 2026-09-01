@@ -1,9 +1,11 @@
 import { SyncStatusIcon } from "@/features/wealthfolio-connect/components/sync-status-icon";
 import { useAggregatedSyncStatus } from "@/features/wealthfolio-connect/hooks";
+import { formatDistanceToNow } from "@/lib/utils";
+import { useLocalizationSettings } from "@wealthfolio/ui";
 import { Button } from "@wealthfolio/ui/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@wealthfolio/ui/components/ui/tooltip";
 import { cn } from "@wealthfolio/ui/lib/utils";
-import { formatDistanceToNow } from "date-fns";
+import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router-dom";
 import { isPathActive } from "./app-navigation";
 
@@ -12,13 +14,20 @@ interface ConnectNavItemProps {
 }
 
 export function ConnectNavItem({ collapsed }: ConnectNavItemProps) {
+  const localizationSettings = useLocalizationSettings();
+
+  const { t } = useTranslation();
   const location = useLocation();
   const { status, lastSyncTime } = useAggregatedSyncStatus();
   const isActive = isPathActive(location.pathname, "/connect");
 
   const tooltipContent = lastSyncTime
-    ? `Connect - Last synced ${formatDistanceToNow(new Date(lastSyncTime), { addSuffix: true })}`
-    : "Connect";
+    ? t("common:layout.connect_last_synced", {
+        time: formatDistanceToNow(new Date(lastSyncTime), localizationSettings, {
+          addSuffix: true,
+        }),
+      })
+    : t("common:connect");
 
   return (
     <Tooltip>
@@ -31,7 +40,11 @@ export function ConnectNavItem({ collapsed }: ConnectNavItemProps) {
             collapsed ? "justify-center" : "justify-start",
           )}
         >
-          <Link to="/connect" title="Connect" aria-current={isActive ? "page" : undefined}>
+          <Link
+            to="/connect"
+            title={t("common:connect")}
+            aria-current={isActive ? "page" : undefined}
+          >
             <span aria-hidden="true">
               <SyncStatusIcon status={status} className="size-5" />
             </span>
@@ -43,7 +56,7 @@ export function ConnectNavItem({ collapsed }: ConnectNavItemProps) {
                 "block opacity-100": !collapsed,
               })}
             >
-              Connect
+              {t("common:connect")}
             </span>
           </Link>
         </Button>

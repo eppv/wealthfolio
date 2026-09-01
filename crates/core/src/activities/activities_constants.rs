@@ -62,12 +62,10 @@ pub const INCOME_ACTIVITY_TYPES: [&str; 2] = [ACTIVITY_TYPE_DIVIDEND, ACTIVITY_T
 
 /// Activity types where `unit_price` represents the asset's per-unit market
 /// price and can be used as a fallback quote. Income activities (DIVIDEND,
-/// INTEREST) store payment amounts, not asset prices.
-pub const PRICE_BEARING_ACTIVITY_TYPES: [&str; 3] = [
-    ACTIVITY_TYPE_BUY,
-    ACTIVITY_TYPE_SELL,
-    ACTIVITY_TYPE_TRANSFER_IN,
-];
+/// INTEREST) store payment amounts, not asset prices. Securities transfers
+/// store book cost basis in `unit_price`; valuation derives transfer market
+/// value from quotes instead.
+pub const PRICE_BEARING_ACTIVITY_TYPES: [&str; 2] = [ACTIVITY_TYPE_BUY, ACTIVITY_TYPE_SELL];
 
 /// Activity types that always require a symbol/asset.
 /// Everything else: symbol is optional (cash-only or dual-use like TRANSFER_IN).
@@ -251,9 +249,83 @@ pub const ACTIVITY_SUBTYPE_REBATE: &str = "REBATE";
 /// Examples: erroneous fee refund, service credit.
 pub const ACTIVITY_SUBTYPE_REFUND: &str = "REFUND";
 
+/// Reimbursement: External cash credit that offsets an expense category.
+/// Used by spending/budgeting to reduce actuals without treating the money as income.
+/// Examples: friend reimburses dinner, employer pays back a travel expense.
+pub const ACTIVITY_SUBTYPE_REIMBURSEMENT: &str = "REIMBURSEMENT";
+
 /// Option expiry: option contract expired worthless.
 /// Removes lots via FIFO with no cash effect.
 pub const ACTIVITY_SUBTYPE_OPTION_EXPIRY: &str = "OPTION_EXPIRY";
+
+/// Position-opening trade intent.
+/// Examples: buy-to-open for long options, sell-to-open for short options.
+pub const ACTIVITY_SUBTYPE_POSITION_OPEN: &str = "POSITION_OPEN";
+
+/// Position-closing trade intent.
+/// Examples: sell-to-close for long options, buy-to-close for short options.
+pub const ACTIVITY_SUBTYPE_POSITION_CLOSE: &str = "POSITION_CLOSE";
+
+/// A TRANSFER_IN/TRANSFER_OUT that moves a security rather than cash. The one
+/// definition: `ActivityEconomicsResolver::is_security_transfer` and the
+/// activity writer boundary both delegate here, so the rule cannot drift.
+pub fn is_securities_transfer(activity_type: &str, resolved_asset_id: Option<&str>) -> bool {
+    if activity_type != ACTIVITY_TYPE_TRANSFER_IN && activity_type != ACTIVITY_TYPE_TRANSFER_OUT {
+        return false;
+    }
+    resolved_asset_id
+        .map(str::trim)
+        .is_some_and(|id| !id.is_empty() && !is_cash_symbol(id))
+}
+
+/// The final-cash contract's population: activity types whose `amount` is the
+/// money that moved, and which therefore book zero cash when it is absent.
+/// SPLIT and ADJUSTMENT carry no directed cash; a security transfer is
+/// lot-only (its cash effect is the fee) and so is exempt too.
+///
+/// The single source of truth for "needs a final cash amount" — the activity
+/// writer boundary, the legacy-cash migration, and the storage floor all call
+/// this, so a new cash-bearing type cannot be added to one and missed by the
+/// others.
+pub fn requires_final_cash_amount(activity_type: &str, is_security_transfer: bool) -> bool {
+    !is_security_transfer
+        && matches!(
+            activity_type,
+            ACTIVITY_TYPE_BUY
+                | ACTIVITY_TYPE_SELL
+                | ACTIVITY_TYPE_DEPOSIT
+                | ACTIVITY_TYPE_WITHDRAWAL
+                | ACTIVITY_TYPE_DIVIDEND
+                | ACTIVITY_TYPE_INTEREST
+                | ACTIVITY_TYPE_CREDIT
+                | ACTIVITY_TYPE_FEE
+                | ACTIVITY_TYPE_TAX
+                | ACTIVITY_TYPE_TRANSFER_IN
+                | ACTIVITY_TYPE_TRANSFER_OUT
+        )
+}
+
+/// Storage-floor backstop for the final-cash contract: a POSTED, cash-bearing
+/// activity persisted with no stored amount books zero cash silently, so such
+/// a row is only legal when it is flagged for review. The writer boundary is
+/// supposed to make this state unreachable — this floor exists so any future
+/// bypass (the CSV-import class) fails loudly at the repository instead of
+/// silently mis-booking.
+pub fn violates_final_cash_floor(
+    effective_type: &str,
+    asset_id: Option<&str>,
+    status: &str,
+    has_amount: bool,
+    needs_review: bool,
+) -> bool {
+    if status != "POSTED" || has_amount || needs_review {
+        return false;
+    }
+    requires_final_cash_amount(
+        effective_type,
+        is_securities_transfer(effective_type, asset_id),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -304,6 +376,14 @@ mod tests {
         assert!(!requires_symbol(ACTIVITY_TYPE_UNKNOWN));
         assert!(!requires_symbol("INVALID"));
         assert!(!requires_symbol(""));
+    }
+
+    #[test]
+    fn test_price_bearing_types_exclude_transfers() {
+        assert!(PRICE_BEARING_ACTIVITY_TYPES.contains(&ACTIVITY_TYPE_BUY));
+        assert!(PRICE_BEARING_ACTIVITY_TYPES.contains(&ACTIVITY_TYPE_SELL));
+        assert!(!PRICE_BEARING_ACTIVITY_TYPES.contains(&ACTIVITY_TYPE_TRANSFER_IN));
+        assert!(!PRICE_BEARING_ACTIVITY_TYPES.contains(&ACTIVITY_TYPE_TRANSFER_OUT));
     }
 
     // ── is_cash_symbol ──────────────────────────────────────────────────

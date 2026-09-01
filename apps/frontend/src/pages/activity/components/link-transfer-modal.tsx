@@ -1,3 +1,7 @@
+import { ActivityType } from "@/lib/constants";
+import type { ActivityDetails } from "@/lib/types";
+import { formatDateTime } from "@/lib/utils";
+import { Button, Icons, useAmountFormatting, useDateFormatting } from "@wealthfolio/ui";
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -7,10 +11,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@wealthfolio/ui/components/ui/alert-dialog";
-import { Button, formatAmount, Icons } from "@wealthfolio/ui";
-import { ActivityType } from "@/lib/constants";
-import type { ActivityDetails } from "@/lib/types";
-import { formatDateTime } from "@/lib/utils";
+import { useTranslation } from "react-i18next";
+import { nonCashTransferAssetKey } from "./transfer-link-utils";
 
 interface LinkTransferModalProps {
   isOpen: boolean;
@@ -24,14 +26,20 @@ interface LinkTransferModalProps {
 }
 
 function ActivityRow({ activity, label }: { activity: ActivityDetails; label: string }) {
-  const date = formatDateTime(activity.date).date;
-  const value = activity.amount ?? activity.unitPrice;
+  const dateFormatting = useDateFormatting();
+  const formatting = useAmountFormatting();
+  const { t } = useTranslation();
+  const date = formatDateTime(activity.date, dateFormatting).date;
+  const value =
+    activity.amount ?? (nonCashTransferAssetKey(activity) ? activity.unitPrice : undefined);
   return (
     <div className="bg-muted/30 flex flex-col gap-1 rounded-md border px-3 py-2 text-sm">
       <div className="text-muted-foreground flex items-center justify-between text-xs uppercase">
         <span>{label}</span>
         <span>
-          {activity.activityType === ActivityType.TRANSFER_IN ? "Transfer In" : "Transfer Out"}
+          {activity.activityType === ActivityType.TRANSFER_IN
+            ? t("activity:type_transfer_in")
+            : t("activity:type_transfer_out")}
         </span>
       </div>
       <div className="flex items-center justify-between">
@@ -39,9 +47,11 @@ function ActivityRow({ activity, label }: { activity: ActivityDetails; label: st
         <span>{date}</span>
       </div>
       <div className="text-muted-foreground flex items-center justify-between text-xs">
-        <span>{activity.assetSymbol || "Cash"}</span>
+        <span>{activity.assetSymbol || t("activity:date_list.cash")}</span>
         <span>
-          {value != null ? formatAmount(Number(value), activity.currency) : activity.currency}
+          {value != null
+            ? formatting.formatAmount(Number(value), activity.currency)
+            : activity.currency}
         </span>
       </div>
     </div>
@@ -58,6 +68,7 @@ export function LinkTransferModal({
   onConfirm,
   onCancel,
 }: LinkTransferModalProps) {
+  const { t } = useTranslation();
   const isUnlinkMode = mode === "unlink";
 
   return (
@@ -65,22 +76,24 @@ export function LinkTransferModal({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>
-            {isUnlinkMode ? "Unlink internal transfer" : "Link as internal transfer"}
+            {isUnlinkMode
+              ? t("activity:link_transfer.unlink_title")
+              : t("activity:link_transfer.link_title")}
           </AlertDialogTitle>
           <AlertDialogDescription>
             {isUnlinkMode
-              ? "These two activities will become external transfers again."
-              : "These two activities will be paired and treated as a single internal transfer between your accounts."}
+              ? t("activity:link_transfer.unlink_desc")
+              : t("activity:link_transfer.link_desc")}
           </AlertDialogDescription>
         </AlertDialogHeader>
 
         {activityIn && activityOut ? (
           <div className="flex flex-col gap-2">
-            <ActivityRow activity={activityOut} label="Source" />
+            <ActivityRow activity={activityOut} label={t("activity:link_transfer.source")} />
             <div className="flex justify-center">
               <Icons.ArrowDown className="text-muted-foreground h-4 w-4" />
             </div>
-            <ActivityRow activity={activityIn} label="Destination" />
+            <ActivityRow activity={activityIn} label={t("activity:link_transfer.destination")} />
           </div>
         ) : null}
 
@@ -96,7 +109,7 @@ export function LinkTransferModal({
         ) : null}
 
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={isProcessing}>Cancel</AlertDialogCancel>
+          <AlertDialogCancel disabled={isProcessing}>{t("common:cancel")}</AlertDialogCancel>
           <Button onClick={onConfirm} disabled={isProcessing}>
             {isProcessing ? (
               <Icons.Spinner className="mr-2 h-4 w-4 animate-spin" />
@@ -105,7 +118,11 @@ export function LinkTransferModal({
             ) : (
               <Icons.Link className="mr-2 h-4 w-4" />
             )}
-            <span>{isUnlinkMode ? "Unlink transfers" : "Link transfers"}</span>
+            <span>
+              {isUnlinkMode
+                ? t("activity:link_transfer.unlink_button")
+                : t("activity:link_transfer.link_button")}
+            </span>
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>

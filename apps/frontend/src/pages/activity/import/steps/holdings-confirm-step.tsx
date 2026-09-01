@@ -6,14 +6,24 @@ import { Alert, AlertDescription, AlertTitle } from "@wealthfolio/ui/components/
 
 import { useMemo, useCallback, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 
-import { createAsset, importHoldingsCsv, saveAccountImportMapping, logger } from "@/adapters";
+import {
+  checkHoldingsImport,
+  createAsset,
+  importHoldingsCsv,
+  saveAccountImportMapping,
+  logger,
+} from "@/adapters";
 import { useImportContext } from "../context";
 import { setImportResult, nextStep } from "../context/import-actions";
 import { buildNewAssetFromDraft } from "../utils/asset-review-utils";
 import {
+  analyzeDateColumn,
   buildHoldingsRowResolutionMap,
+  parseDateToYMD,
   parseHoldingsSnapshots,
+  parseHoldingsSnapshotsForValidation,
 } from "../utils/holdings-import-utils";
 import { HoldingsFormat } from "./holdings-mapping-step";
 import type { HoldingsSnapshotInput, ImportHoldingsCsvResult } from "@/lib/types";
@@ -25,6 +35,7 @@ interface PersistedSymbolResolution {
   quoteCcy?: string;
   instrumentType?: string;
   symbolName?: string;
+  quoteMode?: "MARKET" | "MANUAL";
   providerId?: string;
   providerSymbol?: string;
 }
@@ -39,6 +50,7 @@ function isSamePersistedResolution(
     (left.quoteCcy ?? "") === (right.quoteCcy ?? "") &&
     (left.instrumentType ?? "") === (right.instrumentType ?? "") &&
     (left.symbolName ?? "") === (right.symbolName ?? "") &&
+    (left.quoteMode ?? "") === (right.quoteMode ?? "") &&
     (left.providerId ?? "") === (right.providerId ?? "") &&
     (left.providerSymbol ?? "") === (right.providerSymbol ?? "")
   );
@@ -61,6 +73,7 @@ export function HoldingsConfirmStep() {
     assetPreviewItems,
   } = state;
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const [prepareError, setPrepareError] = useState<string | null>(null);
   const [isPreparingAssets, setIsPreparingAssets] = useState(false);
 
@@ -90,6 +103,7 @@ export function HoldingsConfirmStep() {
         quoteCcy?: string;
         instrumentType?: string;
         symbolName?: string;
+        quoteMode?: "MARKET" | "MANUAL";
         providerId?: string;
         providerSymbol?: string;
       }
@@ -107,6 +121,10 @@ export function HoldingsConfirmStep() {
           quoteCcy: draft.quoteCcy,
           instrumentType: draft.instrumentType,
           symbolName: draft.symbolName,
+          quoteMode:
+            draft.quoteMode === "MARKET" || draft.quoteMode === "MANUAL"
+              ? draft.quoteMode
+              : undefined,
           providerId: draft.providerId,
           providerSymbol: draft.providerSymbol,
         };
@@ -137,6 +155,7 @@ export function HoldingsConfirmStep() {
         resolution.quoteCcy ||
         resolution.instrumentType ||
         resolution.symbolName ||
+        resolution.quoteMode ||
         resolution.providerId ||
         resolution.providerSymbol
       ) {
@@ -145,6 +164,7 @@ export function HoldingsConfirmStep() {
           quoteCcy: resolution.quoteCcy,
           instrumentType: resolution.instrumentType,
           symbolName: resolution.symbolName,
+          quoteMode: resolution.quoteMode,
           providerId: resolution.providerId,
           providerSymbol: resolution.providerSymbol,
         };
@@ -168,6 +188,24 @@ export function HoldingsConfirmStep() {
       const rowResolutions = buildHoldingsRowResolutionMap(draftActivities, createdAssetIdsByKey);
 
       return parseHoldingsSnapshots(
+        headers,
+        parsedRows,
+        fieldMappings,
+        parseOptions,
+        enrichedMapping?.symbolMappings,
+        enrichedMapping?.symbolMappingMeta,
+        rowResolutions,
+      );
+    },
+    [draftActivities, enrichedMapping, headers, parseOptions, parsedRows],
+  );
+
+  const buildValidationSnapshots = useCallback(
+    (createdAssetIdsByKey: Record<string, string> = {}) => {
+      const fieldMappings = (enrichedMapping?.fieldMappings || {}) as Record<string, string>;
+      const rowResolutions = buildHoldingsRowResolutionMap(draftActivities, createdAssetIdsByKey);
+
+      return parseHoldingsSnapshotsForValidation(
         headers,
         parsedRows,
         fieldMappings,
@@ -283,13 +321,47 @@ export function HoldingsConfirmStep() {
 
       const createdAssetIdsByKey: Record<string, string> = {};
       try {
+        const validation = await checkHoldingsImport(accountId, buildValidationSnapshots());
+        if (validation.validSnapshotDates.length === 0) {
+          throw new Error(validation.validationErrors.join(" "));
+        }
+        const validSnapshotDates = new Set(validation.validSnapshotDates);
+        const fieldMappings = (enrichedMapping?.fieldMappings || {}) as Record<string, string>;
+        const dateHeader = fieldMappings[HoldingsFormat.DATE];
+        const dateIndex = dateHeader ? headers.indexOf(dateHeader) : -1;
+        // Same day/month order the snapshots were parsed with, or these dates
+        // will not match the snapshot keys they are being checked against.
+        const { order: dateOrder } = analyzeDateColumn(
+          headers,
+          parsedRows,
+          fieldMappings,
+          parseOptions.dateFormat,
+        );
+        const belongsToValidSnapshot = (rowIndex: number) => {
+          if (dateIndex < 0 || rowIndex < 0) return false;
+          const rawDate = parsedRows[rowIndex]?.[dateIndex] ?? "";
+          const snapshotDate = parseDateToYMD(rawDate, parseOptions.dateFormat, dateOrder);
+          return snapshotDate !== null && validSnapshotDates.has(snapshotDate);
+        };
+        const validAssetKeys = new Set(
+          draftActivities
+            .filter((draft) => belongsToValidSnapshot(draft.rowIndex))
+            .flatMap((draft) =>
+              [draft.importAssetKey, draft.assetCandidateKey].filter((key): key is string =>
+                Boolean(key),
+              ),
+            ),
+        );
+
         const pendingAssets = new Map<string, ReturnType<typeof buildNewAssetFromDraft>>();
 
         for (const pending of Object.values(pendingImportAssets)) {
+          if (!validAssetKeys.has(pending.key)) continue;
           pendingAssets.set(pending.key, pending.draft);
         }
 
         for (const draft of draftActivities) {
+          if (!belongsToValidSnapshot(draft.rowIndex)) continue;
           if (draft.assetId) continue;
 
           const key = draft.importAssetKey || draft.assetCandidateKey;
@@ -308,19 +380,33 @@ export function HoldingsConfirmStep() {
           createdAssetIdsByKey[key] = created.id;
         }
 
-        const snapshotsToImport = buildSnapshots(createdAssetIdsByKey);
+        const snapshotsToImport = buildValidationSnapshots(createdAssetIdsByKey);
         persistCreatedAssets(createdAssetIdsByKey);
         mutateImport(snapshotsToImport);
       } catch (error) {
         persistCreatedAssets(createdAssetIdsByKey);
         setPrepareError(
-          error instanceof Error ? error.message : "Failed to prepare assets for import.",
+          error instanceof Error
+            ? error.message
+            : t("activity:import.holdings.failedToPrepareAssets"),
         );
       } finally {
         setIsPreparingAssets(false);
       }
     })();
-  }, [buildSnapshots, draftActivities, mutateImport, pendingImportAssets, persistCreatedAssets]);
+  }, [
+    accountId,
+    buildValidationSnapshots,
+    draftActivities,
+    enrichedMapping,
+    headers,
+    mutateImport,
+    parseOptions.dateFormat,
+    pendingImportAssets,
+    persistCreatedAssets,
+    parsedRows,
+    t,
+  ]);
 
   const handleCancel = useCallback(() => {
     navigate(-1);
@@ -337,35 +423,44 @@ export function HoldingsConfirmStep() {
     <div className="flex flex-col gap-6">
       <Card>
         <CardHeader className="px-4 py-3">
-          <CardTitle className="text-sm font-medium">Confirm Holdings Import</CardTitle>
+          <CardTitle className="text-sm font-medium">
+            {t("activity:import.holdings.confirmTitle")}
+          </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
             <Alert>
               <Icons.AlertTriangle className="h-4 w-4" />
-              <AlertTitle>Important</AlertTitle>
+              <AlertTitle>{t("activity:import.holdings.importantTitle")}</AlertTitle>
               <AlertDescription>
-                Importing will create or update snapshots for each date in your CSV. Existing
-                snapshots for the same dates will be replaced.
+                {t("activity:import.holdings.importantDescription")}
               </AlertDescription>
             </Alert>
 
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <div className="bg-muted/30 rounded-lg p-3 text-center">
                 <div className="text-primary text-2xl font-bold">{snapshots.length}</div>
-                <div className="text-muted-foreground text-xs">Snapshots</div>
+                <div className="text-muted-foreground text-xs">
+                  {t("activity:import.holdings.snapshots")}
+                </div>
               </div>
               <div className="bg-muted/30 rounded-lg p-3 text-center">
                 <div className="text-2xl font-bold">{totalPositions}</div>
-                <div className="text-muted-foreground text-xs">Positions</div>
+                <div className="text-muted-foreground text-xs">
+                  {t("activity:import.holdings.positions")}
+                </div>
               </div>
               <div className="bg-muted/30 rounded-lg p-3 text-center">
                 <div className="text-2xl font-bold">{totalCashEntries}</div>
-                <div className="text-muted-foreground text-xs">Cash Balances</div>
+                <div className="text-muted-foreground text-xs">
+                  {t("activity:import.holdings.cashBalances")}
+                </div>
               </div>
               <div className="bg-muted/30 rounded-lg p-3 text-center">
                 <div className="text-2xl font-bold">{parsedRows.length}</div>
-                <div className="text-muted-foreground text-xs">CSV Rows</div>
+                <div className="text-muted-foreground text-xs">
+                  {t("activity:import.holdings.csvRows")}
+                </div>
               </div>
             </div>
 
@@ -373,7 +468,10 @@ export function HoldingsConfirmStep() {
               <div className="text-muted-foreground flex items-center justify-center gap-2 text-sm">
                 <Icons.Calendar className="h-4 w-4" />
                 <span>
-                  {snapshots[snapshots.length - 1].date} to {snapshots[0].date}
+                  {t("activity:import.holdings.dateRange", {
+                    from: snapshots[snapshots.length - 1].date,
+                    to: snapshots[0].date,
+                  })}
                 </span>
               </div>
             )}
@@ -384,25 +482,27 @@ export function HoldingsConfirmStep() {
       {prepareError && (
         <Alert variant="destructive">
           <Icons.AlertCircle className="h-4 w-4" />
-          <AlertTitle>Import preparation failed</AlertTitle>
+          <AlertTitle>{t("activity:import.holdings.prepareFailedTitle")}</AlertTitle>
           <AlertDescription>{prepareError}</AlertDescription>
         </Alert>
       )}
 
       <div className="flex justify-end gap-3">
         <Button variant="outline" onClick={handleCancel} disabled={isImporting}>
-          Cancel
+          {t("activity:import.holdings.cancel")}
         </Button>
         <Button onClick={handleImport} disabled={isImporting || snapshots.length === 0}>
           {isImporting ? (
             <>
               <Icons.Spinner className="mr-2 h-4 w-4 animate-spin" />
-              {isPreparingAssets ? "Preparing assets..." : "Importing..."}
+              {isPreparingAssets
+                ? t("activity:import.holdings.preparingAssets")
+                : t("activity:import.holdings.importing")}
             </>
           ) : (
             <>
               <Icons.Upload className="mr-2 h-4 w-4" />
-              Import {snapshots.length} Snapshot{snapshots.length !== 1 ? "s" : ""}
+              {t("activity:import.holdings.importSnapshots", { count: snapshots.length })}
             </>
           )}
         </Button>

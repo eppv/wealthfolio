@@ -1,5 +1,5 @@
 import type { TaxonomyAllocation } from "@/lib/types";
-import { formatPercent, PrivacyAmount } from "@wealthfolio/ui";
+import { PrivacyAmount, useNumberFormatting } from "@wealthfolio/ui";
 import { Card } from "@wealthfolio/ui/components/ui/card";
 import {
   Tooltip,
@@ -8,6 +8,7 @@ import {
   TooltipTrigger,
 } from "@wealthfolio/ui/components/ui/tooltip";
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 
 type VariantType = "security-types" | "risk-composition";
 
@@ -42,12 +43,12 @@ const RISK_COLORS: Record<string, string> = {
 // Fixed order for risk categories - ALWAYS in this order
 const RISK_ORDER = ["low", "medium", "high", "unknown"] as const;
 
-// Compact labels for risk
-const RISK_LABELS: Record<string, string> = {
-  low: "Low",
-  medium: "Med",
-  high: "High",
-  unknown: "-",
+// Compact label translation keys for risk
+const RISK_LABEL_KEYS: Record<string, string> = {
+  low: "holdings:risk_low",
+  medium: "holdings:risk_medium",
+  high: "holdings:risk_high",
+  unknown: "holdings:risk_none",
 };
 
 function normalizeRiskName(name: string): string {
@@ -62,6 +63,8 @@ export function CompactAllocationStrip({
   variant = "security-types",
   onSegmentClick,
 }: CompactAllocationStripProps) {
+  const formatting = useNumberFormatting();
+  const { t } = useTranslation();
   const processedCategories = useMemo(() => {
     if (!allocation?.categories?.length) return [];
 
@@ -79,7 +82,7 @@ export function CompactAllocationStrip({
         return {
           id: found?.categoryId ?? riskLevel,
           name: found?.categoryName ?? riskLevel.charAt(0).toUpperCase() + riskLevel.slice(1),
-          label: RISK_LABELS[riskLevel] ?? riskLevel,
+          label: RISK_LABEL_KEYS[riskLevel] ? t(RISK_LABEL_KEYS[riskLevel]) : riskLevel,
           value,
           percent,
           color: RISK_COLORS[riskLevel] ?? RISK_COLORS.unknown,
@@ -122,15 +125,15 @@ export function CompactAllocationStrip({
       })),
       {
         id: "other",
-        name: "Other",
-        label: "Other",
+        name: t("holdings:other"),
+        label: t("holdings:other"),
         value: otherValue,
         percent: otherPercent,
         color: THEME_COLORS[THEME_COLORS.length - 1],
         isEmpty: false,
       },
     ];
-  }, [allocation, variant]);
+  }, [allocation, variant, t]);
 
   if (isLoading) {
     return (
@@ -151,7 +154,7 @@ export function CompactAllocationStrip({
         <p className="text-muted-foreground text-sm font-medium uppercase tracking-wider">
           {title}
         </p>
-        <p className="text-muted-foreground mt-2 text-xs">No data</p>
+        <p className="text-muted-foreground mt-2 text-xs">{t("holdings:no_data")}</p>
       </Card>
     );
   }
@@ -199,7 +202,9 @@ export function CompactAllocationStrip({
                       <span className="text-muted-foreground text-[0.70rem] uppercase">
                         {category.name}
                       </span>
-                      <div className="font-medium">{formatPercent(category.percent / 100)}</div>
+                      <div className="font-medium">
+                        {formatting.formatPercent(category.percent / 100)}
+                      </div>
                       <div className="text-muted-foreground text-xs">
                         <PrivacyAmount value={category.value} currency={baseCurrency} />
                       </div>

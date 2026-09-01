@@ -1,3 +1,8 @@
+import { useNetWorth } from "@/hooks/use-alternative-assets";
+import { getNetWorthCategoryLabel } from "@/lib/net-worth-category-label";
+import { useSettingsContext } from "@/lib/settings-provider";
+import { cn, parseLocalDate } from "@/lib/utils";
+import { PrivacyAmount, useDateFormatting, type FormattingApi } from "@wealthfolio/ui";
 import { Card } from "@wealthfolio/ui/components/ui/card";
 import {
   Collapsible,
@@ -12,11 +17,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@wealthfolio/ui/components/ui/tooltip";
-import { PrivacyAmount } from "@wealthfolio/ui";
-import { useNetWorth } from "@/hooks/use-alternative-assets";
-import { useSettingsContext } from "@/lib/settings-provider";
-import { cn, parseLocalDate } from "@/lib/utils";
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 interface NetWorthWidgetProps {
   /** Optional date for as-of calculation (ISO format: YYYY-MM-DD). Defaults to today. */
@@ -49,9 +51,11 @@ function isValuationStale(dateStr: string): boolean {
 /**
  * Formats a date string to a human-readable format
  */
-function formatDate(dateStr: string): string {
-  const date = parseLocalDate(dateStr);
-  return date.toLocaleDateString(undefined, {
+function formatDate(
+  dateStr: string,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+): string {
+  return formatting.formatCalendarDate(dateStr.slice(0, 10), {
     year: "numeric",
     month: "short",
     day: "numeric",
@@ -91,21 +95,26 @@ const NetWorthWidgetSkeleton = ({ compact = false }: { compact?: boolean }) => (
 /**
  * Error state for the NetWorthWidget
  */
-const NetWorthWidgetError = ({ error, compact = false }: { error: Error; compact?: boolean }) => (
-  <Card className={cn("p-4", compact && "p-3")}>
-    <div className="flex items-start gap-3">
-      <div className="bg-destructive/10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full">
-        <Icons.AlertTriangle className="text-destructive h-4 w-4" />
+const NetWorthWidgetError = ({ error, compact = false }: { error: Error; compact?: boolean }) => {
+  const { t } = useTranslation();
+  return (
+    <Card className={cn("p-4", compact && "p-3")}>
+      <div className="flex items-start gap-3">
+        <div className="bg-destructive/10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full">
+          <Icons.AlertTriangle className="text-destructive h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-destructive text-sm font-medium">
+            {t("holdings:failed_to_load_net_worth")}
+          </p>
+          <p className="text-muted-foreground mt-1 break-words text-xs">
+            {error?.message || t("holdings:unexpected_error")}
+          </p>
+        </div>
       </div>
-      <div className="min-w-0 flex-1">
-        <p className="text-destructive text-sm font-medium">Failed to load net worth</p>
-        <p className="text-muted-foreground mt-1 break-words text-xs">
-          {error?.message || "An unexpected error occurred"}
-        </p>
-      </div>
-    </div>
-  </Card>
-);
+    </Card>
+  );
+};
 
 /**
  * A breakdown row item showing label and value
@@ -153,6 +162,8 @@ export const NetWorthWidget = ({
   compact = false,
   className,
 }: NetWorthWidgetProps) => {
+  const formatting = useDateFormatting();
+  const { t } = useTranslation();
   const { settings } = useSettingsContext();
   const { data: netWorthData, isLoading, isError, error } = useNetWorth({ date });
 
@@ -167,7 +178,7 @@ export const NetWorthWidget = ({
       totalAssets: parseFloat(netWorthData.assets.total) || 0,
       totalLiabilities: parseFloat(netWorthData.liabilities.total) || 0,
       assetsBreakdown: netWorthData.assets.breakdown.map((item) => ({
-        label: item.name,
+        label: getNetWorthCategoryLabel(t, item.category, item.name),
         value: parseFloat(item.value) || 0,
       })),
       liabilitiesBreakdown: netWorthData.liabilities.breakdown.map((item) => ({
@@ -176,7 +187,7 @@ export const NetWorthWidget = ({
         isDebt: true,
       })),
     };
-  }, [netWorthData]);
+  }, [netWorthData, t]);
 
   // Build breakdown items for display
   const breakdownItems = useMemo((): BreakdownItem[] => {
@@ -225,7 +236,7 @@ export const NetWorthWidget = ({
               compact ? "text-[10px]" : "text-xs",
             )}
           >
-            Net Worth
+            {t("holdings:net_worth")}
           </span>
 
           {hasStaleValuations && (
@@ -238,16 +249,21 @@ export const NetWorthWidget = ({
                 </TooltipTrigger>
                 <TooltipContent side="left" className="max-w-[250px]">
                   <p className="text-sm">
-                    Some valuations are older than 90 days.
+                    {t("holdings:stale_valuations_warning")}
                     {netWorthData?.oldestValuationDate && (
-                      <> Last update: {formatDate(netWorthData.oldestValuationDate)}</>
+                      <>
+                        {" "}
+                        {t("holdings:last_update", {
+                          date: formatDate(netWorthData.oldestValuationDate, formatting),
+                        })}
+                      </>
                     )}
                   </p>
                   {netWorthData && netWorthData.staleAssets.length > 0 && (
                     <p className="text-muted-foreground mt-1 text-xs">
-                      {netWorthData.staleAssets.length} asset
-                      {netWorthData.staleAssets.length > 1 ? "s" : ""} need
-                      {netWorthData.staleAssets.length === 1 ? "s" : ""} updated valuations
+                      {t("holdings:assets_need_valuations", {
+                        count: netWorthData.staleAssets.length,
+                      })}
                     </p>
                   )}
                 </TooltipContent>
@@ -275,7 +291,7 @@ export const NetWorthWidget = ({
                 compact ? "text-[9px]" : "text-[10px]",
               )}
             >
-              Assets
+              {t("holdings:summary_assets")}
             </span>
             <span className={cn("text-success font-medium", compact ? "text-sm" : "text-base")}>
               <PrivacyAmount value={parsedValues.totalAssets} currency={currency} />
@@ -289,7 +305,7 @@ export const NetWorthWidget = ({
                 compact ? "text-[9px]" : "text-[10px]",
               )}
             >
-              Debts
+              {t("holdings:summary_debts")}
             </span>
             <span className={cn("text-destructive font-medium", compact ? "text-sm" : "text-base")}>
               <PrivacyAmount value={parsedValues.totalLiabilities} currency={currency} />
@@ -311,7 +327,7 @@ export const NetWorthWidget = ({
                     compact ? "text-xs" : "text-sm",
                   )}
                 >
-                  Category Breakdown
+                  {t("holdings:category_breakdown")}
                 </span>
                 <Icons.ChevronDown
                   className={cn(

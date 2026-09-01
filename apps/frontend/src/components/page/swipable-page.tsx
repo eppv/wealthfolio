@@ -293,7 +293,7 @@ export function SwipablePage({
           <div className="hidden h-full flex-col md:flex">
             {/* Header with Navigation and Actions */}
             <div className="flex shrink-0 items-center justify-between gap-4 px-2 pb-3 pt-4 lg:px-4">
-              <div className="flex items-center gap-3">
+              <div className="titlebar-nudge flex items-center gap-3">
                 {title && <h1 className="text-muted-foreground text-sm font-medium">{title}</h1>}
                 <NavigationPills
                   views={views}

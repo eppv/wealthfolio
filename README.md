@@ -1,21 +1,31 @@
 <div align="center">
   <a href="https://github.com/wealthfolio/wealthfolio">
-    <img src="apps/frontend/public/logo.svg" alt="Logo" width="80" height="80">
+    <img src="assets/brand/icon.png" alt="Logo" width="80" height="80">
   </a>
 
   <h3 align="center">Wealthfolio</h3>
 
   <p align="center">
-    A Beautiful Personal Finance Tracker — investments, net worth, spending, and simulations
+    The open-source, private portfolio tracker — investments, net worth, spending, and simulations.
+    <br />
+    Local-first: your data lives on your device.
     <br />
     <br />
-    <a href="https://wealthfolio.app">Website</a>
+    <a href="https://wealthfolio.app?utm_source=github&utm_medium=readme">Website</a>
     ·
     <a href="https://discord.gg/WDMCY6aPWK">Discord</a>
     ·
     <a href="https://x.com/intent/follow?screen_name=WealthfolioApp">Twitter</a>
     ·
     <a href="https://github.com/wealthfolio/wealthfolio/releases">Releases</a>
+  </p>
+
+  <p align="center">
+    <a href="https://wealthfolio.app/download?utm_source=github&utm_medium=readme&utm_campaign=cta"><strong>⬇️&nbsp;&nbsp;Download for macOS · Windows · Linux</strong></a>
+    &nbsp;·&nbsp;
+    <a href="https://apps.apple.com/us/app/wealthfolio-private-finance/id6732888445">📱&nbsp;iOS&nbsp;App</a>
+    &nbsp;·&nbsp;
+    <a href="https://wealthfolio.app/docs/guide/self-hosting/docker?utm_source=github&utm_medium=readme">🐳&nbsp;Docker</a>
   </p>
 </div>
 <div align="center">
@@ -41,11 +51,19 @@
 
 ## Introduction
 
-**Wealthfolio App** is a Beautiful Personal Finance Tracker — investments, net
-worth, spending, and simulations — with local data storage. No subscriptions, no
-cloud.
+**Wealthfolio** is an open-source, private portfolio tracker — investments, net
+worth, spending, and simulations. All your data is stored locally on your
+device: no cloud database, no account required, free forever.
 
-Visit the app website at [Wealthfolio App](https://wealthfolio.app/).
+For automatic brokerage syncing (30+ institutions, read-only) and encrypted
+multi-device sync, there's
+**[Wealthfolio Connect](https://wealthfolio.app/connect?utm_source=github&utm_medium=readme)**
+— an optional subscription that covers the real cost of the brokerage data
+connections. The app never requires it: manual tracking and CSV import are free,
+forever.
+
+Visit the website at
+[wealthfolio.app](https://wealthfolio.app/?utm_source=github&utm_medium=readme).
 
 ![Screenshot](apps/frontend/public/screenshot.webp)
 
@@ -53,16 +71,26 @@ Visit the app website at [Wealthfolio App](https://wealthfolio.app/).
 
 - **📊 Portfolio Tracking** - Track your investments across multiple accounts
   and asset types
-- **📈 Performance Analytics** - Detailed performance metrics and historical
-  analysis
+- **📈 Performance Analytics** - True time-weighted and money-weighted returns,
+  benchmark comparison, and historical analysis
 - **💰 Activity Management** - Import and manage all your trading activities
 - **🎯 Goal Planning** - Set and track financial goals with allocation
   management
 - **🔒 Local Data** - All data stored locally with no cloud dependencies
+- **🔄 Optional Broker Sync** - Auto-sync 30+ brokerages with
+  [Wealthfolio Connect](https://wealthfolio.app/connect?utm_source=github&utm_medium=readme)
+  (read-only, entirely optional)
 - **🧩 Extensible** - Powerful addon system for custom functionality
 - **🌍 Multi-Currency** - Support for multiple currencies with exchange rate
   management
-- **📱 Cross-Platform** - Available on Windows, macOS, and Linux
+- **📱 Cross-Platform** - Desktop (Windows, macOS, Linux), iOS, and self-hosted
+  Docker/web
+
+Wealthfolio 3.7 requires macOS 12 or newer and iOS/iPadOS 16 or newer. macOS 12
+installations should apply current macOS and Safari updates so the system
+WKWebView meets the Safari 16 browser floor. Windows uses the evergreen WebView2
+runtime; Linux and self-hosted installations should keep WebKitGTK or their
+browser updated.
 
 ### 🧩 Addon System
 
@@ -78,6 +106,8 @@ functionality:
 - **🗄️ Full Data Access** - Access to accounts, holdings, activities, and market
   data
 - **🔐 Secrets Management** - Secure storage for API keys and sensitive data
+- **📦 Private Assets** - Package images, fonts, media, configuration, and Wasm
+  for the isolated addon sandbox
 
 **Get started building addons:** See the
 [Addon Documentation Hub](docs/addons/index.md)
@@ -113,6 +143,8 @@ See [ROADMAP.md](./ROADMAP.md).
   documentation with examples
 - **[Architecture](docs/addons/addon-architecture.md)** - Design patterns and
   architecture guide
+- **[v3.6 to v3.7 Migration](docs/addons/addon-migration-guide-v3.6-to-v3.7.md)** -
+  Packaged assets and compatibility notes
 
 ### Quick Links
 
@@ -250,6 +282,37 @@ All configuration is done via environment variables in `.env.web`.
   (default `60`)
 - `WF_AUTH_REQUIRED` - Set to `false` to allow starting on non-loopback
   addresses without authentication (e.g. when a reverse proxy handles auth)
+- OIDC / SSO (optional) - sign in via any OpenID Connect provider (Authentik,
+  PocketID, Authelia, Keycloak, …). Works alongside or instead of
+  `WF_AUTH_PASSWORD_HASH`; a successful SSO login mints the same session cookie.
+  Enabled when both `WF_OIDC_ISSUER_URL` and `WF_OIDC_CLIENT_ID` are set.
+  - `WF_OIDC_ISSUER_URL` - provider base URL (discovery hits
+    `<issuer>/.well-known/openid-configuration`)
+  - `WF_OIDC_CLIENT_ID` - client id registered with the IdP
+  - `WF_OIDC_CLIENT_SECRET` - **Optional** client secret (PKCE is always used)
+  - `WF_OIDC_REDIRECT_URL` - **Required** when OIDC is enabled; must be
+    registered in the IdP, e.g. `https://your.host/api/v1/auth/oidc/callback`
+  - `WF_OIDC_SCOPES` - **Optional** space-separated scopes (default
+    `openid email profile`)
+  - `WF_OIDC_ALLOWED_EMAILS` / `WF_OIDC_ALLOWED_SUBS` - comma-separated
+    allowlists matched against the ID token's `email` / `sub` claims. With
+    neither set, the server **refuses to start** unless `WF_OIDC_ALLOW_ANY=true`
+    is also set — a missing allowlist must never silently grant every IdP user
+    access. An `email` is only honored when the IdP asserts
+    `email_verified=true`; `WF_OIDC_ALLOWED_SUBS` is the stronger control
+    (stable, issuer-scoped) and is recommended on shared/multi-tenant IdPs.
+  - `WF_OIDC_ALLOW_ANY` - **Optional**, default `false`. Set to `true` to allow
+    **any** user the IdP authenticates when no allowlist is configured. Only
+    safe on a dedicated single-user IdP; on a shared/multi-tenant IdP this
+    grants everyone access. A warning is logged at startup when enabled.
+  - `WF_OIDC_POST_LOGOUT_REDIRECT_URL` - **Optional**. When the IdP advertises
+    an `end_session_endpoint`, sign-out also ends the IdP session (RP-Initiated
+    Logout); otherwise logout is local-only. Set this to land back on the app
+    afterward — it must be **registered** with the IdP (e.g. Keycloak's "Valid
+    post logout redirect URIs"). If unset, the IdP shows its own logged-out
+    page.
+  - `WF_OIDC_RP_LOGOUT` - **Optional**, default `true`. Set to `false` to force
+    local-only logout even when the IdP supports RP-Initiated Logout.
 - `WF_COOKIE_SECURE` - Controls the `Secure` attribute on session cookies
   (default: `auto`)
   - `auto` - set `Secure` only when `X-Forwarded-Proto: https` is present
@@ -619,6 +682,7 @@ Your addon will be automatically discovered and loaded with hot reload support!
 - **🔐 Secure Storage**: Store API keys and sensitive data securely
 - **⚡ Hot Reload**: Seamless development experience
 - **🔒 Permission System**: Transparent security with user consent
+- **📦 Private Assets**: Sandbox-safe packaged images, fonts, media, and Wasm
 
 ### Official Addons
 
@@ -638,6 +702,8 @@ for maintained addon examples including:
   documentation
 - **[Architecture Guide](docs/addons/addon-architecture.md)** - Design patterns
   and best practices
+- **[v3.6 to v3.7 Migration Guide](docs/addons/addon-migration-guide-v3.6-to-v3.7.md)** -
+  Asset packaging and compatibility
 
 ## Technologies Used
 

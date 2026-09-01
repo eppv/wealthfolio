@@ -126,12 +126,20 @@ export const tradeActivitySchema = baseActivitySchema.extend({
       invalid_type_error: "Unit price must be a number.",
     })
     .positive(),
+  amount: z.coerce.number().min(0).optional(),
   fee: z.coerce
     .number({
       required_error: "Please enter a valid fee.",
       invalid_type_error: "Fee must be a positive number.",
     })
     .min(0, { message: "Fee must be a non-negative number." })
+    .default(0),
+  tax: z.coerce
+    .number({
+      required_error: "Please enter a valid tax.",
+      invalid_type_error: "Tax must be a positive number.",
+    })
+    .min(0, { message: "Tax must be a non-negative number." })
     .default(0),
   quoteMode: z.enum([QuoteMode.MARKET, QuoteMode.MANUAL]).default(QuoteMode.MARKET),
   // Asset type selection (stock/option/bond)
@@ -155,7 +163,7 @@ export const cashActivitySchema = baseActivitySchema.extend({
       required_error: "Please enter a valid amount.",
       invalid_type_error: "Amount must be a positive number.",
     })
-    .positive(),
+    .min(0),
   fee: z.coerce
     .number({
       invalid_type_error: "Fee must be a positive number.",
@@ -169,19 +177,29 @@ export const cashActivitySchema = baseActivitySchema.extend({
 export const incomeActivitySchema = baseActivitySchema.extend({
   activityType: z.enum([ActivityType.DIVIDEND, ActivityType.INTEREST]),
   assetId: z.string().min(1, { message: "Please select a security" }).optional(),
+  // No .positive() on unitPrice: cash records persist quantity/unitPrice as 0,
+  // so a top-level check would reject edits over these hidden fields. Positivity
+  // for asset-backed subtypes is enforced by validateAssetBackedIncomeFields.
   quantity: z.coerce.number().default(0),
-  unitPrice: z.coerce.number().positive().optional(),
+  unitPrice: z.coerce.number().optional(),
   amount: z.coerce
     .number({
       required_error: "Please enter a valid amount.",
       invalid_type_error: "Amount must be a positive number.",
     })
-    .positive(),
+    .min(0),
   fee: z.coerce
     .number({
       invalid_type_error: "Fee must be a positive number.",
     })
     .min(0, { message: "Fee must be a non-negative number." })
+    .default(0)
+    .optional(),
+  tax: z.coerce
+    .number({
+      invalid_type_error: "Tax must be a positive number.",
+    })
+    .min(0, { message: "Tax must be a non-negative number." })
     .default(0)
     .optional(),
 });
@@ -207,7 +225,7 @@ export const creditActivitySchema = baseActivitySchema.extend({
       required_error: "Please enter a valid amount.",
       invalid_type_error: "Amount must be a positive number.",
     })
-    .positive(),
+    .min(0),
   fee: z.coerce
     .number({
       invalid_type_error: "Fee must be a positive number.",

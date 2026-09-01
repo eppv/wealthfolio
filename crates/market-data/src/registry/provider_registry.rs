@@ -23,7 +23,7 @@ use crate::models::{
     SplitEvent,
 };
 use crate::provider::MarketDataProvider;
-use crate::resolver::SymbolResolver;
+use crate::resolver::{check_profile, SymbolResolver};
 
 /// Provider registry for orchestrating market data fetching.
 pub struct ProviderRegistry {
@@ -190,7 +190,10 @@ impl ProviderRegistry {
                         {
                             Ok(()) => valid_quotes.push(quote),
                             Err(e) => {
-                                warn!("Quote validation failed for {:?}: {:?}", quote.timestamp, e);
+                                debug!(
+                                    "Quote validation failed for {:?}: {:?}",
+                                    quote.timestamp, e
+                                );
                             }
                         }
                     }
@@ -732,7 +735,25 @@ impl ProviderRegistry {
 
             match provider.get_profile(&symbol).await {
                 Ok(profile) => {
+                    // The provider answered, so it is healthy either way.
                     self.circuit_breaker.record_success(&provider_id);
+
+                    // ...but a bare-ticker fallback may have answered for a
+                    // different listing entirely. Discard rather than store it.
+                    if let Err(mismatch) = check_profile(context, resolved.source, &profile) {
+                        warn!(
+                            "Discarding {} profile for '{}': it {}",
+                            provider_id, symbol, mismatch
+                        );
+                        last_error = Some(MarketDataError::ValidationFailed {
+                            message: format!(
+                                "{} profile for '{}' {}",
+                                provider_id, symbol, mismatch
+                            ),
+                        });
+                        continue;
+                    }
+
                     return Ok(profile);
                 }
                 Err(MarketDataError::NotSupported { .. }) => {
@@ -783,6 +804,7 @@ impl ProviderRegistry {
         }
 
         let mut last_error: Option<MarketDataError> = None;
+        let mut saw_no_data = false;
 
         for provider in providers {
             let provider_id: ProviderId = Cow::Borrowed(provider.id());
@@ -813,9 +835,16 @@ impl ProviderRegistry {
                 .await
             {
                 Ok(mut quotes) => {
-                    self.circuit_breaker.record_success(&provider_id);
-
                     let original_count = quotes.len();
+                    if original_count == 0 {
+                        diagnostics.record_error(
+                            provider_id.clone(),
+                            "No data returned for requested range".to_string(),
+                        );
+                        saw_no_data = true;
+                        continue;
+                    }
+
                     let mut valid_quotes = Vec::with_capacity(original_count);
                     for quote in quotes.drain(..) {
                         match self
@@ -824,12 +853,15 @@ impl ProviderRegistry {
                         {
                             Ok(()) => valid_quotes.push(quote),
                             Err(e) => {
-                                warn!("Quote validation failed for {:?}: {:?}", quote.timestamp, e);
+                                debug!(
+                                    "Quote validation failed for {:?}: {:?}",
+                                    quote.timestamp, e
+                                );
                             }
                         }
                     }
 
-                    if valid_quotes.is_empty() && original_count > 0 {
+                    if valid_quotes.is_empty() {
                         diagnostics.record_error(
                             provider_id.clone(),
                             "All quotes failed validation".to_string(),
@@ -840,10 +872,19 @@ impl ProviderRegistry {
                         continue;
                     }
 
+                    self.circuit_breaker.record_success(&provider_id);
                     diagnostics.record_success(provider_id);
                     return (Ok(valid_quotes), diagnostics);
                 }
                 Err(MarketDataError::NotSupported { .. }) => continue,
+                Err(MarketDataError::NoDataForRange) => {
+                    diagnostics.record_error(
+                        provider_id,
+                        "No data returned for requested range".to_string(),
+                    );
+                    saw_no_data = true;
+                    continue;
+                }
                 Err(e) => {
                     let retry_class = e.retry_class();
                     diagnostics.record_error(provider_id.clone(), format!("{:?}", e));
@@ -867,10 +908,14 @@ impl ProviderRegistry {
             "All providers failed. Diagnostics: {}",
             diagnostics.summary()
         );
-        (
-            Err(last_error.unwrap_or(MarketDataError::AllProvidersFailed)),
-            diagnostics,
-        )
+        let error = last_error.unwrap_or_else(|| {
+            if saw_no_data {
+                MarketDataError::NoDataForRange
+            } else {
+                MarketDataError::AllProvidersFailed
+            }
+        });
+        (Err(error), diagnostics)
     }
 
     /// Fetch latest quote for an instrument with diagnostics.
@@ -1090,6 +1135,149 @@ mod tests {
         }
     }
 
+    struct EmptyHistoricalProvider {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MarketDataProvider for EmptyHistoricalProvider {
+        fn id(&self) -> &'static str {
+            "EMPTY"
+        }
+
+        fn priority(&self) -> u8 {
+            1
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                instrument_kinds: &[InstrumentKind::Equity],
+                coverage: Coverage::global_best_effort(),
+                supports_latest: false,
+                supports_historical: true,
+                supports_search: false,
+                supports_profile: false,
+                supports_dividends: false,
+            }
+        }
+
+        fn rate_limit(&self) -> RateLimit {
+            RateLimit::default()
+        }
+
+        async fn get_latest_quote(
+            &self,
+            _: &QuoteContext,
+            _: ProviderInstrument,
+        ) -> Result<Quote, MarketDataError> {
+            unreachable!()
+        }
+
+        async fn get_historical_quotes(
+            &self,
+            _: &QuoteContext,
+            _: ProviderInstrument,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+        ) -> Result<Vec<Quote>, MarketDataError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_historical_result_falls_back_to_next_provider() {
+        let empty_calls = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(MockProvider::new("FALLBACK", 10, false));
+        let providers: Vec<Arc<dyn MarketDataProvider>> = vec![
+            Arc::new(EmptyHistoricalProvider {
+                call_count: empty_calls.clone(),
+            }),
+            fallback.clone(),
+        ];
+        let registry = ProviderRegistry::new(providers, Arc::new(MockResolver));
+        let context = QuoteContext {
+            instrument: InstrumentId::Equity {
+                ticker: Arc::from("TEST"),
+                mic: Some(Cow::Borrowed("XNAS")),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        };
+
+        let (result, _) = registry
+            .fetch_quotes_with_diagnostics(&context, Utc::now(), Utc::now())
+            .await;
+        let quotes = result.unwrap();
+
+        assert_eq!(empty_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].source, "FALLBACK");
+    }
+
+    #[tokio::test]
+    async fn test_empty_historical_result_returns_no_data_without_fallback() {
+        let providers: Vec<Arc<dyn MarketDataProvider>> = vec![Arc::new(EmptyHistoricalProvider {
+            call_count: Arc::new(AtomicUsize::new(0)),
+        })];
+        let registry = ProviderRegistry::new(providers, Arc::new(MockResolver));
+        let context = QuoteContext {
+            instrument: InstrumentId::Equity {
+                ticker: Arc::from("TEST"),
+                mic: Some(Cow::Borrowed("XNAS")),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        };
+
+        let (result, _) = registry
+            .fetch_quotes_with_diagnostics(&context, Utc::now(), Utc::now())
+            .await;
+
+        assert!(matches!(result, Err(MarketDataError::NoDataForRange)));
+    }
+
+    #[tokio::test]
+    async fn test_empty_result_does_not_mask_provider_error() {
+        let providers: Vec<Arc<dyn MarketDataProvider>> = vec![
+            Arc::new(MockProvider::new("FAILING", 0, true)),
+            Arc::new(EmptyHistoricalProvider {
+                call_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        ];
+        let registry = ProviderRegistry::new(providers, Arc::new(MockResolver));
+        let context = QuoteContext {
+            instrument: InstrumentId::Equity {
+                ticker: Arc::from("TEST"),
+                mic: Some(Cow::Borrowed("XNAS")),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        };
+
+        let (result, _) = registry
+            .fetch_quotes_with_diagnostics(&context, Utc::now(), Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MarketDataError::ProviderError { provider, .. }) if provider == "FAILING"
+        ));
+    }
+
     #[test]
     fn test_provider_ordering_by_priority() {
         let providers: Vec<Arc<dyn MarketDataProvider>> = vec![
@@ -1107,6 +1295,7 @@ mod tests {
                 ticker: Arc::from("TEST"),
                 mic: Some(Cow::Borrowed("XNAS")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1137,6 +1326,7 @@ mod tests {
                 ticker: Arc::from("TEST"),
                 mic: Some(Cow::Borrowed("XNAS")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: Some(Cow::Borrowed("PROVIDER_C")),
@@ -1211,6 +1401,7 @@ mod tests {
                 ticker: Arc::from("TEST"),
                 mic: Some(Cow::Borrowed("XNAS")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1228,6 +1419,7 @@ mod tests {
                 base: Arc::from("BTC"),
                 quote: Cow::Borrowed("USD"),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1292,6 +1484,7 @@ mod tests {
                 ticker: Arc::from("AAPL"),
                 mic: Some(Cow::Borrowed("XNAS")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1306,6 +1499,7 @@ mod tests {
                 ticker: Arc::from("SHOP"),
                 mic: Some(Cow::Borrowed("XTSE")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1320,6 +1514,7 @@ mod tests {
                 ticker: Arc::from("AAPL"),
                 mic: None,
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1351,6 +1546,7 @@ mod tests {
                 ticker: Arc::from("TEST"),
                 mic: Some(Cow::Borrowed("XNAS")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1389,6 +1585,7 @@ mod tests {
                 ticker: Arc::from("TEST"),
                 mic: Some(Cow::Borrowed("XNAS")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: Some(Cow::Borrowed("PROVIDER_C")),
@@ -1485,6 +1682,7 @@ mod tests {
                 ticker: Arc::from("SHOP"),
                 mic: Some(Cow::Borrowed("XTSE")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: Some(Cow::Borrowed("US_ONLY_PROFILE")),
@@ -1604,6 +1802,7 @@ mod tests {
                 ticker: Arc::from("TEST"),
                 mic: Some(Cow::Borrowed("XNAS")),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: None,
             preferred_provider: None,
@@ -1621,6 +1820,116 @@ mod tests {
         assert_eq!(
             dividends.iter().map(|d| d.date).collect::<Vec<_>>(),
             vec![1, 2]
+        );
+    }
+
+    /// The measured P10C case, end to end: an unknown MIC resolves to the bare
+    /// ticker, the provider answers for a US listing, and the registry must
+    /// throw that answer away instead of handing it to the classifier.
+    #[tokio::test]
+    async fn test_get_profile_discards_an_unconfirmed_fallback_match() {
+        struct WrongListingProvider;
+
+        #[async_trait::async_trait]
+        impl MarketDataProvider for WrongListingProvider {
+            fn id(&self) -> &'static str {
+                "WRONG_LISTING"
+            }
+
+            fn priority(&self) -> u8 {
+                10
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    instrument_kinds: &[InstrumentKind::Equity],
+                    coverage: Coverage::global_best_effort(),
+                    supports_latest: false,
+                    supports_historical: false,
+                    supports_search: false,
+                    supports_profile: true,
+                    supports_dividends: false,
+                }
+            }
+
+            fn rate_limit(&self) -> RateLimit {
+                RateLimit::default()
+            }
+
+            async fn get_latest_quote(
+                &self,
+                _: &QuoteContext,
+                _: ProviderInstrument,
+            ) -> Result<Quote, MarketDataError> {
+                unreachable!()
+            }
+
+            async fn get_historical_quotes(
+                &self,
+                _: &QuoteContext,
+                _: ProviderInstrument,
+                _: DateTime<Utc>,
+                _: DateTime<Utc>,
+            ) -> Result<Vec<Quote>, MarketDataError> {
+                unreachable!()
+            }
+
+            async fn get_profile(&self, _: &str) -> Result<AssetProfile, MarketDataError> {
+                Ok(AssetProfile {
+                    name: Some("First Equities Corp".to_string()),
+                    quote_type: Some("MUTUALFUND".to_string()),
+                    currency: Some("USD".to_string()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        struct FallbackResolver;
+
+        impl SymbolResolver for FallbackResolver {
+            fn resolve(
+                &self,
+                _provider: &ProviderId,
+                _context: &QuoteContext,
+            ) -> Result<ResolvedInstrument, MarketDataError> {
+                Ok(ResolvedInstrument {
+                    instrument: ProviderInstrument::EquitySymbol {
+                        symbol: Arc::from("FEQT"),
+                    },
+                    source: ResolutionSource::RulesFallback,
+                })
+            }
+
+            fn get_currency(
+                &self,
+                _provider: &ProviderId,
+                _context: &QuoteContext,
+            ) -> Option<Currency> {
+                None
+            }
+        }
+
+        let providers: Vec<Arc<dyn MarketDataProvider>> = vec![Arc::new(WrongListingProvider)];
+        let registry = ProviderRegistry::new(providers, Arc::new(FallbackResolver));
+
+        let context = QuoteContext {
+            instrument: InstrumentId::Equity {
+                ticker: Arc::from("FEQT"),
+                mic: Some(Cow::Borrowed("NEOE")),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: Some(Cow::Borrowed("CAD")),
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        };
+
+        let error = registry.get_profile(&context).await.unwrap_err();
+
+        assert!(
+            matches!(error, MarketDataError::ValidationFailed { .. }),
+            "expected a validation failure, got {error:?}"
         );
     }
 }

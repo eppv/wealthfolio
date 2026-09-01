@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen } from "@/test/render";
 import userEvent from "@testing-library/user-event";
 import { TransferForm } from "../transfer-form";
 import type { AccountSelectOption } from "../fields";
@@ -60,7 +60,15 @@ vi.mock("../fields", () => ({
       <textarea data-testid={`textarea-${name}`} name={name} id={name} />
     </div>
   ),
-  AdvancedOptionsSection: () => <div data-testid="advanced-options-section" />,
+  AdvancedOptionsSection: ({ children }: { children?: React.ReactNode }) => (
+    <div data-testid="advanced-options-section">{children}</div>
+  ),
+  FormSection: ({ action, children }: { action?: React.ReactNode; children?: React.ReactNode }) => (
+    <div data-testid="form-section">
+      {action}
+      {children}
+    </div>
+  ),
   createValidatedSubmit: vi.fn((_form, handler) => handler),
 }));
 
@@ -317,8 +325,7 @@ describe("TransferForm", () => {
     it("wraps content in a Card component", () => {
       render(<TransferForm accounts={mockAccounts} onSubmit={mockOnSubmit} />);
 
-      expect(screen.getByTestId("card")).toBeInTheDocument();
-      expect(screen.getByTestId("card-content")).toBeInTheDocument();
+      expect(screen.getAllByTestId("form-section").length).toBeGreaterThan(0);
     });
 
     it("renders form with proper structure", () => {

@@ -1,4 +1,19 @@
-import { useMemo, useState } from "react";
+import type { AssetLotView } from "@/lib/types";
+import { cn, formatDate, normalizeCurrency } from "@/lib/utils";
+import {
+  Button,
+  GainAmount,
+  GainPercent,
+  PrivacyAmount,
+  useAmountFormatting,
+  useNumberFormatting,
+  type FormattingApi,
+  useLocalizationSettings,
+  useDateFormatting,
+} from "@wealthfolio/ui";
+import { Badge } from "@wealthfolio/ui/components/ui/badge";
+import { Card, CardContent } from "@wealthfolio/ui/components/ui/card";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import {
   Table,
   TableBody,
@@ -7,20 +22,9 @@ import {
   TableHeader,
   TableRow,
 } from "@wealthfolio/ui/components/ui/table";
-import type { AssetLotView } from "@/lib/types";
-import {
-  Button,
-  GainAmount,
-  GainPercent,
-  PrivacyAmount,
-  formatAmount,
-  formatPercent,
-} from "@wealthfolio/ui";
-import { formatDate, formatQuantity } from "@/lib/utils";
-import { Badge } from "@wealthfolio/ui/components/ui/badge";
-import { Card, CardContent } from "@wealthfolio/ui/components/ui/card";
-import { Icons } from "@wealthfolio/ui/components/ui/icons";
-import { cn } from "@/lib/utils";
+import type { TFunction } from "i18next";
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 const ALLOCATION_COLORS = [
   "var(--color-chart-1)",
@@ -47,10 +51,13 @@ export const AssetLotsTable = ({
   dayChangeAmount = null,
   dayChangePct = null,
 }: AssetLotsTableProps) => {
+  const { t } = useTranslation();
   const groups = useMemo(
     () =>
-      lots && lots.length > 0 ? groupLotsByAccount(lots, marketPrice, contractMultiplier) : [],
-    [lots, marketPrice, contractMultiplier],
+      lots && lots.length > 0
+        ? groupLotsByAccount(lots, currency, marketPrice, contractMultiplier)
+        : [],
+    [lots, currency, marketPrice, contractMultiplier],
   );
   const totals = useMemo(() => computeTotals(groups), [groups]);
   const totalLots = useMemo(() => groups.reduce((acc, g) => acc + g.lots.length, 0), [groups]);
@@ -96,22 +103,24 @@ export const AssetLotsTable = ({
         <CardContent className="p-0">
           <div className="flex items-center justify-between border-b px-4 py-2.5">
             <div className="flex items-baseline gap-2">
-              <span className="text-foreground text-sm font-medium">Lots by account</span>
+              <span className="text-foreground text-sm font-medium">
+                {t("asset:lots.lots_by_account")}
+              </span>
               <span className="text-muted-foreground text-xs">
-                {groups.length} {groups.length === 1 ? "account" : "accounts"} · {totalLots}{" "}
-                {totalLots === 1 ? "lot" : "lots"}
+                {t("asset:lots.account", { count: groups.length })} ·{" "}
+                {t("asset:lots.lot", { count: totalLots })}
               </span>
             </div>
             <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={toggleAll}>
               {allExpanded ? (
                 <>
                   <Icons.ChevronUp className="mr-1 h-3.5 w-3.5" />
-                  Collapse all
+                  {t("asset:lots.collapse_all")}
                 </>
               ) : (
                 <>
                   <Icons.ChevronDown className="mr-1 h-3.5 w-3.5" />
-                  Expand all
+                  {t("asset:lots.expand_all")}
                 </>
               )}
             </Button>
@@ -137,8 +146,13 @@ interface ComputedLot {
   remainingQuantity: number;
   effectiveQuantity: number;
   marketValue: number;
-  gainLossAmount: number;
-  gainLossPercent: number;
+  aggregateMarketValue: number;
+  valuationCurrency: string;
+  valuationUnitCost: number | null;
+  valuationCostBasis: number | null;
+  gainLossAmount: number | null;
+  gainLossPercent: number | null;
+  canAggregate: boolean;
   isValuable: boolean;
   hasPartialSell: boolean;
 }
@@ -166,6 +180,7 @@ interface LotTotals {
 
 function groupLotsByAccount(
   lots: AssetLotView[],
+  currency: string,
   marketPrice: number,
   contractMultiplier: number,
 ): AccountLotGroupData[] {
@@ -188,13 +203,13 @@ function groupLotsByAccount(
     .map((group) => {
       const computed = [...group.lots]
         .sort(compareLots)
-        .map((lot) => computeLot(lot, marketPrice, contractMultiplier));
+        .map((lot) => computeLot(lot, currency, marketPrice, contractMultiplier));
       const shares = computed.reduce((acc, item) => acc + item.remainingQuantity, 0);
-      const costBasis = computed.reduce((acc, item) => acc + item.lot.costBasis, 0);
-      const marketValue = computed.reduce(
-        (acc, item) => acc + (item.isValuable ? item.marketValue : 0),
+      const costBasis = computed.reduce(
+        (acc, item) => acc + (item.canAggregate ? (item.valuationCostBasis ?? 0) : 0),
         0,
       );
+      const marketValue = computed.reduce((acc, item) => acc + item.aggregateMarketValue, 0);
       const gainLossAmount = marketValue - costBasis;
       const gainLossPercent = costBasis !== 0 ? gainLossAmount / costBasis : 0;
       const allSnapshot = computed.every((item) => item.lot.source === "SNAPSHOT_POSITION");
@@ -216,6 +231,7 @@ function groupLotsByAccount(
 
 function computeLot(
   lot: AssetLotView,
+  currency: string,
   marketPrice: number,
   contractMultiplier: number,
 ): ComputedLot {
@@ -226,8 +242,26 @@ function computeLot(
   const effectiveQuantity = isSnapshot ? lot.quantity : remainingQuantity * splitRatio;
   const isValuable = !lot.isClosed;
   const marketValue = effectiveQuantity * marketPrice * rowContractMultiplier;
-  const gainLossAmount = marketValue - lot.costBasis;
-  const gainLossPercent = lot.costBasis !== 0 ? gainLossAmount / lot.costBasis : 0;
+  const valuationCurrency = lot.valuationCurrency || currency;
+  const valuationUnitCost = finiteAmount(lot.valuationUnitCost);
+  const openCostBasis = finiteAmount(lot.valuationCostBasis);
+  const disposedCostBasis = finiteAmount(lot.valuationDisposalCostBasis);
+  const realizedGainLoss = finiteAmount(lot.valuationRealizedPnl);
+  const valuationCostBasis = lot.isClosed ? disposedCostBasis : openCostBasis;
+  const canAggregate =
+    isValuable && openCostBasis != null && sameCurrency(valuationCurrency, currency);
+  const aggregateMarketValue = canAggregate ? marketValue : 0;
+  const gainLossAmount = lot.isClosed
+    ? realizedGainLoss
+    : canAggregate && openCostBasis != null
+      ? marketValue - openCostBasis
+      : null;
+  const gainLossPercent =
+    gainLossAmount != null && valuationCostBasis != null && valuationCostBasis !== 0
+      ? gainLossAmount / Math.abs(valuationCostBasis)
+      : gainLossAmount === 0
+        ? 0
+        : null;
   const hasPartialSell =
     !isSnapshot && lot.originalQuantity > 0 && lot.remainingQuantity < lot.originalQuantity;
 
@@ -236,11 +270,26 @@ function computeLot(
     remainingQuantity,
     effectiveQuantity,
     marketValue,
+    aggregateMarketValue,
+    valuationCurrency,
+    valuationUnitCost,
+    valuationCostBasis,
     gainLossAmount,
     gainLossPercent,
+    canAggregate,
     isValuable,
     hasPartialSell,
   };
+}
+
+function finiteAmount(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function sameCurrency(left: string | undefined, right: string | undefined): boolean {
+  const normalizedLeft = normalizeCurrency(left)?.toUpperCase();
+  const normalizedRight = normalizeCurrency(right)?.toUpperCase();
+  return !!normalizedLeft && !!normalizedRight && normalizedLeft === normalizedRight;
 }
 
 function compareLots(a: AssetLotView, b: AssetLotView) {
@@ -278,35 +327,41 @@ function KpiStrip({
   dayChangeAmount: number | null;
   dayChangePct: number | null;
 }) {
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+
+  const { t } = useTranslation();
   const hasDayChange = dayChangeAmount != null;
   const bigAmountClass = "text-xl font-medium tracking-tight tabular-nums";
 
   return (
     <div className="bg-border grid grid-cols-2 gap-px md:grid-cols-5">
-      <KpiCell label="Market Value">
+      <KpiCell label={t("asset:lots.market_value")}>
         <PrivacyAmount
           value={totals.marketValue}
           currency={currency}
           className={cn("text-foreground", bigAmountClass)}
         />
         <span className="text-muted-foreground text-[11px]">
-          {formatQuantity(totals.shares)} shares
-          {marketPrice ? ` @ ${formatAmount(marketPrice, currency)}` : null}
+          {numberFormatting.formatQuantity(totals.shares)} {t("asset:lots.shares_suffix")}
+          {marketPrice ? ` @ ${amountFormatting.formatPrice(marketPrice, currency)}` : null}
         </span>
       </KpiCell>
 
-      <KpiCell label="Cost Basis">
+      <KpiCell label={t("asset:lots.cost_basis")}>
         <PrivacyAmount
           value={totals.costBasis}
           currency={currency}
           className={cn("text-foreground", bigAmountClass)}
         />
         <span className="text-muted-foreground text-[11px]">
-          avg {formatAmount(totals.averageUnitCost, currency)}
+          {t("asset:lots.avg", {
+            amount: amountFormatting.formatPrice(totals.averageUnitCost, currency),
+          })}
         </span>
       </KpiCell>
 
-      <KpiCell label="Unrealized Gain">
+      <KpiCell label={t("asset:lots.unrealized_gain")}>
         <GainAmount
           value={totals.gainLossAmount}
           currency={currency}
@@ -316,7 +371,7 @@ function KpiStrip({
         <GainPercent value={totals.gainLossPercent} className="justify-start text-[11px]" />
       </KpiCell>
 
-      <KpiCell label="Day's Change">
+      <KpiCell label={t("asset:lots.days_change")}>
         {hasDayChange ? (
           <>
             <GainAmount
@@ -334,7 +389,7 @@ function KpiStrip({
         )}
       </KpiCell>
 
-      <KpiCell label="Allocation" className="col-span-2 md:col-span-1">
+      <KpiCell label={t("asset:lots.allocation")} className="col-span-2 md:col-span-1">
         <AllocationBar groups={groups} totalValue={totals.marketValue} />
       </KpiCell>
     </div>
@@ -365,6 +420,7 @@ function AllocationBar({
   groups: AccountLotGroupData[];
   totalValue: number;
 }) {
+  const formatting = useNumberFormatting();
   if (totalValue <= 0) {
     return <span className="text-muted-foreground text-[11px]">—</span>;
   }
@@ -386,7 +442,7 @@ function AllocationBar({
             key={segment.accountId}
             className="h-full"
             style={{ width: `${segment.pct * 100}%`, backgroundColor: segment.color }}
-            title={`${segment.accountName}: ${formatPercent(segment.pct)}`}
+            title={`${segment.accountName}: ${formatting.formatPercent(segment.pct)}`}
           />
         ))}
       </div>
@@ -402,7 +458,7 @@ function AllocationBar({
               aria-hidden
             />
             <span className="text-foreground">{segment.accountName}</span>
-            <span>{formatPercent(segment.pct)}</span>
+            <span>{formatting.formatPercent(segment.pct)}</span>
           </div>
         ))}
       </div>
@@ -423,6 +479,8 @@ function AccountLotGroup({
   onToggle: () => void;
   isFirst: boolean;
 }) {
+  const formatting = useNumberFormatting();
+  const { t } = useTranslation();
   const Chevron = expanded ? Icons.ChevronDown : Icons.ChevronRight;
 
   return (
@@ -447,18 +505,19 @@ function AccountLotGroup({
           <span className="text-foreground truncate text-sm font-medium">{group.accountName}</span>
           {group.allSnapshot && (
             <Badge variant="secondary" className="ml-1 text-[10px] uppercase tracking-wider">
-              From snapshot
+              {t("asset:lots.from_snapshot")}
             </Badge>
           )}
           <span className="text-muted-foreground truncate text-xs">
-            {group.lots.length} {group.lots.length === 1 ? "lot" : "lots"} ·{" "}
-            {formatQuantity(group.shares)} {group.shares === 1 ? "share" : "shares"}
+            {t("asset:lots.lot", { count: group.lots.length })} ·{" "}
+            {formatting.formatQuantity(group.shares)}{" "}
+            {t("asset:lots.share", { count: group.shares })}
           </span>
         </button>
 
         <div className="text-muted-foreground flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs">
           <span className="inline-flex items-center gap-1.5">
-            <span className="text-[10px] uppercase tracking-wider">Basis</span>
+            <span className="text-[10px] uppercase tracking-wider">{t("asset:lots.basis")}</span>
             <PrivacyAmount
               value={group.costBasis}
               currency={currency}
@@ -467,7 +526,7 @@ function AccountLotGroup({
           </span>
           <span className="bg-border hidden h-3 w-px sm:block" aria-hidden />
           <span className="inline-flex items-center gap-1.5">
-            <span className="text-[10px] uppercase tracking-wider">Value</span>
+            <span className="text-[10px] uppercase tracking-wider">{t("asset:lots.value")}</span>
             <PrivacyAmount
               value={group.marketValue}
               currency={currency}
@@ -502,21 +561,23 @@ function AccountLotGroup({
                 </colgroup>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="text-[10px] uppercase tracking-[0.1em]">Date</TableHead>
-                    <TableHead className="text-right text-[10px] uppercase tracking-[0.1em]">
-                      Qty
+                    <TableHead className="text-[10px] uppercase tracking-[0.1em]">
+                      {t("asset:lots.date")}
                     </TableHead>
                     <TableHead className="text-right text-[10px] uppercase tracking-[0.1em]">
-                      Unit Cost
+                      {t("asset:lots.qty")}
                     </TableHead>
                     <TableHead className="text-right text-[10px] uppercase tracking-[0.1em]">
-                      Cost Basis
+                      {t("asset:lots.unit_cost")}
                     </TableHead>
                     <TableHead className="text-right text-[10px] uppercase tracking-[0.1em]">
-                      Market Value
+                      {t("asset:lots.cost_basis_col")}
                     </TableHead>
                     <TableHead className="text-right text-[10px] uppercase tracking-[0.1em]">
-                      Unrealized
+                      {t("asset:lots.market_value_col")}
+                    </TableHead>
+                    <TableHead className="text-right text-[10px] uppercase tracking-[0.1em]">
+                      {t("holdings:gain_loss")}
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -541,6 +602,12 @@ function AccountLotGroup({
 }
 
 function AssetLotTableRow({ item, currency }: { item: ComputedLot; currency: string }) {
+  const localizationSettings = useLocalizationSettings();
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+  const formatting = useNumberFormatting();
+  const { t } = useTranslation();
   const { lot } = item;
   const isSnapshot = lot.source === "SNAPSHOT_POSITION";
 
@@ -552,44 +619,77 @@ function AssetLotTableRow({ item, currency }: { item: ComputedLot; currency: str
       )}
     >
       <TableCell className="font-medium">
-        <div>{formatLotDate(lot)}</div>
+        <div>
+          {formatLotDate(lot, {
+            ...localizationSettings,
+            ...amountFormatting,
+            ...numberFormatting,
+            ...dateFormatting,
+          })}
+        </div>
         <div className="text-muted-foreground text-[11px]">
-          {isSnapshot ? "as-of snapshot" : `held ${formatHoldingPeriod(lot.acquisitionDate)}`}
-          {lot.isClosed && lot.closeDate && ` · closed ${formatDate(lot.closeDate)}`}
+          {isSnapshot
+            ? t("asset:lots.as_of_snapshot")
+            : t("asset:lots.held", { period: formatHoldingPeriod(lot.acquisitionDate, t) })}
+          {lot.isClosed &&
+            lot.closeDate &&
+            ` · ${t("asset:lots.closed", { date: formatDate(lot.closeDate, dateFormatting) })}`}
         </div>
       </TableCell>
       <TableCell className="text-right tabular-nums">
-        <div>{formatQuantity(item.remainingQuantity)}</div>
+        <div>{formatting.formatQuantity(item.remainingQuantity)}</div>
         {item.hasPartialSell && (
           <div className="text-muted-foreground text-[11px]">
-            of {formatQuantity(lot.originalQuantity)}
+            {t("asset:lots.of", { quantity: formatting.formatQuantity(lot.originalQuantity) })}
           </div>
         )}
         {!isSnapshot && lot.splitRatio !== 1 && (
           <div className="text-muted-foreground text-[11px]">
-            eff. {formatQuantity(item.effectiveQuantity)}
+            {t("asset:lots.eff", { quantity: formatting.formatQuantity(item.effectiveQuantity) })}
           </div>
         )}
       </TableCell>
       <TableCell className="text-right tabular-nums">
-        <PrivacyAmount value={lot.unitCost} currency={currency} />
+        {item.valuationUnitCost != null ? (
+          <PrivacyAmount value={item.valuationUnitCost} currency={item.valuationCurrency} />
+        ) : (
+          "—"
+        )}
         {!isSnapshot && lot.splitRatio !== 1 && (
           <div className="text-muted-foreground text-[11px]">
-            adj. <PrivacyAmount value={lot.unitCost / lot.splitRatio} currency={currency} />
+            {t("asset:lots.adj")}{" "}
+            {item.valuationUnitCost != null ? (
+              <PrivacyAmount
+                value={item.valuationUnitCost / lot.splitRatio}
+                currency={item.valuationCurrency}
+              />
+            ) : (
+              "—"
+            )}
           </div>
         )}
       </TableCell>
       <TableCell className="text-right tabular-nums">
-        <PrivacyAmount value={lot.costBasis} currency={currency} />
+        {item.valuationCostBasis != null ? (
+          <PrivacyAmount value={item.valuationCostBasis} currency={item.valuationCurrency} />
+        ) : (
+          "—"
+        )}
       </TableCell>
       <TableCell className="text-right tabular-nums">
         {item.isValuable ? <PrivacyAmount value={item.marketValue} currency={currency} /> : "—"}
       </TableCell>
       <TableCell className="text-right">
-        {item.isValuable ? (
+        {item.gainLossAmount != null ? (
           <div className="flex flex-col items-end">
-            <GainAmount value={item.gainLossAmount} currency={currency} displayCurrency={false} />
-            <GainPercent value={item.gainLossPercent} className="text-[11px]" />
+            <GainAmount
+              value={item.gainLossAmount}
+              currency={item.valuationCurrency}
+              displayCurrency={false}
+            />
+            {item.gainLossPercent != null && (
+              <GainPercent value={item.gainLossPercent} className="text-[11px]" />
+            )}
           </div>
         ) : (
           "—"
@@ -600,6 +700,12 @@ function AssetLotTableRow({ item, currency }: { item: ComputedLot; currency: str
 }
 
 function AssetLotMobileRow({ item, currency }: { item: ComputedLot; currency: string }) {
+  const localizationSettings = useLocalizationSettings();
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+  const formatting = useNumberFormatting();
+  const { t } = useTranslation();
   const { lot } = item;
   const isSnapshot = lot.source === "SNAPSHOT_POSITION";
 
@@ -607,41 +713,66 @@ function AssetLotMobileRow({ item, currency }: { item: ComputedLot; currency: st
     <div className={cn("space-y-2 p-4", lot.isClosed && "opacity-60")}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 space-y-0.5">
-          <div className="text-sm font-medium">{formatLotDate(lot)}</div>
+          <div className="text-sm font-medium">
+            {formatLotDate(lot, {
+              ...localizationSettings,
+              ...amountFormatting,
+              ...numberFormatting,
+              ...dateFormatting,
+            })}
+          </div>
           <div className="text-muted-foreground text-[11px]">
-            {isSnapshot ? "as-of snapshot" : `held ${formatHoldingPeriod(lot.acquisitionDate)}`}
-            {lot.isClosed && lot.closeDate && ` · closed ${formatDate(lot.closeDate)}`}
+            {isSnapshot
+              ? t("asset:lots.as_of_snapshot")
+              : t("asset:lots.held", { period: formatHoldingPeriod(lot.acquisitionDate, t) })}
+            {lot.isClosed &&
+              lot.closeDate &&
+              ` · ${t("asset:lots.closed", { date: formatDate(lot.closeDate, dateFormatting) })}`}
           </div>
         </div>
-        {item.isValuable && (
+        {item.gainLossAmount != null && (
           <div className="flex shrink-0 flex-col items-end">
-            <GainAmount value={item.gainLossAmount} currency={currency} displayCurrency={false} />
-            <GainPercent value={item.gainLossPercent} className="text-[11px]" />
+            <GainAmount
+              value={item.gainLossAmount}
+              currency={item.valuationCurrency}
+              displayCurrency={false}
+            />
+            {item.gainLossPercent != null && (
+              <GainPercent value={item.gainLossPercent} className="text-[11px]" />
+            )}
           </div>
         )}
       </div>
 
       <div className="text-muted-foreground grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-        <span>Qty</span>
+        <span>{t("asset:lots.qty")}</span>
         <span className="text-foreground text-right tabular-nums">
-          {formatQuantity(item.remainingQuantity)}
+          {formatting.formatQuantity(item.remainingQuantity)}
           {item.hasPartialSell && (
             <span className="text-muted-foreground block text-[11px]">
-              of {formatQuantity(lot.originalQuantity)}
+              {t("asset:lots.of", { quantity: formatting.formatQuantity(lot.originalQuantity) })}
             </span>
           )}
         </span>
-        <span>Unit Cost</span>
+        <span>{t("asset:lots.unit_cost")}</span>
         <span className="text-foreground text-right tabular-nums">
-          <PrivacyAmount value={lot.unitCost} currency={currency} />
+          {item.valuationUnitCost != null ? (
+            <PrivacyAmount value={item.valuationUnitCost} currency={item.valuationCurrency} />
+          ) : (
+            "—"
+          )}
         </span>
-        <span>Cost Basis</span>
+        <span>{t("asset:lots.cost_basis_col")}</span>
         <span className="text-foreground text-right tabular-nums">
-          <PrivacyAmount value={lot.costBasis} currency={currency} />
+          {item.valuationCostBasis != null ? (
+            <PrivacyAmount value={item.valuationCostBasis} currency={item.valuationCurrency} />
+          ) : (
+            "—"
+          )}
         </span>
         {item.isValuable && (
           <>
-            <span>Market Value</span>
+            <span>{t("asset:lots.market_value_col")}</span>
             <span className="text-foreground text-right tabular-nums">
               <PrivacyAmount value={item.marketValue} currency={currency} />
             </span>
@@ -652,12 +783,12 @@ function AssetLotMobileRow({ item, currency }: { item: ComputedLot; currency: st
   );
 }
 
-function formatLotDate(lot: AssetLotView) {
+function formatLotDate(lot: AssetLotView, formatting: FormattingApi) {
   const date = lot.acquisitionDate ?? lot.snapshotDate;
-  return date ? formatDate(date) : "—";
+  return date ? formatDate(date, formatting) : "—";
 }
 
-function formatHoldingPeriod(acquisitionDate: string | null | undefined): string {
+function formatHoldingPeriod(acquisitionDate: string | null | undefined, t: TFunction): string {
   if (!acquisitionDate) return "—";
   const start = new Date(acquisitionDate);
   if (Number.isNaN(start.getTime())) return "—";
@@ -678,12 +809,14 @@ function formatHoldingPeriod(acquisitionDate: string | null | undefined): string
   }
 
   if (years > 0) {
-    return months > 0 ? `${years}y ${months}mo` : `${years}y`;
+    return months > 0
+      ? t("asset:lots.period_year_month", { years, months })
+      : t("asset:lots.period_year", { years });
   }
   if (months > 0) {
-    return `${months}mo`;
+    return t("asset:lots.period_month", { months });
   }
-  return `${Math.max(days, 0)}d`;
+  return t("asset:lots.period_day", { days: Math.max(days, 0) });
 }
 
 export default AssetLotsTable;

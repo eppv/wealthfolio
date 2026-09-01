@@ -1,8 +1,8 @@
 import {
-  getAssetHoldings,
-  getSnapshots,
-  getSnapshotByDate,
   deleteSnapshot,
+  getAssetHoldings,
+  getSnapshotByDate,
+  getSnapshots,
   saveManualHoldings,
 } from "@/adapters";
 import { useAccounts } from "@/hooks/use-accounts";
@@ -11,18 +11,15 @@ import { useIsMobileViewport } from "@/hooks/use-platform";
 import { QueryKeys } from "@/lib/query-keys";
 import type { Account, Holding, SnapshotInfo } from "@/lib/types";
 import { formatDate } from "@/lib/utils";
-import { AmountDisplay, GainAmount, GainPercent, QuantityDisplay } from "@wealthfolio/ui";
-import { Badge } from "@wealthfolio/ui/components/ui/badge";
-import { Button } from "@wealthfolio/ui/components/ui/button";
-import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import { HoldingsEditMode } from "@/pages/holdings/components/holdings-edit-mode";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@wealthfolio/ui/components/ui/table";
+  AmountDisplay,
+  GainAmount,
+  GainPercent,
+  QuantityDisplay,
+  useDateFormatting,
+} from "@wealthfolio/ui";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,10 +30,21 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@wealthfolio/ui/components/ui/alert-dialog";
+import { Badge } from "@wealthfolio/ui/components/ui/badge";
+import { Button } from "@wealthfolio/ui/components/ui/button";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@wealthfolio/ui/components/ui/sheet";
-import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@wealthfolio/ui/components/ui/table";
+import type { TFunction } from "i18next";
 import { useCallback, useMemo, useState } from "react";
-import { HoldingsEditMode } from "@/pages/holdings/components/holdings-edit-mode";
+import { useTranslation } from "react-i18next";
 
 interface AssetAccountHoldingsProps {
   assetId: string;
@@ -69,14 +77,13 @@ export function useHasManualSnapshots(assetId: string): boolean {
   });
 
   return useMemo(() => {
-    return snapshotQueries.some((q) =>
-      (q.data ?? []).some((snap) => snap.source !== "CALCULATED" && snap.source !== "SYNTHETIC"),
-    );
+    return snapshotQueries.some((q) => (q.data ?? []).some((snap) => snap.source !== "CALCULATED"));
   }, [snapshotQueries]);
 }
 
 /** Holdings table - per-account breakdown for an asset */
 export function AssetAccountHoldings({ assetId, baseCurrency }: AssetAccountHoldingsProps) {
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const { accounts } = useAccounts();
   const isMobile = useIsMobileViewport();
@@ -106,12 +113,13 @@ export function AssetAccountHoldings({ assetId, baseCurrency }: AssetAccountHold
                   <p className="truncate text-sm font-medium">{account?.name ?? h.accountId}</p>
                   {account?.trackingMode === "HOLDINGS" && (
                     <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px]">
-                      Manual
+                      {t("asset:accountHoldings.manual")}
                     </Badge>
                   )}
                 </div>
                 <p className="text-muted-foreground text-xs">
-                  <QuantityDisplay value={h.quantity} isHidden={isBalanceHidden} /> shares
+                  <QuantityDisplay value={h.quantity} isHidden={isBalanceHidden} />{" "}
+                  {t("asset:accountHoldings.shares_suffix")}
                 </p>
               </div>
               <div className="shrink-0 text-right">
@@ -143,11 +151,11 @@ export function AssetAccountHoldings({ assetId, baseCurrency }: AssetAccountHold
       <Table>
         <TableHeader className="bg-muted/50">
           <TableRow>
-            <TableHead>Account</TableHead>
-            <TableHead className="text-right">Shares</TableHead>
-            <TableHead className="text-right">Market Value</TableHead>
-            <TableHead className="text-right">Cost Basis</TableHead>
-            <TableHead className="text-right">Total P&L</TableHead>
+            <TableHead>{t("asset:accountHoldings.account")}</TableHead>
+            <TableHead className="text-right">{t("asset:accountHoldings.shares")}</TableHead>
+            <TableHead className="text-right">{t("asset:accountHoldings.market_value")}</TableHead>
+            <TableHead className="text-right">{t("asset:accountHoldings.cost_basis")}</TableHead>
+            <TableHead className="text-right">{t("asset:accountHoldings.total_pnl")}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -162,7 +170,7 @@ export function AssetAccountHoldings({ assetId, baseCurrency }: AssetAccountHold
                     {account?.name ?? h.accountId}
                     {account?.trackingMode === "HOLDINGS" && (
                       <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-                        Manual
+                        {t("asset:accountHoldings.manual")}
                       </Badge>
                     )}
                   </div>
@@ -220,6 +228,9 @@ export function AssetSnapshotHistory({
   assetId: string;
   baseCurrency: string;
 }) {
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const queryClient = useQueryClient();
   const { accounts } = useAccounts();
@@ -253,7 +264,7 @@ export function AssetSnapshotHistory({
       const snapshots = snapshotQueries[idx]?.data ?? [];
       const accountName = accountsMap.get(accountId)?.name ?? accountId;
       for (const snap of snapshots) {
-        if (snap.source === "CALCULATED" || snap.source === "SYNTHETIC") continue;
+        if (snap.source === "CALCULATED" || !snap.isDateValid) continue;
         result.push({ ...snap, accountId, accountName });
       }
     });
@@ -397,11 +408,13 @@ export function AssetSnapshotHistory({
               className="flex items-center gap-3 rounded-lg border p-3"
             >
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium">{formatDate(snap.snapshotDate)}</p>
+                <p className="text-sm font-medium">
+                  {formatDate(snap.snapshotDate, dateFormatting)}
+                </p>
                 <div className="text-muted-foreground flex items-center gap-1.5 text-xs">
                   <span className="truncate">{snap.accountName}</span>
                   <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px]">
-                    {formatSource(snap.source)}
+                    {formatSource(snap.source, t)}
                   </Badge>
                 </div>
               </div>
@@ -459,18 +472,20 @@ export function AssetSnapshotHistory({
           <Table>
             <TableHeader className="bg-muted/50">
               <TableRow>
-                <TableHead>Date</TableHead>
-                <TableHead>Account</TableHead>
-                <TableHead className="text-right">Shares</TableHead>
-                <TableHead className="text-right">Avg Cost</TableHead>
-                <TableHead>Source</TableHead>
+                <TableHead>{t("asset:accountHoldings.date")}</TableHead>
+                <TableHead>{t("asset:accountHoldings.account")}</TableHead>
+                <TableHead className="text-right">{t("asset:accountHoldings.shares")}</TableHead>
+                <TableHead className="text-right">{t("asset:accountHoldings.avg_cost")}</TableHead>
+                <TableHead>{t("asset:accountHoldings.source")}</TableHead>
                 <TableHead className="w-[80px]" />
               </TableRow>
             </TableHeader>
             <TableBody>
               {enrichedSnapshots.map((snap) => (
                 <TableRow key={`${snap.accountId}-${snap.snapshotDate}`}>
-                  <TableCell className="font-medium">{formatDate(snap.snapshotDate)}</TableCell>
+                  <TableCell className="font-medium">
+                    {formatDate(snap.snapshotDate, dateFormatting)}
+                  </TableCell>
                   <TableCell>{snap.accountName}</TableCell>
                   <TableCell className="text-right">
                     {snap.isDetailLoading ? (
@@ -496,7 +511,7 @@ export function AssetSnapshotHistory({
                   </TableCell>
                   <TableCell>
                     <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-                      {formatSource(snap.source)}
+                      {formatSource(snap.source, t)}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right">
@@ -537,7 +552,7 @@ export function AssetSnapshotHistory({
         <Sheet open={!!editingSnapshot} onOpenChange={() => handleEditClose()}>
           <SheetContent side="right" className="flex h-full w-full flex-col p-0 sm:max-w-2xl">
             <SheetHeader className="border-b px-6 py-4">
-              <SheetTitle>Update Holdings</SheetTitle>
+              <SheetTitle>{t("asset:accountHoldings.update_holdings")}</SheetTitle>
             </SheetHeader>
             <div className="flex-1 overflow-hidden px-6">
               <HoldingsEditMode
@@ -555,21 +570,24 @@ export function AssetSnapshotHistory({
       <AlertDialog open={!!deletingSnapshot} onOpenChange={() => setDeletingSnapshot(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove Position</AlertDialogTitle>
+            <AlertDialogTitle>{t("asset:accountHoldings.remove_position_title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              Remove this asset from the {deletingSnapshot?.accountName} snapshot on{" "}
-              {deletingSnapshot?.date ? formatDate(deletingSnapshot.date) : ""}? The other positions
-              in the snapshot will be kept.
+              {t("asset:accountHoldings.remove_position_description", {
+                accountName: deletingSnapshot?.accountName ?? "",
+                date: deletingSnapshot?.date
+                  ? formatDate(deletingSnapshot.date, dateFormatting)
+                  : "",
+              })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={isDeleting}>{t("common:cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={handleRemovePosition}
               disabled={isDeleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {isDeleting ? "Removing..." : "Remove"}
+              {isDeleting ? t("asset:accountHoldings.removing") : t("asset:accountHoldings.remove")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -578,14 +596,14 @@ export function AssetSnapshotHistory({
   );
 }
 
-function formatSource(source: string): string {
+function formatSource(source: string, t: TFunction): string {
   switch (source) {
     case "MANUAL_ENTRY":
-      return "Manual";
+      return t("asset:accountHoldings.source_manual");
     case "CSV_IMPORT":
-      return "CSV";
+      return t("asset:accountHoldings.source_csv");
     case "BROKER_IMPORTED":
-      return "Broker";
+      return t("asset:accountHoldings.source_broker");
     default:
       return source;
   }

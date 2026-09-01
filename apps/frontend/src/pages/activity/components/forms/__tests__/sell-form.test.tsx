@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@/test/render";
 import userEvent from "@testing-library/user-event";
 import { SellForm } from "../sell-form";
+import { ACTIVITY_SUBTYPES } from "@/lib/constants";
 import type { AccountSelectOption } from "../fields";
 import type { Holding } from "@/lib/types";
 
@@ -99,11 +100,73 @@ vi.mock("../fields", async () => {
         </div>
       );
     },
-    OptionContractFields: () => <div data-testid="option-contract-fields" />,
+    OptionContractFields: () => {
+      const { register } = useFormContext();
+      return (
+        <div data-testid="option-contract-fields">
+          <input data-testid="input-underlyingSymbol" {...register("underlyingSymbol")} />
+          <input
+            data-testid="input-strikePrice"
+            type="number"
+            {...register("strikePrice", { valueAsNumber: true })}
+          />
+          <input data-testid="input-expirationDate" {...register("expirationDate")} />
+        </div>
+      );
+    },
+    PositionIntentSelector: ({ name = "subtype" }: { name?: string }) => {
+      const { setValue, watch } = useFormContext();
+      const value = watch(name);
+      return (
+        <div data-testid="position-intent-selector" data-value={value ?? ""}>
+          <button type="button" onClick={() => setValue(name, "POSITION_OPEN")}>
+            Open
+          </button>
+          <button type="button" onClick={() => setValue(name, "POSITION_CLOSE")}>
+            Close
+          </button>
+        </div>
+      );
+    },
+    StockTradeIntentSelector: () => <div data-testid="stock-trade-intent-selector" />,
     AssetTypeSelector: ({ name }: { name: string }) => (
       <div data-testid={`asset-type-selector-${name}`} />
     ),
-    AdvancedOptionsSection: () => <div data-testid="advanced-options-section" />,
+    AdvancedOptionsSection: ({ children }: { children?: React.ReactNode }) => (
+      <div data-testid="advanced-options-section">{children}</div>
+    ),
+    FormSection: ({
+      action,
+      children,
+    }: {
+      action?: React.ReactNode;
+      children?: React.ReactNode;
+    }) => (
+      <div data-testid="form-section">
+        {action}
+        {children}
+      </div>
+    ),
+    TradeTotalInput: ({
+      calculatedAmount,
+      onCustomChange,
+    }: {
+      calculatedAmount?: number;
+      onCustomChange: (isCustom: boolean) => void;
+    }) => {
+      const { register } = useFormContext();
+      return (
+        <input
+          data-testid="input-amount"
+          data-calculated-amount={calculatedAmount ?? ""}
+          type="number"
+          {...register("amount", {
+            setValueAs: (value) => (value === "" ? undefined : Number(value)),
+          })}
+          onInput={() => onCustomChange(true)}
+        />
+      );
+    },
     createValidatedSubmit: vi.fn((form, handler) => form.handleSubmit(handler)),
   };
 });
@@ -196,6 +259,89 @@ describe("SellForm", () => {
     });
   });
 
+  describe("Trade Total", () => {
+    it("does not apply the option contract multiplier to a stock", async () => {
+      const user = userEvent.setup();
+      render(<SellForm accounts={mockAccounts} onSubmit={mockOnSubmit} />);
+
+      await user.type(screen.getByTestId("input-quantity"), "1");
+      await user.type(screen.getByTestId("input-unitPrice"), "12");
+
+      await waitFor(() =>
+        expect(screen.getByTestId("input-amount")).toHaveAttribute("data-calculated-amount", "12"),
+      );
+    });
+
+    it("applies the contract multiplier to an option", async () => {
+      const user = userEvent.setup();
+      render(
+        <SellForm
+          accounts={mockAccounts}
+          onSubmit={mockOnSubmit}
+          defaultValues={{ assetType: "option" }}
+        />,
+      );
+
+      await user.type(screen.getByTestId("input-quantity"), "1");
+      await user.type(screen.getByTestId("input-unitPrice"), "12");
+
+      await waitFor(() =>
+        expect(screen.getByTestId("input-amount")).toHaveAttribute(
+          "data-calculated-amount",
+          "1200",
+        ),
+      );
+    });
+
+    it("uses the existing asset multiplier as read-only when editing an option", async () => {
+      render(
+        <SellForm
+          accounts={mockAccounts}
+          onSubmit={mockOnSubmit}
+          isEditing
+          defaultValues={{
+            assetType: "option",
+            symbolInstrumentType: "OPTION",
+            contractMultiplier: 10,
+            quantity: 1,
+            unitPrice: 12,
+            amount: 120,
+          }}
+        />,
+      );
+
+      expect(screen.getByLabelText(/contract multiplier/i)).toHaveAttribute("readonly");
+      await waitFor(() =>
+        expect(screen.getByTestId("input-amount")).toHaveAttribute("data-calculated-amount", "120"),
+      );
+    });
+
+    it("submits a user-typed custom total verbatim", async () => {
+      const user = userEvent.setup();
+      render(
+        <SellForm
+          accounts={mockAccounts}
+          onSubmit={mockOnSubmit}
+          defaultValues={{
+            accountId: "acc-1",
+            assetId: "AAPL",
+            activityDate: new Date("2026-02-01T10:00:00.000Z"),
+            currency: "USD",
+            quantity: 2,
+            unitPrice: 10,
+            fee: 1,
+          }}
+        />,
+      );
+
+      await user.type(screen.getByTestId("input-amount"), "30");
+      await user.click(screen.getByRole("button", { name: /add sell/i }));
+
+      await waitFor(() => expect(mockOnSubmit).toHaveBeenCalledTimes(1));
+      expect(mockOnSubmit).toHaveBeenCalledWith(expect.objectContaining({ amount: 30 }));
+    });
+  });
+
   describe("Render Tests", () => {
     it("renders all form fields", () => {
       render(<SellForm accounts={mockAccounts} onSubmit={mockOnSubmit} />);
@@ -278,8 +424,7 @@ describe("SellForm", () => {
     it("wraps content in a Card component", () => {
       render(<SellForm accounts={mockAccounts} onSubmit={mockOnSubmit} />);
 
-      expect(screen.getByTestId("card")).toBeInTheDocument();
-      expect(screen.getByTestId("card-content")).toBeInTheDocument();
+      expect(screen.getAllByTestId("form-section").length).toBeGreaterThan(0);
     });
 
     it("renders form with proper structure", () => {
@@ -373,6 +518,51 @@ describe("SellForm", () => {
       });
     });
 
+    it("warns for Sell Short while the selected stock is long", () => {
+      holdingsHook.useHoldings.mockReturnValue({
+        holdings: [createHolding("AAPL", 5)],
+        isLoading: false,
+      });
+
+      render(
+        <SellForm
+          accounts={mockAccounts}
+          defaultValues={{
+            accountId: "acc-1",
+            assetId: "AAPL",
+            assetType: "stock",
+            subtype: ACTIVITY_SUBTYPES.POSITION_OPEN,
+          }}
+          onSubmit={mockOnSubmit}
+        />,
+      );
+
+      expect(screen.getByText(/split this into a normal Sell first/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /sell short/i })).toBeEnabled();
+    });
+
+    it("warns for a normal Sell while the selected stock is already short", () => {
+      holdingsHook.useHoldings.mockReturnValue({
+        holdings: [createHolding("AAPL", -5)],
+        isLoading: false,
+      });
+
+      render(
+        <SellForm
+          accounts={mockAccounts}
+          defaultValues={{
+            accountId: "acc-1",
+            assetId: "AAPL",
+            assetType: "stock",
+          }}
+          onSubmit={mockOnSubmit}
+        />,
+      );
+
+      expect(screen.getByText(/already have a short position/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /add sell/i })).toBeEnabled();
+    });
+
     it("does not add back the original sell quantity after changing the asset", async () => {
       const user = userEvent.setup();
       holdingsHook.useHoldings.mockReturnValue({
@@ -400,6 +590,38 @@ describe("SellForm", () => {
       });
     });
 
+    it("resets the Sell Short intent when the selected symbol changes", async () => {
+      const user = userEvent.setup();
+
+      render(
+        <SellForm
+          accounts={mockAccounts}
+          defaultValues={{
+            accountId: "acc-1",
+            assetId: "AAPL",
+            assetType: "stock",
+            subtype: ACTIVITY_SUBTYPES.POSITION_OPEN,
+            quantity: 1,
+            unitPrice: 10,
+            currency: "USD",
+          }}
+          onSubmit={mockOnSubmit}
+        />,
+      );
+
+      // Starts as Sell Short.
+      expect(screen.getByRole("button", { name: /sell short/i })).toBeInTheDocument();
+
+      const symbolInput = screen.getByTestId("symbol-search-assetId");
+      await user.clear(symbolInput);
+      await user.type(symbolInput, "MSFT");
+
+      // Intent reset back to normal Sell.
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: /add sell/i })).toBeInTheDocument();
+      });
+    });
+
     it("matches current holdings by instrument id as well as display symbol", () => {
       holdingsHook.useHoldings.mockReturnValue({
         holdings: [createHolding("CJR28A", 10, "SEC:CJR28A:XTSE")],
@@ -421,6 +643,53 @@ describe("SellForm", () => {
 
       expect(screen.queryByTestId("alert")).not.toBeInTheDocument();
       expect(screen.getByText("Available: 10")).toBeInTheDocument();
+    });
+  });
+
+  describe("Option Position Intent", () => {
+    const optionDefaults = {
+      accountId: "acc-1",
+      assetType: "option" as const,
+      underlyingSymbol: "AAPL",
+      strikePrice: 200,
+      expirationDate: "2026-12-19",
+      optionType: "CALL" as const,
+      quantity: 1,
+      unitPrice: 5,
+      currency: "USD",
+    };
+
+    it("blocks submit for an option with no Open/Close intent chosen", async () => {
+      const user = userEvent.setup();
+
+      render(
+        <SellForm accounts={mockAccounts} defaultValues={optionDefaults} onSubmit={mockOnSubmit} />,
+      );
+
+      // No intent pre-selected.
+      expect(screen.getByTestId("position-intent-selector")).toHaveAttribute("data-value", "");
+
+      await user.click(screen.getByRole("button", { name: /add sell/i }));
+
+      await waitFor(() => {
+        expect(mockOnSubmit).not.toHaveBeenCalled();
+      });
+    });
+
+    it("submits an option once an intent is chosen", async () => {
+      const user = userEvent.setup();
+
+      render(
+        <SellForm accounts={mockAccounts} defaultValues={optionDefaults} onSubmit={mockOnSubmit} />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Open" }));
+      await user.click(screen.getByRole("button", { name: /sell to open/i }));
+
+      await waitFor(() => {
+        expect(mockOnSubmit).toHaveBeenCalledTimes(1);
+      });
+      expect(mockOnSubmit.mock.calls[0][0].subtype).toBe(ACTIVITY_SUBTYPES.POSITION_OPEN);
     });
   });
 });

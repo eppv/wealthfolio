@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     error::{ApiError, ApiResult},
     events::{
-        ServerEvent, MARKET_SYNC_COMPLETE, MARKET_SYNC_ERROR, MARKET_SYNC_START,
+        MarketSyncResult, ServerEvent, MARKET_SYNC_COMPLETE, MARKET_SYNC_ERROR, MARKET_SYNC_START,
         PORTFOLIO_UPDATE_COMPLETE, PORTFOLIO_UPDATE_ERROR, PORTFOLIO_UPDATE_START,
     },
     main_lib::AppState,
@@ -12,12 +12,16 @@ use anyhow::anyhow;
 use chrono::NaiveDate;
 use serde_json::json;
 use wealthfolio_core::{
-    accounts::{account_supports_purpose, AccountPurpose, AccountServiceTrait},
+    accounts::{account_supports_portfolio_scope, AccountPurpose, AccountServiceTrait},
     portfolio::{
-        snapshot::{reconcile_quote_sync_from_latest_account_snapshots, SnapshotRecalcMode},
+        snapshot::{
+            reconcile_quote_sync_from_latest_account_snapshots, snapshot_date_requires_remediation,
+            SnapshotRecalcMode,
+        },
         valuation::ValuationRecalcMode,
     },
     quotes::MarketSyncMode,
+    utils::time_utils::{parse_user_timezone_or_default, user_today},
 };
 
 // ============================================================================
@@ -43,7 +47,7 @@ pub fn holdings_account_ids(state: &AppState, account_ids: &[String]) -> ApiResu
         .account_service
         .get_accounts_by_ids(account_ids)?
         .into_iter()
-        .filter(|account| account_supports_purpose(&account.account_type, AccountPurpose::Holdings))
+        .filter(|account| account_supports_portfolio_scope(account, AccountPurpose::Holdings))
         .map(|account| account.id)
         .collect())
 }
@@ -123,17 +127,44 @@ pub fn trigger_full_portfolio_recalc(state: Arc<AppState>) {
     );
 }
 
+/// Trigger a full portfolio recalculation that also syncs the given assets'
+/// market data. Used when a provider-backed FX pair is added so its real rate
+/// is fetched immediately instead of waiting for the periodic sync (#1143).
+pub fn trigger_portfolio_recalc_with_asset_sync(state: Arc<AppState>, asset_ids: Vec<String>) {
+    enqueue_portfolio_job(
+        state,
+        PortfolioJobConfig {
+            account_ids: None,
+            market_sync_mode: MarketSyncMode::Incremental {
+                asset_ids: Some(asset_ids),
+            },
+            snapshot_mode: SnapshotRecalcMode::Full,
+            valuation_mode: ValuationRecalcMode::Full,
+            since_date: None,
+        },
+    );
+}
+
 pub async fn process_portfolio_job(
     state: Arc<AppState>,
     config: PortfolioJobConfig,
 ) -> ApiResult<()> {
     let event_bus = state.event_bus.clone();
-    let snapshot_mode = config
+    let today = user_today(parse_user_timezone_or_default(
+        &state.timezone.read().unwrap(),
+    ));
+    let safe_since_date = config
         .since_date
+        .filter(|date| !snapshot_date_requires_remediation(*date, today));
+    if config.since_date.is_some() && safe_since_date.is_none() {
+        tracing::warn!(
+            "Ignoring an invalid portfolio recalculation boundary and rebuilding safely"
+        );
+    }
+    let snapshot_mode = safe_since_date
         .map(SnapshotRecalcMode::SinceDate)
         .unwrap_or_else(|| config.snapshot_mode.clone());
-    let valuation_mode = config
-        .since_date
+    let valuation_mode = safe_since_date
         .map(ValuationRecalcMode::SinceDate)
         .unwrap_or_else(|| config.valuation_mode.clone());
 
@@ -196,9 +227,10 @@ pub async fn process_portfolio_job(
                     .collect();
                 event_bus.publish(ServerEvent::with_payload(
                     MARKET_SYNC_COMPLETE,
-                    json!({
-                        "failed_syncs": result.failures,
-                        "skipped_reasons": skipped_reasons,
+                    json!(MarketSyncResult {
+                        failed_syncs: result.failures,
+                        skipped_reasons,
+                        show_skipped_reasons: false,
                     }),
                 ));
                 tracing::info!("Market data sync completed in {:?}", sync_start.elapsed());
@@ -256,20 +288,37 @@ pub async fn process_portfolio_job(
         );
     }
 
-    for account_id in account_ids {
-        if let Err(err) = state
-            .valuation_service
-            .calculate_valuation_history(&account_id, valuation_mode.clone())
-            .await
-        {
-            let err_msg = format!(
-                "Valuation history calculation failed for {}: {}",
-                account_id, err
-            );
-            tracing::warn!("{}", err_msg);
+    match state
+        .valuation_service
+        .calculate_valuation_histories(&account_ids, valuation_mode)
+        .await
+    {
+        Ok(outcome) => {
+            if outcome
+                .failures
+                .iter()
+                .any(|failure| failure.code == "INVALID_SNAPSHOT_DATE")
+            {
+                state.health_service.clear_cache().await;
+            }
+            for failure in outcome.failures {
+                tracing::warn!(
+                    "Valuation history calculation failed for {}: {}",
+                    failure.account_id,
+                    failure.message
+                );
+                event_bus.publish(ServerEvent::with_payload(
+                    PORTFOLIO_UPDATE_ERROR,
+                    json!(failure),
+                ));
+            }
+        }
+        Err(error) => {
+            let message = format!("Failed to load shared valuation facts: {}", error);
+            tracing::warn!("{}", message);
             event_bus.publish(ServerEvent::with_payload(
                 PORTFOLIO_UPDATE_ERROR,
-                json!(err_msg),
+                json!(message),
             ));
         }
     }

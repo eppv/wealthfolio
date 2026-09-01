@@ -14,8 +14,8 @@
 //! The `Quote` struct uses `asset_id: String` which stores the canonical asset identifier.
 
 use async_trait::async_trait;
-use chrono::NaiveDate;
-use std::collections::HashMap;
+use chrono::{NaiveDate, TimeZone, Utc};
+use std::collections::{HashMap, HashSet};
 
 use super::model::{LatestQuotePair, Quote};
 use super::types::{AssetId, Day, QuoteSource};
@@ -171,6 +171,50 @@ pub trait QuoteStore: Send + Sync {
         source: Option<&QuoteSource>,
     ) -> Result<HashMap<AssetId, Quote>>;
 
+    /// Gets sparse quotes in a date range for multiple assets.
+    ///
+    /// This is the batch counterpart to [`QuoteStore::range`]. Implementations
+    /// should avoid issuing one query per asset. With no source filter, the
+    /// highest-priority quote is selected for each asset/day. Results are sorted
+    /// by asset and then timestamp.
+    fn range_batch(
+        &self,
+        asset_ids: &[AssetId],
+        start: Day,
+        end: Day,
+        source: Option<&QuoteSource>,
+    ) -> Result<Vec<Quote>> {
+        let mut quotes = Vec::new();
+        for asset_id in asset_ids {
+            quotes.extend(self.range(asset_id, start, end, source)?);
+        }
+        quotes.sort_by(|left, right| {
+            left.asset_id
+                .cmp(&right.asset_id)
+                .then_with(|| left.timestamp.cmp(&right.timestamp))
+        });
+        Ok(quotes)
+    }
+
+    /// Gets sparse quote rows for assets that may have different inclusive start dates.
+    fn range_batch_from_dates(
+        &self,
+        asset_start_dates: &[(AssetId, Day)],
+        end: Day,
+        source: Option<&QuoteSource>,
+    ) -> Result<Vec<Quote>> {
+        let mut quotes = Vec::new();
+        for (asset_id, start) in asset_start_dates {
+            quotes.extend(self.range(asset_id, *start, end, source)?);
+        }
+        quotes.sort_by(|left, right| {
+            left.asset_id
+                .cmp(&right.asset_id)
+                .then_with(|| left.timestamp.cmp(&right.timestamp))
+        });
+        Ok(quotes)
+    }
+
     /// Gets latest + previous quote for multiple assets.
     ///
     /// This is useful for calculating daily price changes.
@@ -208,6 +252,21 @@ pub trait QuoteStore: Send + Sync {
         asset_ids: &[String],
         source: &str,
     ) -> Result<HashMap<String, (NaiveDate, NaiveDate)>>;
+
+    /// Gets quote date bounds across all sources for multiple assets.
+    fn get_quote_bounds_for_assets_any_source(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<HashMap<String, (NaiveDate, NaiveDate)>> {
+        let latest = self.get_latest_quotes(asset_ids)?;
+        Ok(latest
+            .into_iter()
+            .map(|(asset_id, quote)| {
+                let date = quote.timestamp.date_naive();
+                (asset_id, (date, date))
+            })
+            .collect())
+    }
 
     // =========================================================================
     // Legacy Methods (String-based, for backward compatibility)
@@ -261,6 +320,56 @@ pub trait QuoteStore: Send + Sync {
         symbols: &[String],
         as_of: NaiveDate,
     ) -> Result<HashMap<String, Quote>>;
+
+    /// Gets one original persisted seed quote per asset using an asset-specific cutoff.
+    fn get_latest_quotes_as_of_dates(
+        &self,
+        requests: &[(String, NaiveDate)],
+    ) -> Result<HashMap<String, Quote>> {
+        let mut result = HashMap::new();
+        for (asset_id, as_of) in requests {
+            if let Some(quote) = self
+                .get_latest_quotes_as_of(std::slice::from_ref(asset_id), *as_of)?
+                .remove(asset_id)
+            {
+                result.insert(asset_id.clone(), quote);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Gets the latest quote on or before each requested asset/date pair.
+    ///
+    /// Storage backends should override this with a sparse batch query. The
+    /// default keeps test and alternative stores correct without materializing
+    /// every calendar day between requested dates.
+    fn get_latest_quotes_for_asset_dates(
+        &self,
+        requests: &[(String, NaiveDate)],
+    ) -> Result<HashMap<(String, NaiveDate), Quote>> {
+        let mut assets_by_date: HashMap<NaiveDate, HashSet<String>> = HashMap::new();
+        for (asset_id, requested_date) in requests {
+            assets_by_date
+                .entry(*requested_date)
+                .or_default()
+                .insert(asset_id.clone());
+        }
+
+        let mut result = HashMap::new();
+        for (requested_date, asset_ids) in assets_by_date {
+            let mut asset_ids: Vec<String> = asset_ids.into_iter().collect();
+            asset_ids.sort();
+            for (asset_id, mut quote) in self.get_latest_quotes_as_of(&asset_ids, requested_date)? {
+                quote.timestamp = Utc.from_utc_datetime(
+                    &requested_date
+                        .and_hms_opt(12, 0, 0)
+                        .expect("a valid date always has noon"),
+                );
+                result.insert((asset_id, requested_date), quote);
+            }
+        }
+        Ok(result)
+    }
 
     /// Gets the latest and previous quotes for multiple symbols.
     ///

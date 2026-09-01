@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use wealthfolio_core::{
     accounts::TrackingMode,
     events::DomainEvent,
@@ -15,6 +15,57 @@ use wealthfolio_core::{
 };
 
 use crate::api::shared::PortfolioJobConfig;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetClassificationChangePlan {
+    pub asset_ids: Vec<String>,
+    pub taxonomy_ids: Vec<String>,
+}
+
+/// Plans a UI cache refresh for asset classification changes.
+pub fn plan_asset_classification_change(
+    events: &[DomainEvent],
+) -> Option<AssetClassificationChangePlan> {
+    let mut asset_ids: HashSet<String> = HashSet::new();
+    let mut taxonomy_ids: HashSet<String> = HashSet::new();
+    let mut has_event = false;
+
+    for event in events {
+        if let DomainEvent::AssetClassificationsChanged {
+            asset_ids: changed_asset_ids,
+            taxonomy_ids: changed_taxonomy_ids,
+        } = event
+        {
+            has_event = true;
+            asset_ids.extend(
+                changed_asset_ids
+                    .iter()
+                    .filter(|id| !id.is_empty())
+                    .cloned(),
+            );
+            taxonomy_ids.extend(
+                changed_taxonomy_ids
+                    .iter()
+                    .filter(|id| !id.is_empty())
+                    .cloned(),
+            );
+        }
+    }
+
+    if !has_event {
+        return None;
+    }
+
+    let mut asset_ids = asset_ids.into_iter().collect::<Vec<_>>();
+    asset_ids.sort();
+    let mut taxonomy_ids = taxonomy_ids.into_iter().collect::<Vec<_>>();
+    taxonomy_ids.sort();
+
+    Some(AssetClassificationChangePlan {
+        asset_ids,
+        taxonomy_ids,
+    })
+}
 
 /// Plans a portfolio job from a batch of domain events.
 ///
@@ -27,7 +78,10 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
     let mut account_ids: HashSet<String> = HashSet::new();
     let mut asset_ids: HashSet<String> = HashSet::new();
     let mut has_recalc_event = false;
+    let mut recalculate_all_accounts = false;
+    let mut requires_full_rebuild = false;
     let mut min_activity_at_utc: Option<DateTime<Utc>> = None;
+    let mut min_snapshot_date: Option<NaiveDate> = None;
 
     for event in events {
         match event {
@@ -38,6 +92,9 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
                 ..
             } => {
                 has_recalc_event = true;
+                if earliest_activity_at_utc.is_none() {
+                    requires_full_rebuild = true;
+                }
                 for id in acc_ids {
                     if !id.is_empty() {
                         account_ids.insert(id.clone());
@@ -54,9 +111,28 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
                     (current, None) => current,
                 };
             }
+            DomainEvent::AssetSplitActivitiesChanged {
+                asset_ids: ids,
+                earliest_activity_at_utc,
+            } => {
+                has_recalc_event = true;
+                requires_full_rebuild = true;
+                recalculate_all_accounts = true;
+                for id in ids {
+                    if !id.is_empty() {
+                        asset_ids.insert(id.clone());
+                    }
+                }
+                min_activity_at_utc = match (min_activity_at_utc, earliest_activity_at_utc) {
+                    (Some(current), Some(new)) => Some(current.min(*new)),
+                    (None, Some(new)) => Some(*new),
+                    (current, None) => current,
+                };
+            }
             DomainEvent::HoldingsChanged {
                 account_ids: acc_ids,
                 asset_ids: ast_ids,
+                earliest_snapshot_date,
             } => {
                 has_recalc_event = true;
                 for id in acc_ids {
@@ -69,29 +145,32 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
                         asset_ids.insert(id.clone());
                     }
                 }
+                min_snapshot_date = Some(
+                    min_snapshot_date
+                        .map(|current| current.min(*earliest_snapshot_date))
+                        .unwrap_or(*earliest_snapshot_date),
+                );
             }
             DomainEvent::AccountsChanged {
                 account_ids: acc_ids,
                 ..
             } => {
                 has_recalc_event = true;
+                requires_full_rebuild = true;
                 for id in acc_ids {
                     if !id.is_empty() {
                         account_ids.insert(id.clone());
                     }
                 }
             }
-            DomainEvent::ManualSnapshotSaved { account_id } => {
-                has_recalc_event = true;
-                if !account_id.is_empty() {
-                    account_ids.insert(account_id.clone());
-                }
-            }
             DomainEvent::DeviceSyncPullComplete => {
                 has_recalc_event = true;
+                recalculate_all_accounts = true;
             }
             DomainEvent::AssetsUpdated { asset_ids: ids } => {
                 has_recalc_event = true;
+                recalculate_all_accounts = true;
+                requires_full_rebuild = true;
                 for id in ids {
                     if !id.is_empty() {
                         asset_ids.insert(id.clone());
@@ -106,6 +185,7 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
                     }
                 }
             }
+            DomainEvent::AssetClassificationsChanged { .. } => {}
             DomainEvent::TrackingModeChanged {
                 account_id,
                 old_mode,
@@ -117,6 +197,7 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
                         account_ids.insert(account_id.clone());
                     }
                     has_recalc_event = true;
+                    requires_full_rebuild = true;
                 }
             }
             DomainEvent::AssetsMerged { .. } => {}
@@ -127,8 +208,17 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
         return None;
     }
 
+    let activity_date =
+        min_activity_at_utc.map(|instant| activity_date_in_user_timezone(instant, timezone));
+    let since_date = match (activity_date, min_snapshot_date) {
+        (Some(activity), Some(snapshot)) => Some(activity.min(snapshot)),
+        (Some(activity), None) => Some(activity),
+        (None, Some(snapshot)) => Some(snapshot),
+        (None, None) => None,
+    };
+
     Some(PortfolioJobConfig {
-        account_ids: if account_ids.is_empty() {
+        account_ids: if recalculate_all_accounts || account_ids.is_empty() {
             None
         } else {
             Some(account_ids.into_iter().collect())
@@ -142,8 +232,11 @@ pub fn plan_portfolio_job(events: &[DomainEvent], timezone: &str) -> Option<Port
         },
         snapshot_mode: SnapshotRecalcMode::Full,
         valuation_mode: ValuationRecalcMode::Full,
-        since_date: min_activity_at_utc
-            .map(|instant| activity_date_in_user_timezone(instant, timezone)),
+        since_date: if recalculate_all_accounts || requires_full_rebuild {
+            None
+        } else {
+            since_date
+        },
     })
 }
 
@@ -271,6 +364,24 @@ mod tests {
     }
 
     #[test]
+    fn test_split_activity_change_recalculates_all_accounts() {
+        let events = vec![
+            DomainEvent::ActivitiesChanged {
+                account_ids: vec!["edited-account".to_string()],
+                asset_ids: vec!["VGT".to_string()],
+                currencies: vec!["USD".to_string()],
+                earliest_activity_at_utc: None,
+            },
+            DomainEvent::asset_split_activities_changed(vec!["VGT".to_string()], None),
+        ];
+
+        let config = plan_portfolio_job(&events, "UTC").unwrap();
+
+        assert!(config.account_ids.is_none());
+        assert!(config.since_date.is_none());
+    }
+
+    #[test]
     fn test_plan_portfolio_job_converts_utc_timestamp_using_timezone() {
         let events = vec![DomainEvent::ActivitiesChanged {
             account_ids: vec!["acc1".to_string()],
@@ -284,6 +395,75 @@ mod tests {
             config.since_date.map(|date| date.to_string()),
             Some("2024-12-31".to_string())
         );
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_uses_earliest_holdings_snapshot_date() {
+        let events = vec![
+            DomainEvent::holdings_changed(
+                vec!["acc1".to_string()],
+                vec!["AAPL".to_string()],
+                NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
+            ),
+            DomainEvent::holdings_changed(
+                vec!["acc1".to_string()],
+                vec!["MSFT".to_string()],
+                NaiveDate::from_ymd_opt(2024, 2, 3).unwrap(),
+            ),
+        ];
+
+        let config = plan_portfolio_job(&events, "UTC").unwrap();
+        assert_eq!(config.since_date, NaiveDate::from_ymd_opt(2024, 2, 3));
+    }
+
+    #[test]
+    fn test_undated_recalc_event_keeps_full_rebuild_when_batched_with_holdings() {
+        let holdings = DomainEvent::holdings_changed(
+            vec!["holdings-account".to_string()],
+            vec!["AAPL".to_string()],
+            NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
+        );
+        let cases = vec![
+            DomainEvent::ActivitiesChanged {
+                account_ids: vec!["activity-account".to_string()],
+                asset_ids: vec![],
+                currencies: vec![],
+                earliest_activity_at_utc: None,
+            },
+            DomainEvent::AccountsChanged {
+                account_ids: vec!["account-change".to_string()],
+                currency_changes: vec![],
+            },
+            DomainEvent::TrackingModeChanged {
+                account_id: "tracking-account".to_string(),
+                old_mode: TrackingMode::Holdings,
+                new_mode: TrackingMode::Transactions,
+                is_connected: false,
+            },
+        ];
+
+        for undated in cases {
+            let config = plan_portfolio_job(&[holdings.clone(), undated], "UTC").unwrap();
+            assert!(config.since_date.is_none());
+        }
+    }
+
+    #[test]
+    fn test_assets_updated_keeps_all_account_scope_when_batched_with_holdings() {
+        let events = vec![
+            DomainEvent::holdings_changed(
+                vec!["holdings-account".to_string()],
+                vec!["AAPL".to_string()],
+                NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
+            ),
+            DomainEvent::AssetsUpdated {
+                asset_ids: vec!["AAPL".to_string()],
+            },
+        ];
+
+        let config = plan_portfolio_job(&events, "UTC").unwrap();
+        assert!(config.account_ids.is_none());
+        assert!(config.since_date.is_none());
     }
 
     #[test]
@@ -359,6 +539,56 @@ mod tests {
         } else {
             panic!("Expected Incremental mode");
         }
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_device_sync_pull_complete_recalculates_all_accounts() {
+        let events = vec![DomainEvent::device_sync_pull_complete()];
+
+        let config = plan_portfolio_job(&events, "UTC").expect("device sync should plan a job");
+
+        assert!(config.account_ids.is_none());
+        assert!(config.since_date.is_none());
+        assert!(matches!(config.snapshot_mode, SnapshotRecalcMode::Full));
+        assert!(matches!(config.valuation_mode, ValuationRecalcMode::Full));
+        assert!(matches!(
+            config.market_sync_mode,
+            MarketSyncMode::Incremental { asset_ids: None }
+        ));
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_asset_classifications_changed_does_not_trigger_recalc() {
+        let events = vec![DomainEvent::asset_classifications_changed(
+            vec!["asset-1".to_string()],
+            vec!["asset_classes".to_string()],
+        )];
+
+        assert!(plan_portfolio_job(&events, "UTC").is_none());
+    }
+
+    #[test]
+    fn test_plan_asset_classification_change_deduplicates_ids() {
+        let events = vec![
+            DomainEvent::asset_classifications_changed(
+                vec!["asset-2".to_string(), "asset-1".to_string()],
+                vec!["regions".to_string()],
+            ),
+            DomainEvent::asset_classifications_changed(
+                vec!["asset-1".to_string(), "".to_string()],
+                vec!["regions".to_string(), "asset_classes".to_string()],
+            ),
+        ];
+
+        let plan = plan_asset_classification_change(&events).unwrap();
+        assert_eq!(
+            plan.asset_ids,
+            vec!["asset-1".to_string(), "asset-2".to_string()]
+        );
+        assert_eq!(
+            plan.taxonomy_ids,
+            vec!["asset_classes".to_string(), "regions".to_string()]
+        );
     }
 
     #[test]

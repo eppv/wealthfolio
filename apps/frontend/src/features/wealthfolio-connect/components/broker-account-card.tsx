@@ -1,7 +1,16 @@
-import { Card, CardContent } from "@wealthfolio/ui/components/ui/card";
-import { Badge } from "@wealthfolio/ui/components/ui/badge";
-import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { formatDate } from "@/lib/utils";
+import {
+  useAmountFormatting,
+  useDateFormatting,
+  useLocalizationSettings,
+  useNumberFormatting,
+  type FormattingApi,
+} from "@wealthfolio/ui";
+import { Badge } from "@wealthfolio/ui/components/ui/badge";
+import { Card, CardContent } from "@wealthfolio/ui/components/ui/card";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import type { BrokerAccount } from "../types";
 
 interface BrokerAccountCardProps {
@@ -34,12 +43,29 @@ function getLastSyncDate(account: BrokerAccount): string | null {
 /**
  * Format the last sync date for display
  */
-function formatLastSyncDate(dateStr: string | null): string {
-  if (!dateStr) return "No data yet";
-  return `Data as of ${formatDate(dateStr)}`;
+function formatLastSyncDate(
+  dateStr: string | null,
+  t: TFunction,
+  formatting: FormattingApi,
+): string {
+  if (!dateStr) return t("connect:accounts.noDataYet");
+  return t("connect:accounts.dataAsOf", { date: formatDate(dateStr, formatting) });
 }
 
 export function BrokerAccountCard({ account }: BrokerAccountCardProps) {
+  const localizationSettings = useLocalizationSettings();
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const formatting = {
+    ...localizationSettings,
+    ...numberFormatting,
+    ...amountFormatting,
+    ...dateFormatting,
+  };
+
+  const { t } = useTranslation();
   const lastSyncDate = getLastSyncDate(account);
   const isShared = account.owner && !account.owner.is_own_account;
   const ownerName = account.owner?.full_name;
@@ -66,16 +92,16 @@ export function BrokerAccountCard({ account }: BrokerAccountCardProps) {
 
           <div>
             <div className="flex items-center gap-2">
-              <p className="font-medium">{account.name || "Account"}</p>
+              <p className="font-medium">{account.name || t("connect:accounts.accountFallback")}</p>
               {account.is_paper && (
                 <Badge variant="outline" className="text-xs">
-                  Paper
+                  {t("connect:accounts.paper")}
                 </Badge>
               )}
               {isShared && ownerName && (
                 <span className="text-muted-foreground flex items-center gap-1 text-sm">
                   <Icons.Users className="h-3.5 w-3.5" />
-                  Shared by {ownerName}
+                  {t("connect:accounts.sharedBy", { name: ownerName })}
                 </span>
               )}
             </div>
@@ -93,7 +119,9 @@ export function BrokerAccountCard({ account }: BrokerAccountCardProps) {
         </div>
 
         <div className="flex items-center gap-3">
-          <span className="text-muted-foreground text-sm">{formatLastSyncDate(lastSyncDate)}</span>
+          <span className="text-muted-foreground text-sm">
+            {formatLastSyncDate(lastSyncDate, t, formatting)}
+          </span>
 
           {/* Sync enabled indicator */}
           {account.sync_enabled ? (

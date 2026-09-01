@@ -7,6 +7,7 @@ import {
   type ReactNode,
   type Dispatch,
 } from "react";
+import { useTranslation } from "react-i18next";
 import { checkActivitiesImport, previewImportAssets, logger } from "@/adapters";
 import type {
   ActivityImport,
@@ -40,6 +41,7 @@ export interface ParseConfig {
 }
 
 export type DraftActivityStatus = "valid" | "warning" | "error" | "skipped" | "duplicate";
+export type DraftCurrencySource = "csv" | "default" | "manual" | "resolved";
 
 export interface DraftActivity {
   rowIndex: number;
@@ -54,13 +56,17 @@ export interface DraftActivity {
   unitPrice?: string | null;
   amount?: string | null;
   currency: string;
+  currencySource?: DraftCurrencySource;
   fee?: string | null;
+  tax?: string | null;
   accountId: string;
   comment?: string;
   subtype?: string;
   fxRate?: string | null;
-  /** Whether this is an external transfer (for TRANSFER_IN/TRANSFER_OUT) */
+  /** Whether a transfer or credit crosses the tracked-account boundary. */
   isExternal?: boolean;
+  /** Draft-only provenance used to safely recompute an inferred credit boundary. */
+  boundaryInference?: "expense-reversal";
 
   isin?: string;
 
@@ -261,6 +267,17 @@ function coerceStepForOrder(current: ImportStep, nextOrder: ImportStep[]): Impor
 // ─────────────────────────────────────────────────────────────────────────────
 
 function importReducer(state: ImportState, action: ImportAction): ImportState {
+  const applyUserDraftUpdates = (
+    draft: DraftActivity,
+    updates: Partial<DraftActivity>,
+  ): DraftActivity => {
+    const normalizedUpdates =
+      "currency" in updates && !("currencySource" in updates)
+        ? { ...updates, currencySource: "manual" as const }
+        : updates;
+    return { ...draft, ...normalizedUpdates, isEdited: true };
+  };
+
   const updatesAffectAssetPreview = (updates: Partial<DraftActivity>) =>
     [
       "activityType",
@@ -319,7 +336,7 @@ function importReducer(state: ImportState, action: ImportAction): ImportState {
       return {
         ...state,
         draftActivities: state.draftActivities.map((draft) =>
-          draft.rowIndex === rowIndex ? { ...draft, ...updates, isEdited: true } : draft,
+          draft.rowIndex === rowIndex ? applyUserDraftUpdates(draft, updates) : draft,
         ),
         ...(shouldClearAssetPreview
           ? {
@@ -340,7 +357,7 @@ function importReducer(state: ImportState, action: ImportAction): ImportState {
       return {
         ...state,
         draftActivities: state.draftActivities.map((draft) =>
-          indexSet.has(draft.rowIndex) ? { ...draft, ...updates, isEdited: true } : draft,
+          indexSet.has(draft.rowIndex) ? applyUserDraftUpdates(draft, updates) : draft,
         ),
         ...(shouldClearAssetPreview
           ? {
@@ -513,6 +530,7 @@ interface ImportProviderProps {
 }
 
 export function ImportProvider({ children, initialAccountId }: ImportProviderProps) {
+  const { t } = useTranslation();
   const [state, dispatch] = useReducer(importReducer, {
     ...INITIAL_STATE,
     accountId: initialAccountId ?? "",
@@ -536,8 +554,6 @@ export function ImportProvider({ children, initialAccountId }: ImportProviderPro
   // "Latest ref" pattern — keeps validateDrafts stable while reading current values
   const accountIdRef = useRef(state.accountId);
   accountIdRef.current = state.accountId;
-  const defaultCurrencyRef = useRef(state.parseConfig.defaultCurrency);
-  defaultCurrencyRef.current = state.parseConfig.defaultCurrency;
   const draftRevisionRef = useRef(state.draftRevision);
   draftRevisionRef.current = state.draftRevision;
 
@@ -568,8 +584,9 @@ export function ImportProvider({ children, initialAccountId }: ImportProviderPro
                 quantity: draft.quantity,
                 unitPrice: draft.unitPrice,
                 amount: draft.amount,
-                currency: draft.currency || defaultCurrencyRef.current || "",
+                currency: draft.currencySource === "default" ? "" : draft.currency || "",
                 fee: draft.fee,
+                tax: draft.tax,
                 isDraft: true,
                 isValid: draft.status === "valid" || draft.status === "warning",
                 lineNumber: draft.rowIndex + 1,
@@ -632,6 +649,11 @@ export function ImportProvider({ children, initialAccountId }: ImportProviderPro
                       ? "warning"
                       : "valid";
 
+            const backendCurrency = backendResult.currency || undefined;
+            const shouldMarkCurrencyResolved =
+              Boolean(backendCurrency) &&
+              (draft.currencySource !== "default" || backendCurrency !== draft.currency);
+
             return {
               ...draft,
               assetId: backendResult.assetId,
@@ -642,6 +664,14 @@ export function ImportProvider({ children, initialAccountId }: ImportProviderPro
               symbolName: backendResult.symbolName,
               exchangeMic: backendResult.exchangeMic,
               quoteCcy: backendResult.quoteCcy,
+              currency: backendCurrency || draft.currency,
+              currencySource: backendCurrency
+                ? draft.currencySource === "csv" || draft.currencySource === "manual"
+                  ? draft.currencySource
+                  : shouldMarkCurrencyResolved
+                    ? "resolved"
+                    : draft.currencySource
+                : draft.currencySource,
               instrumentType: backendResult.instrumentType,
               providerId: backendResult.providerId,
               providerSymbol: backendResult.providerSymbol,
@@ -723,7 +753,8 @@ export function ImportProvider({ children, initialAccountId }: ImportProviderPro
         if (run !== previewRunRef.current || draftRevisionRef.current > requestedRevision) return;
         dispatch({
           type: "SET_ASSET_PREVIEW_ERROR",
-          payload: error instanceof Error ? error.message : "Failed to preview import assets.",
+          payload:
+            error instanceof Error ? error.message : t("activity:import.errors.previewFailed"),
         });
       } finally {
         if (run === previewRunRef.current) {

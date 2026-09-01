@@ -1,10 +1,14 @@
+import type { Account, Platform } from "@/lib/types";
+import { formatDistanceToNow } from "@/lib/utils";
+import { useLocalizationSettings } from "@wealthfolio/ui";
 import { Badge } from "@wealthfolio/ui/components/ui/badge";
 import { Card, CardContent } from "@wealthfolio/ui/components/ui/card";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
-import { formatDistanceToNow } from "date-fns";
-import type { Account, Platform } from "@/lib/types";
-import type { BrokerSyncState, SyncStatus } from "../types";
+import type { TFunction } from "i18next";
+import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { getBrokerSyncIssueMessage } from "../lib/broker-sync-messages";
+import type { BrokerSyncState, SyncStatus } from "../types";
 
 interface BrokerSyncStateCardProps {
   syncState: BrokerSyncState;
@@ -12,37 +16,43 @@ interface BrokerSyncStateCardProps {
   platform?: Platform;
 }
 
-const statusConfig: Record<
+function buildStatusConfig(t: TFunction): Record<
   SyncStatus,
   {
     label: string;
     variant: "default" | "secondary" | "destructive" | "outline";
     icon: React.ReactNode;
   }
-> = {
-  IDLE: {
-    label: "Up to Date",
-    variant: "default",
-    icon: <Icons.CheckCircle className="h-4 w-4 text-green-500" />,
-  },
-  RUNNING: {
-    label: "Syncing",
-    variant: "outline",
-    icon: <Icons.Spinner className="h-4 w-4 animate-spin text-blue-500" />,
-  },
-  NEEDS_REVIEW: {
-    label: "Needs Review",
-    variant: "destructive",
-    icon: <Icons.AlertTriangle className="h-4 w-4 text-yellow-500" />,
-  },
-  FAILED: {
-    label: "Failed",
-    variant: "destructive",
-    icon: <Icons.AlertCircle className="h-4 w-4 text-red-500" />,
-  },
-};
+> {
+  return {
+    IDLE: {
+      label: t("connect:status.upToDate"),
+      variant: "default",
+      icon: <Icons.CheckCircle className="h-4 w-4 text-green-500" />,
+    },
+    RUNNING: {
+      label: t("connect:status.syncing"),
+      variant: "outline",
+      icon: <Icons.Spinner className="h-4 w-4 animate-spin text-blue-500" />,
+    },
+    NEEDS_REVIEW: {
+      label: t("connect:status.needsReview"),
+      variant: "destructive",
+      icon: <Icons.AlertTriangle className="h-4 w-4 text-yellow-500" />,
+    },
+    FAILED: {
+      label: t("connect:status.failed"),
+      variant: "destructive",
+      icon: <Icons.AlertCircle className="h-4 w-4 text-red-500" />,
+    },
+  };
+}
 
 export function BrokerSyncStateCard({ syncState, account, platform }: BrokerSyncStateCardProps) {
+  const localizationSettings = useLocalizationSettings();
+
+  const { t } = useTranslation();
+  const statusConfig = useMemo(() => buildStatusConfig(t), [t]);
   const config = statusConfig[syncState.syncStatus];
   const accountName = account?.name || syncState.accountId;
 
@@ -55,7 +65,7 @@ export function BrokerSyncStateCard({ syncState, account, platform }: BrokerSync
             {platform?.url ? (
               <img
                 src={`https://logo.clearbit.com/${new URL(platform.url).hostname}`}
-                alt={platform.name || "Platform"}
+                alt={platform.name || t("connect:accounts.platformFallback")}
                 className="h-6 w-6"
                 onError={(e) => {
                   e.currentTarget.style.display = "none";
@@ -73,8 +83,16 @@ export function BrokerSyncStateCard({ syncState, account, platform }: BrokerSync
             </div>
             <p className="text-muted-foreground text-sm">
               {syncState.lastSuccessfulAt
-                ? `Last synced ${formatDistanceToNow(new Date(syncState.lastSuccessfulAt), { addSuffix: true })}`
-                : "Never synced"}
+                ? t("connect:status.lastSynced", {
+                    time: formatDistanceToNow(
+                      new Date(syncState.lastSuccessfulAt),
+                      localizationSettings,
+                      {
+                        addSuffix: true,
+                      },
+                    ),
+                  })
+                : t("connect:status.neverSynced")}
             </p>
           </div>
         </div>

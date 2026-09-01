@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Bar,
   CartesianGrid,
@@ -12,8 +13,8 @@ import {
   YAxis,
 } from "recharts";
 
-import { PrivacyAmount, Skeleton, formatCompactAmount } from "@wealthfolio/ui";
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
+import { PrivacyAmount, Skeleton, useAmountFormatting } from "@wealthfolio/ui";
 
 /** Generic cashflow datum — caller supplies one per bucket (month, week, or day). */
 export interface CashflowPoint {
@@ -50,6 +51,8 @@ interface CashflowDatum {
  * chart would draw via splines).
  */
 export function CashflowDivergingBars({ points, currency, isLoading }: CashflowDivergingBarsProps) {
+  const formatting = useAmountFormatting();
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const data: CashflowDatum[] = useMemo(
     () =>
@@ -103,7 +106,7 @@ export function CashflowDivergingBars({ points, currency, isLoading }: CashflowD
             axisLine={false}
             tickLine={false}
             tickFormatter={(v: number) =>
-              isBalanceHidden ? "••" : formatCompactAmount(Math.abs(v), currency)
+              isBalanceHidden ? "••" : formatting.formatCompactAmount(Math.abs(v), currency)
             }
             tick={{ fontSize: 11, fill: "var(--muted-foreground)" }}
             width={56}
@@ -118,9 +121,14 @@ export function CashflowDivergingBars({ points, currency, isLoading }: CashflowD
               return (
                 <div className="bg-background min-w-[180px] rounded-md border px-3 py-2 text-xs shadow-sm">
                   <div className="text-foreground mb-1 font-semibold">{d.label}</div>
-                  <Row label="Income" value={d.income} currency={currency} tone="success" />
                   <Row
-                    label="Spending"
+                    label={t("spending:cashFlow.income")}
+                    value={d.income}
+                    currency={currency}
+                    tone="success"
+                  />
+                  <Row
+                    label={t("spending:cashFlow.spending")}
                     value={d.spending}
                     currency={currency}
                     tone="destructive"
@@ -128,7 +136,7 @@ export function CashflowDivergingBars({ points, currency, isLoading }: CashflowD
                   />
                   <div className="bg-border my-1.5 h-px" />
                   <Row
-                    label="Net"
+                    label={t("spending:cashFlow.net")}
                     value={d.net}
                     currency={currency}
                     tone={d.net >= 0 ? "success" : "destructive"}
@@ -153,7 +161,7 @@ export function CashflowDivergingBars({ points, currency, isLoading }: CashflowD
               baseline (the bar's visible free end in either direction). */}
           <Bar
             dataKey="income"
-            name="Income"
+            name={t("spending:cashFlow.income")}
             stackId="cashflow"
             fill="var(--success)"
             fillOpacity={0.85}
@@ -163,7 +171,7 @@ export function CashflowDivergingBars({ points, currency, isLoading }: CashflowD
           />
           <Bar
             dataKey="spendingNeg"
-            name="Spending"
+            name={t("spending:cashFlow.spending")}
             stackId="cashflow"
             fill="var(--destructive)"
             fillOpacity={0.8}
@@ -175,7 +183,7 @@ export function CashflowDivergingBars({ points, currency, isLoading }: CashflowD
           <Line
             type="linear"
             dataKey="net"
-            name="Net"
+            name={t("spending:cashFlow.net")}
             stroke="var(--foreground)"
             strokeWidth={1.5}
             dot={{ r: 2.5, fill: "var(--foreground)", strokeWidth: 0 }}

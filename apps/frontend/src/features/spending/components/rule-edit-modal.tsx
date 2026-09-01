@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 import {
   Dialog,
   DialogContent,
@@ -6,7 +8,12 @@ import {
   DialogTitle,
 } from "@wealthfolio/ui";
 
-import { RuleForm, type RuleFormCategoryOption, type RuleFormValues } from "./rule-form";
+import {
+  RuleForm,
+  type RuleFormAccountOption,
+  type RuleFormCategoryOption,
+  type RuleFormValues,
+} from "./rule-form";
 import type { CategorizationRule } from "../types/rule";
 
 interface RuleEditModalProps {
@@ -14,6 +21,7 @@ interface RuleEditModalProps {
   onClose: () => void;
   rule?: CategorizationRule;
   categoryOptions: RuleFormCategoryOption[];
+  accountOptions: RuleFormAccountOption[];
   onSave: (values: RuleFormValues) => void;
   isLoading?: boolean;
 }
@@ -23,21 +31,24 @@ export function RuleEditModal({
   onClose,
   rule,
   categoryOptions,
+  accountOptions,
   onSave,
   isLoading,
 }: RuleEditModalProps) {
+  const { t } = useTranslation();
   return (
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
-          <DialogTitle>{rule ? "Edit Rule" : "Add Rule"}</DialogTitle>
-          <DialogDescription>
-            Auto-tag activities by name pattern. Higher priority rules win when multiple match.
-          </DialogDescription>
+          <DialogTitle>
+            {rule ? t("spending:rules.editTitle") : t("spending:rules.addTitle")}
+          </DialogTitle>
+          <DialogDescription>{t("spending:rules.editDescription")}</DialogDescription>
         </DialogHeader>
         <RuleForm
           rule={rule}
           categoryOptions={categoryOptions}
+          accountOptions={accountOptions}
           onSubmit={onSave}
           onCancel={onClose}
           isLoading={isLoading}

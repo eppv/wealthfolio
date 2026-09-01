@@ -1,12 +1,13 @@
 import { AccountType } from "@/lib/constants";
 import type { Account, AccountScope, PortfolioWithAccounts } from "@/lib/types";
-import { render, screen } from "@testing-library/react";
+import { render, screen } from "@/test/render";
 import userEvent from "@testing-library/user-event";
 import type { InputHTMLAttributes, ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { ActivityMobileFilterSheet } from "./activity-mobile-filter-sheet";
 
-vi.mock("@wealthfolio/ui", () => ({
+vi.mock("@wealthfolio/ui", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@wealthfolio/ui")>()),
   Badge: ({ children }: { children: ReactNode }) => <span>{children}</span>,
   Button: ({
     children,
@@ -93,7 +94,7 @@ describe("ActivityMobileFilterSheet", () => {
   it("preserves portfolio scope when applying without changing account selection", async () => {
     const user = userEvent.setup();
     const accountScope: AccountScope = { type: "portfolio", portfolioId: "pf_1" };
-    const setAccountScope = vi.fn();
+    const setFilters = vi.fn();
 
     render(
       <ActivityMobileFilterSheet
@@ -102,16 +103,14 @@ describe("ActivityMobileFilterSheet", () => {
         accountScope={accountScope}
         accounts={accounts}
         portfolios={portfolios}
-        setAccountScope={setAccountScope}
         selectedActivityTypes={[]}
-        setSelectedActivityTypes={vi.fn()}
         dateRange={undefined}
-        setDateRange={vi.fn()}
+        setFilters={setFilters}
       />,
     );
 
     await user.click(screen.getByRole("button", { name: "Done" }));
 
-    expect(setAccountScope).toHaveBeenCalledWith(accountScope);
+    expect(setFilters).toHaveBeenCalledWith([], undefined, accountScope);
   });
 });

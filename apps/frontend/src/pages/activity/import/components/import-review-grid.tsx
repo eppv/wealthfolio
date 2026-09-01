@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import type { ColumnDef, RowSelectionState } from "@tanstack/react-table";
 import {
   DataGrid,
@@ -11,14 +13,13 @@ import {
   type SymbolSearchResult,
 } from "@wealthfolio/ui";
 
+import { ActivityType, INSTRUMENT_TYPE_OPTIONS, SUBTYPES_BY_ACTIVITY_TYPE } from "@/lib/constants";
 import {
-  ActivityType,
-  ActivityTypeNames,
-  INSTRUMENT_TYPE_OPTIONS,
-  SUBTYPES_BY_ACTIVITY_TYPE,
-  SUBTYPE_DISPLAY_NAMES,
-} from "@/lib/constants";
-import { needsImportAssetResolution } from "@/lib/activity-utils";
+  localizeActivitySubtypeName,
+  localizeActivityTypeName,
+  needsImportAssetResolution,
+  supportsPerformanceBoundary,
+} from "@/lib/activity-utils";
 import { quoteModeFromSearchResult } from "@/lib/asset-utils";
 import { ActivityTypeBadge } from "../../components/activity-type-badge";
 import type { DraftActivity, DraftActivityStatus } from "../context";
@@ -31,9 +32,6 @@ import {
   DEFAULT_ACTIVITY_IMPORT_PROFILE,
   type ActivityImportProfile,
 } from "../utils/activity-import-profile";
-
-const UNIT_PRICE_HELP_TEXT =
-  "For buys and sells, enter the trade price. For staking rewards and in-kind dividends, enter the fair market value per unit at receipt; it sets income amount and cost basis.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -60,32 +58,12 @@ export interface ImportReviewGridProps {
 // Status Display Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface StatusConfig {
-  label: string;
-  bgClassName: string;
-}
-
-const STATUS_CONFIG: Record<DraftActivityStatus, StatusConfig> = {
-  valid: {
-    label: "Valid",
-    bgClassName: "bg-green-100 dark:bg-green-900/30",
-  },
-  warning: {
-    label: "Warning",
-    bgClassName: "bg-yellow-100 dark:bg-yellow-900/30",
-  },
-  error: {
-    label: "Error",
-    bgClassName: "bg-red-100 dark:bg-red-900/30",
-  },
-  skipped: {
-    label: "Skipped",
-    bgClassName: "bg-muted/50",
-  },
-  duplicate: {
-    label: "Duplicate",
-    bgClassName: "bg-blue-100 dark:bg-blue-900/30",
-  },
+const STATUS_LABEL_KEY: Record<DraftActivityStatus, string> = {
+  valid: "activity:import.status.valid",
+  warning: "activity:import.status.warning",
+  error: "activity:import.status.error",
+  skipped: "activity:import.status.skipped",
+  duplicate: "activity:import.status.duplicate",
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +71,7 @@ const STATUS_CONFIG: Record<DraftActivityStatus, StatusConfig> = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getStatusTitle(
+  t: TFunction,
   status: DraftActivityStatus,
   skipReason?: string,
   duplicateOfId?: string,
@@ -103,9 +82,9 @@ function getStatusTitle(
   if (status === "valid") return undefined;
   if (status === "skipped" && skipReason) return skipReason;
   if (typeof duplicateOfLineNumber === "number") {
-    return `Duplicate of line ${duplicateOfLineNumber} in this import batch`;
+    return t("activity:import.status.duplicateOfLine", { line: duplicateOfLineNumber });
   }
-  if (duplicateOfId) return "Duplicate of an existing activity in your portfolio";
+  if (duplicateOfId) return t("activity:import.status.duplicateExisting");
   if (errors) {
     const errorDetails = Object.entries(errors)
       .flatMap(([field, msgs]) => msgs.map((msg) => `${field}: ${msg}`))
@@ -124,7 +103,7 @@ function getStatusTitle(
       return warningDetails;
     }
   }
-  return STATUS_CONFIG[status].label;
+  return t(STATUS_LABEL_KEY[status]);
 }
 
 const STATUS_DOT_COLOR: Record<DraftActivityStatus, string> = {
@@ -154,6 +133,7 @@ function useImportReviewColumns({
   onCreateCustomAsset,
   importProfile,
 }: UseImportReviewColumnsOptions): ColumnDef<DraftActivity>[] {
+  const { t } = useTranslation();
   const accountOptions = useMemo(
     () =>
       accounts.map((account) => ({
@@ -167,23 +147,26 @@ function useImportReviewColumns({
     () =>
       importProfile.allowedActivityTypes.map((type) => ({
         value: type,
-        label: ActivityTypeNames[type],
+        label: localizeActivityTypeName(t, type),
       })),
-    [importProfile.allowedActivityTypes],
+    [importProfile.allowedActivityTypes, t],
   );
 
   // Dynamic subtype options based on activity type
-  const getSubtypeOptions = useCallback((rowData: unknown) => {
-    const draft = rowData as DraftActivity;
-    const activityType = draft.activityType?.toUpperCase();
-    if (!activityType) return [];
+  const getSubtypeOptions = useCallback(
+    (rowData: unknown) => {
+      const draft = rowData as DraftActivity;
+      const activityType = draft.activityType?.toUpperCase();
+      if (!activityType) return [];
 
-    const allowedSubtypes = SUBTYPES_BY_ACTIVITY_TYPE[activityType] || [];
-    return allowedSubtypes.map((subtype) => ({
-      value: subtype,
-      label: SUBTYPE_DISPLAY_NAMES[subtype] || subtype,
-    }));
-  }, []);
+      const allowedSubtypes = SUBTYPES_BY_ACTIVITY_TYPE[activityType] || [];
+      return allowedSubtypes.map((subtype) => ({
+        value: subtype,
+        label: localizeActivitySubtypeName(t, subtype),
+      }));
+    },
+    [t],
+  );
 
   return useMemo<ColumnDef<DraftActivity>[]>(() => {
     const visibleDataColumns = new Set<string>(importProfile.reviewColumns);
@@ -199,7 +182,7 @@ function useImportReviewColumns({
               table.getIsAllRowsSelected() || (table.getIsSomeRowsSelected() && "indeterminate")
             }
             onCheckedChange={(checked) => table.toggleAllRowsSelected(Boolean(checked))}
-            aria-label="Select all rows"
+            aria-label={t("activity:import.columns.selectAllRows")}
           />
         ),
         cell: ({ row }) => (
@@ -207,7 +190,7 @@ function useImportReviewColumns({
             disabled={!row.getCanSelect()}
             checked={row.getIsSelected()}
             onCheckedChange={(checked) => row.toggleSelected(Boolean(checked))}
-            aria-label="Select row"
+            aria-label={t("activity:import.columns.selectRow")}
           />
         ),
         size: 40,
@@ -235,8 +218,9 @@ function useImportReviewColumns({
           } = row.original;
           const isForcedDuplicate = status === "duplicate" && forceImport;
           const title = isForcedDuplicate
-            ? "Will be imported – overrides duplicate detection"
+            ? t("activity:import.status.forcedDuplicate")
             : getStatusTitle(
+                t,
                 status,
                 skipReason,
                 duplicateOfId,
@@ -285,7 +269,7 @@ function useImportReviewColumns({
       {
         id: "activityDate",
         accessorKey: "activityDate",
-        header: "Date & Time",
+        header: t("activity:import.columns.dateTime"),
         size: 180,
         meta: { cell: { variant: "datetime" } },
       },
@@ -293,7 +277,7 @@ function useImportReviewColumns({
       {
         id: "accountId",
         accessorKey: "accountId",
-        header: "Account",
+        header: t("activity:import.columns.account"),
         size: 180,
         meta: { cell: { variant: "select", options: accountOptions } },
       },
@@ -303,7 +287,7 @@ function useImportReviewColumns({
       {
         id: "activityType",
         accessorKey: "activityType",
-        header: "Type",
+        header: t("activity:import.columns.type"),
         size: 150,
         enablePinning: false,
         meta: {
@@ -324,7 +308,7 @@ function useImportReviewColumns({
       {
         id: "subtype",
         accessorKey: "subtype",
-        header: "Subtype",
+        header: t("activity:import.columns.subtype"),
         size: 180,
         enableSorting: false,
         enableHiding: true,
@@ -334,29 +318,24 @@ function useImportReviewColumns({
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             options: getSubtypeOptions as any,
             allowEmpty: true,
-            emptyLabel: "None",
+            emptyLabel: t("activity:import.columns.none"),
           },
         },
       },
-      // 7. External (checkbox for TRANSFER_IN/TRANSFER_OUT only)
+      // 7. Explicit performance boundary for transfers and credits
       {
         id: "isExternal",
         accessorKey: "isExternal",
-        header: "External",
+        header: t("activity:import.columns.external"),
         size: 80,
         enableSorting: false,
         enableHiding: true,
         meta: {
           cell: {
             variant: "checkbox",
-            // Only enabled for transfer types
             isDisabled: (rowData: unknown) => {
               const row = rowData as DraftActivity;
-              const activityType = row.activityType?.toUpperCase();
-              return (
-                activityType !== ActivityType.TRANSFER_IN &&
-                activityType !== ActivityType.TRANSFER_OUT
-              );
+              return !supportsPerformanceBoundary(row.activityType);
             },
           },
         },
@@ -365,7 +344,7 @@ function useImportReviewColumns({
       {
         id: "symbol",
         accessorKey: "symbol",
-        header: "Symbol",
+        header: t("activity:import.columns.symbol"),
         size: 140,
         meta: {
           cell: {
@@ -384,7 +363,7 @@ function useImportReviewColumns({
       {
         id: "instrumentType",
         accessorKey: "instrumentType",
-        header: "Instrument",
+        header: t("activity:import.columns.instrument"),
         size: 120,
         enableSorting: false,
         enableHiding: true,
@@ -393,7 +372,7 @@ function useImportReviewColumns({
             variant: "select",
             options: [...INSTRUMENT_TYPE_OPTIONS],
             allowEmpty: true,
-            emptyLabel: "Auto",
+            emptyLabel: t("activity:import.columns.auto"),
           },
         },
       },
@@ -403,7 +382,7 @@ function useImportReviewColumns({
       {
         id: "quantity",
         accessorKey: "quantity",
-        header: "Quantity",
+        header: t("activity:import.columns.quantity"),
         size: 120,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
@@ -412,11 +391,11 @@ function useImportReviewColumns({
       {
         id: "unitPrice",
         accessorKey: "unitPrice",
-        header: "Price",
+        header: t("activity:import.columns.price"),
         size: 120,
         enableSorting: false,
         meta: {
-          helpText: UNIT_PRICE_HELP_TEXT,
+          helpText: t("activity:import.columns.unitPriceHelp"),
           cell: { variant: "number", step: 0.000001, valueType: "string" },
         },
       },
@@ -424,7 +403,7 @@ function useImportReviewColumns({
       {
         id: "amount",
         accessorKey: "amount",
-        header: "Amount",
+        header: t("activity:import.columns.amount"),
         size: 120,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
@@ -433,7 +412,7 @@ function useImportReviewColumns({
       {
         id: "currency",
         accessorKey: "currency",
-        header: "Currency",
+        header: t("activity:import.columns.currency"),
         size: 110,
         enableSorting: false,
         meta: { cell: { variant: "currency" } },
@@ -442,16 +421,25 @@ function useImportReviewColumns({
       {
         id: "fee",
         accessorKey: "fee",
-        header: "Fee",
+        header: t("activity:import.columns.fee"),
         size: 100,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
       },
-      // 13. FX Rate
+      // 13. Tax
+      {
+        id: "tax",
+        accessorKey: "tax",
+        header: t("activity:import.columns.tax"),
+        size: 100,
+        enableSorting: false,
+        meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
+      },
+      // 14. FX Rate
       {
         id: "fxRate",
         accessorKey: "fxRate",
-        header: "FX Rate",
+        header: t("activity:import.columns.fxRate"),
         size: 100,
         enableSorting: false,
         meta: { cell: { variant: "number", step: 0.000001, valueType: "string" } },
@@ -462,7 +450,7 @@ function useImportReviewColumns({
       {
         id: "comment",
         accessorKey: "comment",
-        header: "Comment",
+        header: t("activity:import.columns.comment"),
         size: 260,
         enableSorting: false,
         meta: { cell: { variant: "long-text" } },
@@ -483,6 +471,7 @@ function useImportReviewColumns({
     onSymbolSearch,
     onSymbolSelect,
     onCreateCustomAsset,
+    t,
   ]);
 }
 
@@ -619,6 +608,7 @@ export function ImportReviewGrid({
       onDraftUpdate(rowIndex, {
         symbol: canonicalSymbol,
         currency,
+        currencySource: result.currency ? "resolved" : draft.currencySource,
         exchangeMic: canonicalExchangeMic,
         quoteCcy: result.currency ?? draft.quoteCcy,
         instrumentType: result.quoteType,
@@ -655,6 +645,7 @@ export function ImportReviewGrid({
       onDraftUpdate(rowIndex, {
         symbol: canonicalSymbol,
         currency,
+        currencySource: result.currency ? "resolved" : draft.currencySource,
         exchangeMic: canonicalExchangeMic,
         quoteCcy: result.currency ?? draft.quoteCcy,
         instrumentType: result.quoteType,
@@ -713,6 +704,7 @@ export function ImportReviewGrid({
             "amount",
             "currency",
             "fee",
+            "tax",
             "fxRate",
             "subtype",
             "isExternal",

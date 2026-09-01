@@ -17,8 +17,11 @@ export type { EventCallback, UnlistenFn, RunEnv, Logger } from "../types";
 export { RunEnvs } from "../types";
 export type {
   AddonFile,
+  AddonAsset,
   AddonInstallResult,
   AddonManifest,
+  AddonNetworkRequest,
+  AddonNetworkResponse,
   AddonUpdateCheckResult,
   AddonUpdateInfo,
   AddonValidationResult,
@@ -47,6 +50,14 @@ export type {
   BackendSyncSnapshotUploadResult,
   EphemeralKeyPair,
   DataExportResult,
+  McpServerStatus,
+  AgentAccessStatus,
+  AgentAccessToken,
+  CreateAgentAccessTokenInput,
+  CreatedAgentAccessToken,
+  AgentAuditEntry,
+  AgentAuditPage,
+  AgentAuditQuery,
 } from "../types";
 
 // Re-export AI types from features/ai-assistant
@@ -109,6 +120,9 @@ export * from "../shared/exchange-rates";
 // Secrets Commands
 export * from "../shared/secrets";
 
+// Addon Network Commands
+export * from "../shared/addon-network";
+
 // Connect Commands (Broker + Device Sync + Auth)
 export * from "../shared/connect";
 
@@ -159,6 +173,7 @@ export {
   toggleAddon,
   uninstallAddon,
   loadAddonForRuntime,
+  loadAddonAsset,
   getEnabledAddonsOnStartup,
   getInstalledAddons,
   loadAddon,
@@ -170,11 +185,31 @@ export {
   updateAddon,
   downloadAddonForReview,
   installFromStaging,
+  updateAddonNetworkApprovals,
   clearAddonStaging,
   getAddonRatings,
   submitAddonRating,
   fetchAddonStoreListings,
+  getAddonStorageItem,
+  setAddonStorageItem,
+  deleteAddonStorageItem,
 } from "./addons";
+
+// Agent Access Commands (embedded MCP server; PATs are web-only stubs)
+export {
+  getMcpStatus,
+  setMcpEnabled,
+  setMcpAutoStart,
+  startMcp,
+  stopMcp,
+  setMcpAuditEnabled,
+  listAgentAuditLog,
+  purgeAgentAuditLog,
+  getAgentAccessStatus,
+  listAgentAccessTokens,
+  createAgentAccessToken,
+  deleteAgentAccessToken,
+} from "./agent-access";
 
 // AI Streaming (Tauri Channel-based implementation)
 export { streamAiChat } from "./ai-streaming";
@@ -188,6 +223,7 @@ export {
   listenPortfolioUpdateComplete,
   listenDatabaseRestored,
   listenPortfolioUpdateError,
+  listenAssetClassificationsChanged,
   listenMarketSyncComplete,
   listenMarketSyncStart,
   listenMarketSyncError,
@@ -196,6 +232,7 @@ export {
   listenBrokerSyncError,
   listenNavigateToRoute,
   listenDeepLink,
+  getCurrentDeepLinks,
 } from "./events";
 
 // File Dialogs (Tauri file dialogs)

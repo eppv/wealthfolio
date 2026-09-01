@@ -1,6 +1,6 @@
 import { getTransferPairForActivity, logger } from "@/adapters";
 import { buildAssetResolutionInput } from "@/lib/asset-resolution-input";
-import { ActivityType } from "@/lib/constants";
+import { ActivityStatus, ActivityType } from "@/lib/constants";
 import { generateId } from "@/lib/id";
 import type { ActivityCreate, ActivityDetails, ActivityUpdate } from "@/lib/types";
 import { useCallback, useMemo } from "react";
@@ -342,6 +342,16 @@ export function useActivityForm({
 
         if (!submitData.currency?.trim() && account?.currency) {
           submitData.currency = account.currency;
+        }
+
+        // A form save is a review: every field - including the total, typed
+        // or calculated - is on screen when the user submits, so every form
+        // submission attests. Drafts are the exception: they stay in their
+        // review queue until explicitly approved and posted.
+        if (isEditing && activity?.status === ActivityStatus.DRAFT) {
+          delete (submitData as { needsReview?: boolean }).needsReview;
+        } else {
+          (submitData as { needsReview?: boolean }).needsReview = false;
         }
 
         if (isEditing && activity?.id) {

@@ -1,4 +1,4 @@
-import { render } from "@testing-library/react";
+import { render } from "@/test/render";
 import { describe, expect, it } from "vitest";
 
 import type { DriftRow } from "@/lib/types";
@@ -19,6 +19,7 @@ function row(
     currentValue: 0,
     targetValue: 0,
     valueDelta: 0,
+    effectiveBandBps: 0,
     status: "in_band",
     isRequired: true,
     isZeroCurrent: false,

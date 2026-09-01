@@ -3,8 +3,9 @@
 #[cfg(test)]
 mod tests {
     use crate::assets::{
-        canonicalize_market_identity, resolve_quote_ccy_precedence, Asset, AssetKind,
-        InstrumentType, OptionSpec, QuoteCcyResolutionSource, QuoteMode,
+        canonicalize_market_identity, resolve_import_quote_ccy_precedence,
+        resolve_quote_ccy_precedence, Asset, AssetKind, InstrumentType, OptionSpec,
+        QuoteCcyResolutionSource, QuoteMode,
     };
     use chrono::NaiveDateTime;
     use rust_decimal_macros::dec;
@@ -217,6 +218,49 @@ mod tests {
         assert!(json.contains("\"right\":\"CALL\""));
     }
 
+    #[test]
+    fn contract_multiplier_uses_asset_economic_metadata() {
+        let equity = Asset {
+            instrument_type: Some(InstrumentType::Equity),
+            ..Default::default()
+        };
+        let bare_option = Asset {
+            instrument_type: Some(InstrumentType::Option),
+            ..Default::default()
+        };
+        let mini_option = Asset {
+            instrument_type: Some(InstrumentType::Option),
+            metadata: Some(json!({
+                "option": {
+                    "underlyingAssetId": "AAPL",
+                    "expiration": "2026-12-18",
+                    "right": "CALL",
+                    "strike": "150",
+                    "multiplier": "10"
+                }
+            })),
+            ..Default::default()
+        };
+        let future = Asset {
+            instrument_type: Some(InstrumentType::Equity),
+            metadata: Some(json!({ "contractMultiplier": "50" })),
+            ..Default::default()
+        };
+
+        let bare_bond = Asset {
+            instrument_type: Some(InstrumentType::Bond),
+            ..Default::default()
+        };
+
+        assert_eq!(equity.contract_multiplier(), dec!(1));
+        assert_eq!(bare_option.contract_multiplier(), dec!(100));
+        assert_eq!(mini_option.contract_multiplier(), dec!(10));
+        assert_eq!(future.contract_multiplier(), dec!(50));
+        // Bonds default to 1 - provider quotes are fraction-of-par;
+        // percent-of-par is opt-in via explicit contractMultiplier metadata.
+        assert_eq!(bare_bond.contract_multiplier(), dec!(1));
+    }
+
     // Test InstrumentType
     #[test]
     fn test_instrument_type_db_roundtrip() {
@@ -394,6 +438,74 @@ mod tests {
         assert_eq!(
             resolved,
             Some(("GBP".to_string(), QuoteCcyResolutionSource::ProviderQuote))
+        );
+    }
+
+    #[test]
+    fn test_resolve_import_quote_ccy_precedence_uses_activity_before_provider() {
+        let resolved = resolve_import_quote_ccy_precedence(
+            None,
+            None,
+            Some("USD"),
+            Some("GBp"),
+            Some("GBP"),
+            Some("CAD"),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(("USD".to_string(), QuoteCcyResolutionSource::ExplicitInput))
+        );
+    }
+
+    #[test]
+    fn test_resolve_import_quote_ccy_precedence_keeps_provider_quote_unit_for_activity_major() {
+        let resolved = resolve_import_quote_ccy_precedence(
+            None,
+            None,
+            Some("GBP"),
+            Some("GBp"),
+            Some("GBP"),
+            Some("CAD"),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(("GBp".to_string(), QuoteCcyResolutionSource::ProviderQuote))
+        );
+    }
+
+    #[test]
+    fn test_resolve_import_quote_ccy_precedence_uses_existing_before_activity() {
+        let resolved = resolve_import_quote_ccy_precedence(
+            None,
+            Some("EUR"),
+            Some("USD"),
+            Some("GBp"),
+            Some("GBP"),
+            Some("CAD"),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(("EUR".to_string(), QuoteCcyResolutionSource::ExistingAsset))
+        );
+    }
+
+    #[test]
+    fn test_resolve_import_quote_ccy_precedence_uses_activity_before_mic_without_provider() {
+        let resolved = resolve_import_quote_ccy_precedence(
+            None,
+            None,
+            Some("CAD"),
+            None,
+            Some("GBp"),
+            Some("USD"),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(("CAD".to_string(), QuoteCcyResolutionSource::ExplicitInput))
         );
     }
 

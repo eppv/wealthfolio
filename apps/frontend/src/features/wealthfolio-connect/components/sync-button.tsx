@@ -1,10 +1,12 @@
+import { formatDistanceToNow } from "@/lib/utils";
+import { useLocalizationSettings } from "@wealthfolio/ui";
 import { Button } from "@wealthfolio/ui/components/ui/button";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@wealthfolio/ui/components/ui/tooltip";
-import { formatDistanceToNow } from "date-fns";
-import { useWealthfolioConnect } from "../providers/wealthfolio-connect-provider";
-import { hasBrokerSync } from "../lib/plan-capabilities";
+import { useTranslation } from "react-i18next";
 import { useAggregatedSyncStatus, useSyncBrokerData } from "../hooks";
+import { hasBrokerSync } from "../lib/plan-capabilities";
+import { useWealthfolioConnect } from "../providers/wealthfolio-connect-provider";
 import type { AggregatedSyncStatus } from "../types";
 
 interface SyncButtonProps {
@@ -29,6 +31,9 @@ const statusColors: Record<AggregatedSyncStatus, string> = {
  * Only visible when Connect is enabled and user has an active subscription.
  */
 export function SyncButton({ className, showLabel = false, size = "icon" }: SyncButtonProps) {
+  const localizationSettings = useLocalizationSettings();
+
+  const { t } = useTranslation();
   const { isEnabled, isConnected, userInfo } = useWealthfolioConnect();
   const { status, lastSyncTime } = useAggregatedSyncStatus();
   const { mutate: syncBrokerData, isPending: isSyncing } = useSyncBrokerData();
@@ -42,8 +47,12 @@ export function SyncButton({ className, showLabel = false, size = "icon" }: Sync
   const colorClass = statusColors[status];
 
   const tooltipContent = lastSyncTime
-    ? `Last synced ${formatDistanceToNow(new Date(lastSyncTime), { addSuffix: true })}`
-    : "Never synced";
+    ? t("connect:status.lastSynced", {
+        time: formatDistanceToNow(new Date(lastSyncTime), localizationSettings, {
+          addSuffix: true,
+        }),
+      })
+    : t("connect:status.neverSynced");
 
   return (
     <Tooltip>
@@ -60,11 +69,15 @@ export function SyncButton({ className, showLabel = false, size = "icon" }: Sync
           ) : (
             <Icons.RefreshCw className={`h-4 w-4 ${colorClass}`} />
           )}
-          {showLabel && <span className="ml-2">{isRunning ? "Syncing..." : "Sync"}</span>}
+          {showLabel && (
+            <span className="ml-2">
+              {isRunning ? t("connect:sync.syncingShort") : t("connect:sync.sync")}
+            </span>
+          )}
         </Button>
       </TooltipTrigger>
       <TooltipContent>
-        <p>{isRunning ? "Syncing..." : tooltipContent}</p>
+        <p>{isRunning ? t("connect:sync.syncingShort") : tooltipContent}</p>
       </TooltipContent>
     </Tooltip>
   );

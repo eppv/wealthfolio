@@ -26,16 +26,19 @@ pub use alternative_assets_traits::{
     AlternativeAssetRepositoryTrait, AlternativeAssetServiceTrait,
 };
 pub use asset_id::{
-    parse_crypto_pair_symbol, parse_symbol_with_exchange_suffix, symbol_resolution_candidates,
-    unknown_dotted_suffix_fallback,
+    parse_crypto_pair_symbol, parse_symbol_with_exchange_suffix, parse_symbol_with_known_exchange,
+    symbol_resolution_candidates, unknown_dotted_suffix_fallback,
 };
 pub(crate) use asset_resolution::asset_provider_alias_symbols;
 pub use asset_resolution::{AssetResolutionInput, AssetResolutionOutput};
 pub use assets_model::{
     build_asset_metadata, build_option_metadata, canonicalize_market_identity,
-    normalize_quote_ccy_code, resolve_quote_ccy_precedence, Asset, AssetKind, AssetMetadata,
-    AssetSpec, BondSpec, Country, EnsureAssetsResult, InstrumentId, InstrumentType, NewAsset,
-    OptionSpec, ProviderProfile, QuoteCcyResolutionSource, QuoteMode, Sector, UpdateAssetProfile,
+    contract_multiplier_from_asset_metadata, instrument_default_multiplier,
+    normalize_quote_ccy_code, resolve_import_quote_ccy_precedence, resolve_quote_ccy_precedence,
+    Asset, AssetKind, AssetMetadata, AssetProfile, AssetSpec, BondSpec, Country,
+    EnsureAssetsResult, InstrumentId, InstrumentType, NewAsset, OptionSpec, ProviderProfile,
+    QuoteCcyResolutionSource, QuoteMode, Sector, UpdateAssetProfile,
+    CONTRACT_MULTIPLIER_METADATA_KEY,
 };
 pub use assets_service::AssetService;
 pub use assets_traits::{AssetRepositoryTrait, AssetServiceTrait};

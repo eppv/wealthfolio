@@ -5,13 +5,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
-use rust_decimal::Decimal;
+use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::asset_id::{parse_crypto_pair_symbol, parse_symbol_with_exchange_suffix};
+use super::asset_id::{parse_crypto_pair_symbol, parse_symbol_with_known_exchange};
 use crate::errors::Result;
 use crate::errors::ValidationError;
+use crate::fx::currency::normalize_currency_code;
 use crate::Error;
 use wealthfolio_market_data::mic_to_currency;
 
@@ -60,6 +61,31 @@ pub enum QuoteMode {
     #[default]
     Market, // Priced via market data providers
     Manual, // User-entered quotes only
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetProfile {
+    #[serde(flatten)]
+    pub asset: Asset,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valuation_market_price: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valuation_market_currency: Option<String>,
+}
+
+impl AssetProfile {
+    pub fn new(
+        asset: Asset,
+        valuation_market_price: Option<Decimal>,
+        valuation_market_currency: Option<String>,
+    ) -> Self {
+        Self {
+            asset,
+            valuation_market_price,
+            valuation_market_currency,
+        }
+    }
 }
 
 impl QuoteMode {
@@ -125,6 +151,65 @@ pub struct OptionSpec {
     pub strike: Decimal,
     pub multiplier: Decimal,
     pub occ_symbol: Option<String>,
+}
+
+/// Top-level asset metadata key for instruments whose value is scaled per contract.
+pub const CONTRACT_MULTIPLIER_METADATA_KEY: &str = "contractMultiplier";
+
+/// Instrument-level default multiplier for assets without an explicit
+/// override. Bonds deliberately default to 1: market-data providers store
+/// bond quotes as a FRACTION of par (percent quotes are divided by 100 at
+/// the provider layer), so a percent-of-par default would double-apply the
+/// /100 and value every existing bond position at 1/100. Percent-of-par
+/// pricing is opt-in per asset via explicit `contractMultiplier` metadata.
+pub fn instrument_default_multiplier(is_option: bool, is_mini_option: bool) -> Decimal {
+    if is_option {
+        if is_mini_option {
+            Decimal::from(10)
+        } else {
+            Decimal::from(100)
+        }
+    } else {
+        Decimal::ONE
+    }
+}
+
+fn explicit_contract_multiplier_from_asset_metadata(
+    instrument_type: Option<&InstrumentType>,
+    metadata: Option<&Value>,
+) -> Option<Decimal> {
+    (instrument_type == Some(&InstrumentType::Option))
+        .then(|| {
+            metadata
+                .and_then(|value| value.get("option"))
+                .and_then(|value| serde_json::from_value::<OptionSpec>(value.clone()).ok())
+                .map(|spec| spec.multiplier)
+        })
+        .flatten()
+        .or_else(|| {
+            metadata
+                .and_then(|value| value.get(CONTRACT_MULTIPLIER_METADATA_KEY))
+                .and_then(|value| {
+                    value
+                        .as_f64()
+                        .and_then(Decimal::from_f64)
+                        .or_else(|| value.as_str().and_then(|raw| raw.parse::<Decimal>().ok()))
+                })
+                .filter(|multiplier| *multiplier > Decimal::ZERO)
+        })
+}
+
+/// Resolves the effective multiplier directly from persisted asset fields.
+///
+/// This is the field-level equivalent of [`Asset::contract_multiplier`] for
+/// projections that already joined the asset but do not need the full model.
+pub fn contract_multiplier_from_asset_metadata(
+    instrument_type: Option<&InstrumentType>,
+    metadata: Option<&Value>,
+) -> Decimal {
+    let is_option = instrument_type == Some(&InstrumentType::Option);
+    explicit_contract_multiplier_from_asset_metadata(instrument_type, metadata)
+        .unwrap_or_else(|| instrument_default_multiplier(is_option, false))
 }
 
 /// Bond specification stored in Asset.metadata["bond"]
@@ -362,6 +447,15 @@ impl Asset {
         self.instrument_type == Some(InstrumentType::Option)
     }
 
+    /// Returns true for stock/ETF/fund-style investment assets.
+    ///
+    /// Legacy assets may not have `instrument_type` populated, so untyped
+    /// investment assets are treated as equity-like for lot accounting.
+    pub fn is_equity_like(&self) -> bool {
+        matches!(self.kind, AssetKind::Investment)
+            && matches!(self.instrument_type, None | Some(InstrumentType::Equity))
+    }
+
     /// Returns true if this asset is a bond / fixed-income instrument.
     pub fn is_bond(&self) -> bool {
         self.instrument_type == Some(InstrumentType::Bond)
@@ -375,16 +469,20 @@ impl Asset {
     /// Returns the contract multiplier for this asset.
     ///
     /// For options, this is the number of shares per contract (typically 100).
-    /// For all other instruments it is 1.
+    /// Other contract instruments can provide an explicit multiplier in asset metadata.
     pub fn contract_multiplier(&self) -> Decimal {
-        if let Some(spec) = self.option_spec() {
-            spec.multiplier
-        } else if self.is_option() {
-            // Option without metadata — default to standard 100 multiplier
-            Decimal::from(100)
-        } else {
-            Decimal::ONE
-        }
+        contract_multiplier_from_asset_metadata(
+            self.instrument_type.as_ref(),
+            self.metadata.as_ref(),
+        )
+    }
+
+    /// Returns only a multiplier explicitly carried by the asset.
+    pub fn explicit_contract_multiplier(&self) -> Option<Decimal> {
+        explicit_contract_multiplier_from_asset_metadata(
+            self.instrument_type.as_ref(),
+            self.metadata.as_ref(),
+        )
     }
 
     /// Get option metadata if this is an option (instrument_type = OPTION)
@@ -903,6 +1001,55 @@ pub fn resolve_quote_ccy_precedence(
         .map(|ccy| (ccy, QuoteCcyResolutionSource::TerminalFallback))
 }
 
+pub fn resolve_import_quote_ccy_precedence(
+    explicit_quote_ccy: Option<&str>,
+    existing_asset_quote_ccy: Option<&str>,
+    activity_quote_ccy: Option<&str>,
+    provider_quote_ccy: Option<&str>,
+    mic_fallback_quote_ccy: Option<&str>,
+    terminal_fallback_quote_ccy: Option<&str>,
+) -> Option<(String, QuoteCcyResolutionSource)> {
+    if let Some(ccy) = normalize_quote_ccy(explicit_quote_ccy) {
+        return Some((ccy, QuoteCcyResolutionSource::ExplicitInput));
+    }
+    if let Some(ccy) = normalize_quote_ccy(existing_asset_quote_ccy) {
+        return Some((ccy, QuoteCcyResolutionSource::ExistingAsset));
+    }
+    let activity_ccy = normalize_quote_ccy(activity_quote_ccy);
+    let provider_ccy = normalize_quote_ccy(provider_quote_ccy);
+    if let Some(provider) = provider_ccy.as_deref() {
+        if activity_ccy
+            .as_deref()
+            .is_some_and(|activity| provider_quote_unit_matches_activity_major(provider, activity))
+        {
+            return Some((
+                provider.to_string(),
+                QuoteCcyResolutionSource::ProviderQuote,
+            ));
+        }
+        if let Some(activity) = activity_ccy {
+            return Some((activity, QuoteCcyResolutionSource::ExplicitInput));
+        }
+        return Some((
+            provider.to_string(),
+            QuoteCcyResolutionSource::ProviderQuote,
+        ));
+    }
+    if let Some(ccy) = activity_ccy {
+        return Some((ccy, QuoteCcyResolutionSource::ExplicitInput));
+    }
+    if let Some(ccy) = normalize_quote_ccy(mic_fallback_quote_ccy) {
+        return Some((ccy, QuoteCcyResolutionSource::MicFallback));
+    }
+    normalize_quote_ccy(terminal_fallback_quote_ccy)
+        .map(|ccy| (ccy, QuoteCcyResolutionSource::TerminalFallback))
+}
+
+fn provider_quote_unit_matches_activity_major(provider_quote: &str, activity_quote: &str) -> bool {
+    let provider_major = normalize_currency_code(provider_quote);
+    provider_major != provider_quote && provider_major.eq_ignore_ascii_case(activity_quote)
+}
+
 fn parse_fx_symbol_parts(symbol: &str) -> Option<(String, String)> {
     let trimmed = symbol.trim().to_uppercase();
     let cleaned = trimmed.strip_suffix("=X").unwrap_or(&trimmed);
@@ -945,7 +1092,10 @@ pub fn canonicalize_market_identity(
         | Some(InstrumentType::Option)
         | Some(InstrumentType::Metal) => {
             if let Some(raw) = instrument_symbol.as_deref() {
-                let (base, suffix_mic) = parse_symbol_with_exchange_suffix(raw);
+                // The known venue decides whether a trailing `.X` is an exchange
+                // suffix or part of the ticker — see `parse_symbol_with_known_exchange`.
+                let (base, suffix_mic) =
+                    parse_symbol_with_known_exchange(raw, instrument_exchange_mic.as_deref());
                 instrument_symbol = Some(base.to_uppercase());
                 if instrument_exchange_mic.is_none() {
                     instrument_exchange_mic = suffix_mic.map(str::to_string);
@@ -1040,6 +1190,23 @@ pub fn canonicalize_market_identity(
 }
 
 impl UpdateAssetProfile {
+    /// Builds a repository update that changes only metadata while preserving asset identity.
+    pub fn metadata_only(asset: &Asset, metadata: Value) -> Self {
+        Self {
+            name: asset.name.clone(),
+            display_code: asset.display_code.clone(),
+            notes: asset.notes.clone().unwrap_or_default(),
+            kind: Some(asset.kind.clone()),
+            quote_mode: Some(asset.quote_mode),
+            quote_ccy: Some(asset.quote_ccy.clone()),
+            instrument_type: asset.instrument_type.clone(),
+            instrument_symbol: asset.instrument_symbol.clone(),
+            instrument_exchange_mic: asset.instrument_exchange_mic.clone(),
+            provider_config: asset.provider_config.clone(),
+            metadata: Some(metadata),
+        }
+    }
+
     /// Validates the asset profile update data
     pub fn validate(&self) -> Result<()> {
         Ok(())
@@ -1213,6 +1380,57 @@ mod tests {
             bond.coupon_frequency, None,
             "Corporate bond coupon_frequency should be None"
         );
+    }
+
+    #[test]
+    fn a_share_class_suffix_survives_when_the_venue_contradicts_it() {
+        // `ZAAA.F` on Cboe Canada is BMO's currency-hedged unit class, and `.F` is
+        // Yahoo's Frankfurt suffix. Stripping it stored the holding under `ZAAA`, the
+        // unhedged listing — a different security. Observed live 2026-07-30.
+        let result = canonicalize_market_identity(
+            Some(InstrumentType::Equity),
+            Some("ZAAA.F"),
+            Some("NEOE"),
+            None,
+        );
+
+        assert_eq!(result.instrument_symbol.as_deref(), Some("ZAAA.F"));
+        assert_eq!(result.instrument_exchange_mic.as_deref(), Some("NEOE"));
+        assert_eq!(result.display_code.as_deref(), Some("ZAAA.F"));
+    }
+
+    #[test]
+    fn an_exchange_suffix_is_still_stripped_when_the_venue_agrees_or_is_absent() {
+        // The ordinary paths, unchanged: no venue to check against, and a venue that
+        // says the same thing the suffix does.
+        let inferred =
+            canonicalize_market_identity(Some(InstrumentType::Equity), Some("SHOP.TO"), None, None);
+        assert_eq!(inferred.instrument_symbol.as_deref(), Some("SHOP"));
+        assert_eq!(inferred.instrument_exchange_mic.as_deref(), Some("XTSE"));
+
+        let agreeing = canonicalize_market_identity(
+            Some(InstrumentType::Equity),
+            Some("SHOP.TO"),
+            Some("XTSE"),
+            None,
+        );
+        assert_eq!(agreeing.instrument_symbol.as_deref(), Some("SHOP"));
+        assert_eq!(agreeing.instrument_exchange_mic.as_deref(), Some("XTSE"));
+    }
+
+    #[test]
+    fn a_share_class_that_is_not_a_known_venue_suffix_is_untouched_either_way() {
+        // `.B` is not in the Yahoo suffix table, so this never depended on the rule
+        // above — pinned so a widened table cannot silently mangle a share class.
+        for mic in [Some("XNYS"), None] {
+            let result = canonicalize_market_identity(
+                Some(InstrumentType::Equity),
+                Some("BRK.B"),
+                mic,
+                None,
+            );
+            assert_eq!(result.instrument_symbol.as_deref(), Some("BRK.B"));
+        }
     }
 
     #[test]

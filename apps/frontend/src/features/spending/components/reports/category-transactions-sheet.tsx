@@ -1,6 +1,11 @@
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
+import { useAccounts } from "@/hooks/use-accounts";
+import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
+import type { Account, TaxonomyCategory } from "@/lib/types";
+import { cn, formatDate, formatDateISO } from "@/lib/utils";
 import {
   Button,
   Icons,
@@ -9,16 +14,16 @@ import {
   SheetContent,
   SheetTitle,
   Skeleton,
-  formatCompactAmount,
+  calendarDateFromLocalDate,
+  useAmountFormatting,
+  useDateFormatting,
+  useNumberFormatting,
+  type FormattingApi,
 } from "@wealthfolio/ui";
-import { useAccounts } from "@/hooks/use-accounts";
-import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
-import type { Account, TaxonomyCategory } from "@/lib/types";
-import { cn, formatDate, formatDateISO } from "@/lib/utils";
 
-import { CategoryIcon } from "../category-chips";
 import { useCashActivitySearch } from "../../hooks/use-cash-activity-search";
 import { getActivitySpendingAmount } from "../../lib/constants";
+import { CategoryIcon } from "../category-chips";
 
 const SPENDING_TAXONOMY = "spending_categories";
 
@@ -62,6 +67,11 @@ export function CategoryTransactionsSheet({
   rangeEnd,
   currency,
 }: CategoryTransactionsSheetProps) {
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const isTopLevel = !!category && !category.parentId;
 
@@ -167,14 +177,14 @@ export function CategoryTransactionsSheet({
     if (directAmount > 0) {
       rows.push({
         id: "__direct__",
-        name: "Direct",
+        name: t("spending:categorySheet.direct"),
         color: category.color ?? "var(--muted-foreground)",
         amount: directAmount,
       });
     }
     const total = rows.reduce((s, r) => s + r.amount, 0);
     return rows.map((r) => ({ ...r, share: total > 0 ? (r.amount / total) * 100 : 0 }));
-  }, [accountById, category, isTopLevel, items, taxonomyCategories]);
+  }, [accountById, category, isTopLevel, items, taxonomyCategories, t]);
 
   const transactionsLink = useMemo(() => {
     if (!category) return "/activities?tab=spending";
@@ -216,7 +226,7 @@ export function CategoryTransactionsSheet({
           }}
         >
           <div className="text-muted-foreground/80 text-[10px] font-semibold uppercase tracking-[0.14em]">
-            Spending · Category
+            {t("spending:categorySheet.eyebrow")}
           </div>
           <div className="mt-2 flex items-start gap-3">
             <span
@@ -231,63 +241,69 @@ export function CategoryTransactionsSheet({
             </span>
             <div className="min-w-0 flex-1">
               <SheetTitle className="text-foreground truncate text-2xl font-semibold tracking-tight">
-                {category?.name ?? "Category"}
+                {category?.name ?? t("spending:categorySheet.categoryFallback")}
               </SheetTitle>
               <p className="text-muted-foreground mt-0.5 text-xs">
-                {formatRangeLabel(rangeStart, rangeEnd)} · {stats.days}{" "}
-                {stats.days === 1 ? "day" : "days"}
+                {formatRangeLabel(rangeStart, rangeEnd, dateFormatting)} ·{" "}
+                {t("spending:categorySheet.daysCount", { count: stats.days })}
               </p>
             </div>
           </div>
 
           <div className="mt-5 grid grid-cols-4 gap-3">
             <Stat
-              label="Spent"
+              label={t("spending:categorySheet.spent")}
               value={
                 isLoading ? (
                   <Skeleton className="h-5 w-16" />
                 ) : isBalanceHidden ? (
                   "••••"
                 ) : (
-                  formatCompactAmount(stats.outflow, currency)
+                  amountFormatting.formatCompactAmount(stats.outflow, currency)
                 )
               }
-              hint={isTopLevel ? "All subcategories" : null}
+              hint={isTopLevel ? t("spending:categorySheet.allSubcategories") : null}
             />
             <Stat
-              label="Tx"
-              value={isLoading ? <Skeleton className="h-5 w-10" /> : totalCount.toLocaleString()}
+              label={t("spending:categorySheet.tx")}
+              value={
+                isLoading ? (
+                  <Skeleton className="h-5 w-10" />
+                ) : (
+                  numberFormatting.formatDecimal(totalCount)
+                )
+              }
               hint={
                 stats.outflowCount > 0 && stats.outflowCount < totalCount
-                  ? `${stats.outflowCount} outflows`
+                  ? t("spending:categorySheet.outflowsCount", { count: stats.outflowCount })
                   : null
               }
             />
             <Stat
-              label="Avg / tx"
+              label={t("spending:categorySheet.avgPerTx")}
               value={
                 isLoading ? (
                   <Skeleton className="h-5 w-14" />
                 ) : isBalanceHidden ? (
                   "••••"
                 ) : (
-                  formatCompactAmount(stats.avg, currency)
+                  amountFormatting.formatCompactAmount(stats.avg, currency)
                 )
               }
-              hint="Outflows only"
+              hint={t("spending:categorySheet.outflowsOnly")}
             />
             <Stat
-              label="Daily pace"
+              label={t("spending:categorySheet.dailyPace")}
               value={
                 isLoading ? (
                   <Skeleton className="h-5 w-14" />
                 ) : isBalanceHidden ? (
                   "••••"
                 ) : (
-                  formatCompactAmount(stats.dailyPace, currency)
+                  amountFormatting.formatCompactAmount(stats.dailyPace, currency)
                 )
               }
-              hint="In this period"
+              hint={t("spending:categorySheet.inThisPeriod")}
             />
           </div>
         </header>
@@ -297,9 +313,11 @@ export function CategoryTransactionsSheet({
           {/* Subcategory composition */}
           {isTopLevel && (subBreakdown.length > 0 || isLoading) && (
             <section className="mb-6">
-              <h3 className="text-foreground text-sm font-semibold">Subcategory mix</h3>
+              <h3 className="text-foreground text-sm font-semibold">
+                {t("spending:categorySheet.subcategoryMix")}
+              </h3>
               <p className="text-muted-foreground mt-0.5 text-xs">
-                Where this category's spending landed.
+                {t("spending:categorySheet.subcategoryMixHint")}
               </p>
               <div className="mt-3 space-y-2">
                 {isLoading ? (
@@ -329,10 +347,12 @@ export function CategoryTransactionsSheet({
                         />
                       </div>
                       <span className="text-muted-foreground/80 w-10 shrink-0 text-right text-[11px] tabular-nums">
-                        {row.share.toFixed(0)}%
+                        {numberFormatting.formatPercent(row.share / 100, { digits: 0 })}
                       </span>
                       <span className="text-foreground/90 w-16 shrink-0 text-right text-xs font-semibold tabular-nums">
-                        {isBalanceHidden ? "••••" : formatCompactAmount(row.amount, currency)}
+                        {isBalanceHidden
+                          ? "••••"
+                          : amountFormatting.formatCompactAmount(row.amount, currency)}
                       </span>
                     </div>
                   ))
@@ -344,9 +364,13 @@ export function CategoryTransactionsSheet({
           {/* Transactions list */}
           <section>
             <div className="mb-3 flex items-baseline justify-between">
-              <h3 className="text-foreground text-sm font-semibold">Transactions</h3>
+              <h3 className="text-foreground text-sm font-semibold">
+                {t("spending:categorySheet.transactions")}
+              </h3>
               <span className="text-muted-foreground text-[11px] tabular-nums">
-                {isLoading ? "Loading…" : `${totalCount.toLocaleString()} total`}
+                {isLoading
+                  ? t("spending:categorySheet.loading")
+                  : t("spending:categorySheet.totalCount", { count: totalCount })}
               </span>
             </div>
 
@@ -359,12 +383,12 @@ export function CategoryTransactionsSheet({
             ) : isError ? (
               <div className="text-destructive border-border/60 flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed py-10 text-center text-sm">
                 <Icons.AlertTriangle className="h-6 w-6 opacity-70" aria-hidden />
-                <div>{error?.message ?? "Transactions could not load."}</div>
+                <div>{error?.message ?? t("spending:categorySheet.loadError")}</div>
               </div>
             ) : items.length === 0 ? (
               <div className="text-muted-foreground border-border/60 flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed py-10 text-center text-sm">
                 <Icons.Activity className="h-6 w-6 opacity-50" aria-hidden />
-                <div>No transactions in this period.</div>
+                <div>{t("spending:categorySheet.noTransactions")}</div>
               </div>
             ) : (
               <ul className="divide-border/40 divide-y">
@@ -390,7 +414,7 @@ export function CategoryTransactionsSheet({
                           )}
                         </div>
                         <div className="text-muted-foreground/80 mt-0.5 flex items-center gap-1 text-[10px] leading-tight">
-                          <span>{formatDate(it.activityDate)}</span>
+                          <span>{formatDate(it.activityDate, dateFormatting)}</span>
                           <span aria-hidden>·</span>
                           <span className="truncate">{account?.name ?? it.accountId}</span>
                         </div>
@@ -426,10 +450,12 @@ export function CategoryTransactionsSheet({
                   {isFetchingNextPage ? (
                     <>
                       <Icons.Spinner className="mr-2 h-3.5 w-3.5 animate-spin" aria-hidden />
-                      Loading…
+                      {t("spending:categorySheet.loading")}
                     </>
                   ) : (
-                    `Load ${Math.min(50, totalCount - items.length)} more`
+                    t("spending:categorySheet.loadMore", {
+                      count: Math.min(50, totalCount - items.length),
+                    })
                   )}
                 </Button>
               </div>
@@ -441,7 +467,7 @@ export function CategoryTransactionsSheet({
         <div className="border-border/60 bg-background/70 border-t px-6 py-3 backdrop-blur">
           <Button asChild size="sm" className="w-full">
             <Link to={transactionsLink} onClick={() => onOpenChange(false)}>
-              Open in Transactions
+              {t("spending:categorySheet.openInTransactions")}
               <Icons.ArrowRight className="ml-1.5 h-3.5 w-3.5" aria-hidden />
             </Link>
           </Button>
@@ -473,12 +499,17 @@ function Stat({
   );
 }
 
-function formatRangeLabel(start: Date, end: Date): string {
-  const fmt = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+function formatRangeLabel(
+  start: Date,
+  end: Date,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+): string {
   const sameYear = start.getFullYear() === end.getFullYear();
-  const yearFmt = new Intl.DateTimeFormat(undefined, { year: "numeric" });
-  const startStr = fmt.format(start);
-  const endStr = fmt.format(end);
-  const yearStr = sameYear ? `, ${yearFmt.format(end)}` : "";
+  const options = { month: "short", day: "numeric" } as const;
+  const startStr = formatting.formatCalendarDate(calendarDateFromLocalDate(start), options);
+  const endStr = formatting.formatCalendarDate(calendarDateFromLocalDate(end), options);
+  const yearStr = sameYear
+    ? `, ${formatting.formatCalendarDate(calendarDateFromLocalDate(end), { year: "numeric" })}`
+    : "";
   return `${startStr} – ${endStr}${yearStr}`;
 }

@@ -1,35 +1,49 @@
+import { formatDistanceToNow } from "@/lib/utils";
+import { useDateFormatting, useLocalizationSettings } from "@wealthfolio/ui";
 import { Badge } from "@wealthfolio/ui/components/ui/badge";
 import { Button } from "@wealthfolio/ui/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/ui/components/ui/card";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { Skeleton } from "@wealthfolio/ui/components/ui/skeleton";
-import { format, formatDistanceToNow } from "date-fns";
+import type { TFunction } from "i18next";
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import { useImportRunsInfinite } from "../hooks";
-import type { ImportRun, ImportRunStatus } from "../types";
 import { BROKER_SYNC_RUN_FAILED_MESSAGE } from "../lib/broker-sync-messages";
+import type { ImportRun, ImportRunStatus } from "../types";
 
-const statusConfig: Record<
+function buildStatusConfig(t: TFunction): Record<
   ImportRunStatus,
   {
     label: string;
     variant: "default" | "secondary" | "destructive" | "outline";
     icon: typeof Icons.Check;
   }
-> = {
-  RUNNING: { label: "Syncing", variant: "outline", icon: Icons.Spinner },
-  APPLIED: { label: "Success", variant: "default", icon: Icons.Check },
-  NEEDS_REVIEW: { label: "Review", variant: "destructive", icon: Icons.AlertTriangle },
-  FAILED: { label: "Failed", variant: "destructive", icon: Icons.X },
-  CANCELLED: { label: "Cancelled", variant: "secondary", icon: Icons.X },
-};
+> {
+  return {
+    RUNNING: { label: t("connect:status.syncing"), variant: "outline", icon: Icons.Spinner },
+    APPLIED: { label: t("connect:syncHistory.success"), variant: "default", icon: Icons.Check },
+    NEEDS_REVIEW: {
+      label: t("connect:syncHistory.review"),
+      variant: "destructive",
+      icon: Icons.AlertTriangle,
+    },
+    FAILED: { label: t("connect:status.failed"), variant: "destructive", icon: Icons.X },
+    CANCELLED: {
+      label: t("connect:runStatus.cancelled"),
+      variant: "secondary",
+      icon: Icons.X,
+    },
+  };
+}
 
 interface SyncHistoryProps {
   pageSize?: number;
 }
 
 export function SyncHistory({ pageSize = 10 }: SyncHistoryProps) {
+  const { t } = useTranslation();
   const { data, isLoading, isFetchingNextPage, hasNextPage, fetchNextPage } = useImportRunsInfinite(
     { pageSize },
   );
@@ -45,7 +59,7 @@ export function SyncHistory({ pageSize = 10 }: SyncHistoryProps) {
         <CardHeader className="pb-3">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <Icons.History className="h-5 w-5" />
-            Sync History
+            {t("connect:syncHistory.title")}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -63,15 +77,15 @@ export function SyncHistory({ pageSize = 10 }: SyncHistoryProps) {
         <CardHeader className="pb-3">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <Icons.History className="h-5 w-5" />
-            Sync History
+            {t("connect:syncHistory.title")}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex flex-col items-center justify-center py-8 text-center">
             <Icons.Clock className="text-muted-foreground mb-3 h-10 w-10" />
-            <p className="text-muted-foreground text-sm">No sync runs yet</p>
+            <p className="text-muted-foreground text-sm">{t("connect:syncHistory.emptyTitle")}</p>
             <p className="text-muted-foreground/70 mt-1 text-xs">
-              Your sync history will appear here after your first sync
+              {t("connect:syncHistory.emptyDescription")}
             </p>
           </div>
         </CardContent>
@@ -85,10 +99,10 @@ export function SyncHistory({ pageSize = 10 }: SyncHistoryProps) {
         <div className="flex items-center justify-between">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <Icons.History className="h-5 w-5" />
-            Sync History
+            {t("connect:syncHistory.title")}
           </CardTitle>
           <span className="text-muted-foreground text-xs">
-            {runs.length} run{runs.length !== 1 ? "s" : ""}
+            {t("connect:syncHistory.runCount", { count: runs.length })}
           </span>
         </div>
       </CardHeader>
@@ -107,12 +121,12 @@ export function SyncHistory({ pageSize = 10 }: SyncHistoryProps) {
             {isFetchingNextPage ? (
               <>
                 <Icons.Spinner className="mr-2 h-4 w-4 animate-spin" />
-                Loading...
+                {t("common:loading")}
               </>
             ) : (
               <>
                 <Icons.ChevronDown className="mr-2 h-4 w-4" />
-                Load more
+                {t("connect:syncHistory.loadMore")}
               </>
             )}
           </Button>
@@ -123,6 +137,9 @@ export function SyncHistory({ pageSize = 10 }: SyncHistoryProps) {
 }
 
 function SyncRunItem({ run }: { run: ImportRun }) {
+  const formatting = useDateFormatting();
+  const { t } = useTranslation();
+  const statusConfig = useMemo(() => buildStatusConfig(t), [t]);
   const config = statusConfig[run.status];
   const StatusIcon = config.icon;
   const hasWarnings = run.warnings && run.warnings.length > 0;
@@ -130,13 +147,14 @@ function SyncRunItem({ run }: { run: ImportRun }) {
   const duration = useMemo(() => {
     if (!run.finishedAt) return null;
     const ms = new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime();
-    if (ms < 1000) return "<1s";
+    if (ms < 1000) return t("connect:syncHistory.lessThanOneSecond");
     return `${Math.round(ms / 1000)}s`;
-  }, [run.startedAt, run.finishedAt]);
+  }, [run.startedAt, run.finishedAt, t]);
 
   const timeAgo = useMemo(() => {
-    return formatDistanceToNow(new Date(run.startedAt), { addSuffix: true });
-  }, [run.startedAt]);
+    const localizationSettings = useLocalizationSettings();
+    return formatDistanceToNow(new Date(run.startedAt), localizationSettings, { addSuffix: true });
+  }, [run.startedAt, formatting]);
 
   return (
     <div className="hover:bg-muted/50 group rounded-lg border p-3 transition-colors">
@@ -176,7 +194,7 @@ function SyncRunItem({ run }: { run: ImportRun }) {
             <div className="text-muted-foreground mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
               <span>{timeAgo}</span>
               <span className="text-muted-foreground/50">&middot;</span>
-              <span>{format(new Date(run.startedAt), "MMM d, HH:mm")}</span>
+              <span>{formatting.formatDateTime(new Date(run.startedAt))}</span>
               {duration && (
                 <>
                   <span className="text-muted-foreground/50">&middot;</span>
@@ -194,18 +212,18 @@ function SyncRunItem({ run }: { run: ImportRun }) {
               <p className="font-semibold text-green-600 dark:text-green-400">
                 +{run.summary.inserted}
               </p>
-              <p className="text-muted-foreground">new</p>
+              <p className="text-muted-foreground">{t("connect:syncHistory.new")}</p>
             </div>
             <div className="text-center">
               <p className="font-semibold text-blue-600 dark:text-blue-400">
                 {run.summary.updated}
               </p>
-              <p className="text-muted-foreground">updated</p>
+              <p className="text-muted-foreground">{t("connect:syncHistory.updated")}</p>
             </div>
             {run.summary.skipped > 0 && (
               <div className="text-center">
                 <p className="text-muted-foreground font-semibold">{run.summary.skipped}</p>
-                <p className="text-muted-foreground">skipped</p>
+                <p className="text-muted-foreground">{t("connect:syncHistory.skipped")}</p>
               </div>
             )}
           </div>
@@ -224,13 +242,13 @@ function SyncRunItem({ run }: { run: ImportRun }) {
         <div className="mt-2 space-y-1">
           <div className="flex items-center justify-between">
             <p className="text-xs font-medium text-yellow-600 dark:text-yellow-400">
-              {run.warnings?.length} warning{run.warnings && run.warnings.length !== 1 ? "s" : ""}
+              {t("connect:syncHistory.warningsCount", { count: run.warnings?.length ?? 0 })}
             </p>
             <Link
               to={`/activities?account=${run.accountId}&needsReview=true`}
               className="text-primary flex items-center gap-1 text-xs hover:underline"
             >
-              Review
+              {t("connect:syncHistory.review")}
               <Icons.ArrowRight className="h-3 w-3" />
             </Link>
           </div>
@@ -242,7 +260,8 @@ function SyncRunItem({ run }: { run: ImportRun }) {
             ))}
             {(run.warnings?.length ?? 0) > 2 && (
               <li className="text-muted-foreground/70">
-                &bull; +{(run.warnings?.length ?? 0) - 2} more
+                &bull;{" "}
+                {t("connect:syncHistory.andMore", { count: (run.warnings?.length ?? 0) - 2 })}
               </li>
             )}
           </ul>

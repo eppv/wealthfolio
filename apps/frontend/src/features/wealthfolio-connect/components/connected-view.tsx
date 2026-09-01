@@ -3,8 +3,9 @@ import { ExternalLink } from "@/components/external-link";
 import { DeviceSyncSection } from "@/features/devices-sync";
 import { WEALTHFOLIO_CONNECT_PORTAL_URL } from "@/lib/constants";
 import { QueryKeys } from "@/lib/query-keys";
+import { formatDate } from "@/lib/utils";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { ActionConfirm } from "@wealthfolio/ui";
+import { ActionConfirm, useDateFormatting } from "@wealthfolio/ui";
 import { Avatar, AvatarFallback, AvatarImage } from "@wealthfolio/ui/components/ui/avatar";
 import { Badge } from "@wealthfolio/ui/components/ui/badge";
 import { Button } from "@wealthfolio/ui/components/ui/button";
@@ -13,8 +14,9 @@ import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { Skeleton } from "@wealthfolio/ui/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@wealthfolio/ui/components/ui/tooltip";
 import { toast } from "@wealthfolio/ui/components/ui/use-toast";
-import { formatDate } from "@/lib/utils";
 import { useCallback, useState } from "react";
+import { Trans, useTranslation } from "react-i18next";
+import { hasBrokerSync } from "../lib/plan-capabilities";
 import { useWealthfolioConnect } from "../providers/wealthfolio-connect-provider";
 import {
   listBrokerAccounts,
@@ -22,7 +24,6 @@ import {
   syncBrokerData,
 } from "../services/broker-service";
 import type { BrokerAccount, BrokerConnection } from "../types";
-import { hasBrokerSync } from "../lib/plan-capabilities";
 import { SubscriptionPlans } from "./subscription-plans";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +64,7 @@ interface ServiceUnavailableCardProps {
 }
 
 function ServiceUnavailableCard({ onRetry, isRetrying }: ServiceUnavailableCardProps) {
+  const { t } = useTranslation();
   return (
     <Card className="border-warning/30 bg-warning/5">
       <CardContent className="py-8">
@@ -71,22 +73,21 @@ function ServiceUnavailableCard({ onRetry, isRetrying }: ServiceUnavailableCardP
             <Icons.CloudOff className="text-warning h-8 w-8" />
           </div>
           <h3 className="text-foreground mb-2 text-base font-medium">
-            Service Temporarily Unavailable
+            {t("connect:serviceUnavailable.title")}
           </h3>
           <p className="text-muted-foreground mb-4 max-w-sm text-sm">
-            We&apos;re having trouble connecting to Wealthfolio Connect. This is usually temporary
-            and should resolve shortly.
+            {t("connect:serviceUnavailable.description")}
           </p>
           <Button variant="outline" onClick={onRetry} disabled={isRetrying}>
             {isRetrying ? (
               <>
                 <Icons.Spinner className="h-4 w-4 animate-spin" />
-                Retrying...
+                {t("connect:serviceUnavailable.retrying")}
               </>
             ) : (
               <>
                 <Icons.Refresh className="h-4 w-4" />
-                Try Again
+                {t("connect:serviceUnavailable.tryAgain")}
               </>
             )}
           </Button>
@@ -135,6 +136,9 @@ function getLastSyncDate(account: BrokerAccount): string | null {
 }
 
 function BrokerAccountCard({ account, connections }: BrokerAccountCardProps) {
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   const lastSyncDate = getLastSyncDate(account);
 
   // Find the connection that matches this account's brokerage_authorization
@@ -142,7 +146,9 @@ function BrokerAccountCard({ account, connections }: BrokerAccountCardProps) {
   const logoUrl =
     connection?.brokerage?.aws_s3_square_logo_url ?? connection?.brokerage?.aws_s3_logo_url;
 
-  const lastSyncedText = lastSyncDate ? `Data as of ${formatDate(lastSyncDate)}` : "No data yet";
+  const lastSyncedText = lastSyncDate
+    ? t("connect:accounts.dataAsOf", { date: formatDate(lastSyncDate, dateFormatting) })
+    : t("connect:accounts.noDataYet");
 
   return (
     <div className="bg-muted/30 rounded-lg border p-3">
@@ -151,7 +157,7 @@ function BrokerAccountCard({ account, connections }: BrokerAccountCardProps) {
         <Avatar className="mt-0.5 h-9 w-9 shrink-0 rounded-lg">
           <AvatarImage
             src={logoUrl}
-            alt={account.institution_name || "Broker"}
+            alt={account.institution_name || t("connect:accounts.brokerFallback")}
             className="bg-white object-contain p-1"
           />
           <AvatarFallback className="rounded-lg text-sm font-semibold">
@@ -163,10 +169,12 @@ function BrokerAccountCard({ account, connections }: BrokerAccountCardProps) {
         <div className="min-w-0 flex-1">
           {/* Row 1: name + badges + sync icon */}
           <div className="flex items-center gap-1.5">
-            <span className="truncate text-sm font-medium">{account.name || "Account"}</span>
+            <span className="truncate text-sm font-medium">
+              {account.name || t("connect:accounts.accountFallback")}
+            </span>
             {account.is_paper && (
               <Badge variant="outline" className="h-5 shrink-0 text-[10px]">
-                Paper
+                {t("connect:accounts.paper")}
               </Badge>
             )}
             <Tooltip>
@@ -178,7 +186,9 @@ function BrokerAccountCard({ account, connections }: BrokerAccountCardProps) {
                 )}
               </TooltipTrigger>
               <TooltipContent>
-                {account.sync_enabled ? "Sync enabled" : "Excluded from sync"}
+                {account.sync_enabled
+                  ? t("connect:accounts.syncEnabled")
+                  : t("connect:accounts.excludedFromSync")}
               </TooltipContent>
             </Tooltip>
           </div>
@@ -196,7 +206,7 @@ function BrokerAccountCard({ account, connections }: BrokerAccountCardProps) {
                 <span className="shrink-0 opacity-40">·</span>
                 <span className="flex shrink-0 items-center gap-0.5">
                   <Icons.Users className="h-3 w-3" />
-                  Shared
+                  {t("connect:accounts.shared")}
                 </span>
               </>
             )}
@@ -228,6 +238,7 @@ function BrokerConnectionsCard({
   onRefresh,
   isRefreshing,
 }: BrokerConnectionsCardProps) {
+  const { t } = useTranslation();
   const openConnectionsPortal = () => {
     openUrlInBrowser(`${WEALTHFOLIO_CONNECT_PORTAL_URL}/connections`);
   };
@@ -240,7 +251,7 @@ function BrokerConnectionsCard({
             <div className="bg-muted flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
               <Icons.Link className="text-muted-foreground h-4 w-4" />
             </div>
-            <h3 className="text-base font-semibold">Broker connections</h3>
+            <h3 className="text-base font-semibold">{t("connect:connections.title")}</h3>
           </div>
           <div className="flex items-center gap-1">
             <Button
@@ -268,7 +279,7 @@ function BrokerConnectionsCard({
               className="text-muted-foreground hover:text-foreground hidden sm:inline-flex"
               onClick={openConnectionsPortal}
             >
-              Manage connections
+              {t("connect:connections.manage")}
               <Icons.ArrowRight className="ml-1 h-3.5 w-3.5" />
             </Button>
           </div>
@@ -282,10 +293,10 @@ function BrokerConnectionsCard({
             </>
           ) : connections.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-6 text-center">
-              <p className="text-muted-foreground text-sm">No broker connections yet</p>
+              <p className="text-muted-foreground text-sm">{t("connect:connections.empty")}</p>
               <Button className="mt-3" onClick={openConnectionsPortal}>
                 <Icons.Plus className="h-4 w-4" />
-                Connect Broker
+                {t("connect:connections.connectBroker")}
               </Button>
             </div>
           ) : (
@@ -296,7 +307,7 @@ function BrokerConnectionsCard({
               const brokerageName =
                 connection.brokerage?.display_name ??
                 connection.brokerage?.name ??
-                "Unknown Broker";
+                t("connect:connections.unknownBroker");
               const isConnected = connection.status === "connected" && !connection.disabled;
 
               return (
@@ -324,7 +335,9 @@ function BrokerConnectionsCard({
                         : "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400"
                     }`}
                   >
-                    {isConnected ? "Connected" : "Disconnected"}
+                    {isConnected
+                      ? t("connect:connections.connected")
+                      : t("connect:connections.disconnected")}
                   </Badge>
                 </div>
               );
@@ -341,6 +354,7 @@ function BrokerConnectionsCard({
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function ConnectedView() {
+  const { t } = useTranslation();
   const {
     user,
     session,
@@ -389,11 +403,13 @@ export function ConnectedView() {
   const syncToLocalMutation = useMutation({
     mutationFn: syncBrokerData,
     onSuccess: () => {
-      toast.loading("Syncing broker data...", { id: "broker-sync-start" });
+      toast.loading(t("connect:sync.syncingBrokerData"), { id: "broker-sync-start" });
     },
     onError: (error) => {
       toast.error(
-        `Failed to start sync: ${error instanceof Error ? error.message : "Unknown error"}`,
+        t("connect:sync.startFailed", {
+          error: error instanceof Error ? error.message : t("connect:errors.unknown"),
+        }),
       );
     },
   });
@@ -427,7 +443,7 @@ export function ConnectedView() {
             <Avatar className="h-12 w-12">
               <AvatarImage
                 src={user?.user_metadata?.avatar_url}
-                alt={user?.email ?? "User avatar"}
+                alt={user?.email ?? t("connect:account.userAvatar")}
               />
               <AvatarFallback className="bg-success/15">
                 <span className="text-success text-lg font-semibold">
@@ -438,11 +454,13 @@ export function ConnectedView() {
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <h3 className="truncate text-base font-semibold">
-                  {userInfo?.full_name ?? user?.email?.split("@")[0] ?? "User"}
+                  {userInfo?.full_name ??
+                    user?.email?.split("@")[0] ??
+                    t("connect:account.userFallback")}
                 </h3>
                 {hasSubscription && (
                   <Badge className="h-5 shrink-0 bg-green-100 px-2 text-[10px] font-medium text-green-700 dark:bg-green-900/30 dark:text-green-400">
-                    Active
+                    {t("connect:account.active")}
                   </Badge>
                 )}
               </div>
@@ -451,11 +469,11 @@ export function ConnectedView() {
             <ActionConfirm
               handleConfirm={handleSignOut}
               isPending={isSigningOut}
-              confirmTitle="Sign out of Wealthfolio Connect?"
-              confirmMessage="You'll need to sign in again to access your synced broker accounts. Your local data will not be affected."
-              confirmButtonText="Sign Out"
-              pendingText="Signing out..."
-              cancelButtonText="Cancel"
+              confirmTitle={t("connect:account.signOutTitle")}
+              confirmMessage={t("connect:account.signOutMessage")}
+              confirmButtonText={t("connect:account.signOutConfirm")}
+              pendingText={t("connect:account.signingOut")}
+              cancelButtonText={t("common:cancel")}
               confirmButtonVariant="destructive"
               button={
                 <Button
@@ -469,7 +487,7 @@ export function ConnectedView() {
                   ) : (
                     <Icons.LogOut className="h-4 w-4" />
                   )}
-                  <span>Sign out</span>
+                  <span>{t("connect:account.signOut")}</span>
                 </Button>
               }
             />
@@ -526,7 +544,7 @@ export function ConnectedView() {
                 <div className="bg-muted flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
                   <Icons.Wallet className="text-muted-foreground h-4 w-4" />
                 </div>
-                <h3 className="text-base font-semibold">Accounts</h3>
+                <h3 className="text-base font-semibold">{t("connect:accounts.title")}</h3>
               </div>
               <div className="flex items-center gap-1">
                 <Button
@@ -536,7 +554,7 @@ export function ConnectedView() {
                   disabled={isSyncing || accountsQuery.isFetching}
                 >
                   <Icons.CloudSync2 className={`h-4 w-4 ${isSyncing ? "animate-pulse" : ""}`} />
-                  Sync Now
+                  {t("connect:sync.syncNow")}
                 </Button>
                 {/* Mobile: icon only */}
                 <Button
@@ -554,7 +572,7 @@ export function ConnectedView() {
                   className="text-muted-foreground hover:text-foreground hidden sm:inline-flex"
                   onClick={() => openUrlInBrowser(`${WEALTHFOLIO_CONNECT_PORTAL_URL}/accounts`)}
                 >
-                  Manage accounts
+                  {t("connect:accounts.manage")}
                   <Icons.ArrowRight className="ml-1 h-3.5 w-3.5" />
                 </Button>
               </div>
@@ -568,9 +586,11 @@ export function ConnectedView() {
                 </div>
               ) : brokerAccounts.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-6 text-center">
-                  <p className="text-muted-foreground text-sm">No accounts synced yet</p>
+                  <p className="text-muted-foreground text-sm">
+                    {t("connect:accounts.emptyTitle")}
+                  </p>
                   <p className="text-muted-foreground mt-1 max-w-xs text-xs">
-                    Connect a broker to start syncing your accounts.
+                    {t("connect:accounts.emptyDescription")}
                   </p>
                 </div>
               ) : (
@@ -598,9 +618,9 @@ export function ConnectedView() {
           <CardContent className="p-4">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <h3 className="text-sm font-medium">Upgrade to sync broker accounts</h3>
+                <h3 className="text-sm font-medium">{t("connect:upgrade.title")}</h3>
                 <p className="text-muted-foreground mt-0.5 text-xs">
-                  Connect your brokerage accounts for automatic portfolio syncing.
+                  {t("connect:upgrade.description")}
                 </p>
               </div>
               <Button
@@ -609,7 +629,7 @@ export function ConnectedView() {
                   openUrlInBrowser(`${WEALTHFOLIO_CONNECT_PORTAL_URL}/settings/billing`)
                 }
               >
-                Upgrade
+                {t("connect:upgrade.button")}
                 <Icons.ArrowRight className="ml-1 h-3.5 w-3.5" />
               </Button>
             </div>
@@ -620,15 +640,17 @@ export function ConnectedView() {
       {/* Privacy Footnote */}
       <footer className="border-t pt-4">
         <p className="text-muted-foreground text-center text-xs leading-relaxed">
-          Wealthfolio Connect doesn&apos;t store your brokerage credentials or financial data.
-          Everything syncs securely via an aggregator to your local database. Device sync uses
-          end-to-end encryption.{" "}
-          <ExternalLink
-            href="https://wealthfolio.app/privacy"
-            className="text-muted-foreground hover:text-foreground underline underline-offset-2"
-          >
-            Learn more
-          </ExternalLink>
+          <Trans
+            i18nKey="connect:privacy.footnote"
+            components={{
+              privacyLink: (
+                <ExternalLink
+                  href="https://wealthfolio.app/privacy"
+                  className="text-muted-foreground hover:text-foreground underline underline-offset-2"
+                />
+              ),
+            }}
+          />
         </p>
       </footer>
     </div>

@@ -1,6 +1,9 @@
 import { logger } from "@/adapters";
 import { reloadAllAddons } from "@/addons/addons-core";
-import { createAddonContext } from "./addons-runtime-context";
+import type { AddonManifest } from "@wealthfolio/addon-sdk";
+import type { AddonAsset, AddonFile } from "@/adapters/types";
+import { clearAddonContributions, ingestAddonContributions } from "./contribution-registry";
+import { addonIframeManager, type AddonRuntimeHandle } from "./iframe/addon-iframe-manager";
 
 interface DevModeConfig {
   enabled: boolean;
@@ -15,12 +18,49 @@ interface AddonDevServer {
   url: string;
   port: number;
   status: "running" | "stopped" | "error";
-  lastUpdated?: Date;
+  generation?: number;
+}
+
+interface DevRuntimePackage {
+  assets: AddonAsset[];
+  files: AddonFile[];
+  generation: number;
+  manifest: Partial<AddonManifest> | null;
+}
+
+interface DevRuntimeStatus {
+  buildInProgress?: boolean;
+  generation?: number;
+}
+
+export function shouldReloadDevelopmentAddon(
+  status: DevRuntimeStatus,
+  currentGeneration: number | undefined,
+): boolean {
+  return (
+    status.buildInProgress !== true &&
+    typeof status.generation === "number" &&
+    Number.isSafeInteger(status.generation) &&
+    status.generation > (currentGeneration ?? 0)
+  );
+}
+
+export function getDevelopmentRuntimePackageError(status: number, detail: string): string {
+  if (status === 404 || status === 405) {
+    return (
+      "Development server does not support Wealthfolio 3.7 runtime packages. " +
+      "Upgrade @wealthfolio/addon-dev-tools to version 3.7.0 or newer."
+    );
+  }
+
+  return `Failed to load development addon package: ${detail}`;
 }
 
 class AddonDevManager {
   private config: DevModeConfig;
   private devServers = new Map<string, AddonDevServer>();
+  private devAddons = new Map<string, AddonRuntimeHandle>();
+  private reloadsInProgress = new Set<string>();
   private watchInterval: number | null = null;
   private eventSource: EventSource | null = null;
 
@@ -155,72 +195,114 @@ class AddonDevManager {
         throw new Error(`Dev server not responding: ${response.status}`);
       }
 
-      // Load addon code from dev server
-      const addonResponse = await fetch(`${devServer.url}/addon.js`);
-      if (!addonResponse.ok) {
-        throw new Error(`Failed to load addon code: ${addonResponse.status}`);
-      }
-
-      const addonCode = await addonResponse.text();
-
-      // Load manifest
-      const manifestResponse = await fetch(`${devServer.url}/manifest.json`);
-      const manifest = manifestResponse.ok ? await manifestResponse.json() : null;
-
-      // Execute addon code in development context
-      await this.executeAddonCode(addonCode, manifest, addonId);
-
-      devServer.status = "running";
-      devServer.lastUpdated = new Date();
+      const runtimePackage = await this.fetchRuntimePackage(devServer);
+      await this.activateRuntimePackage(devServer, runtimePackage);
 
       logger.info(`🚀 Loaded addon ${devServer.name} from dev server`);
       return true;
     } catch (error) {
       devServer.status = "error";
-      logger.error(`❌ Failed to load addon from dev server: ${error}`);
+      logger.error(`❌ Failed to load addon from dev server: ${String(error)}`);
       return false;
     }
+  }
+
+  private async fetchRuntimePackage(devServer: AddonDevServer): Promise<DevRuntimePackage> {
+    const response = await fetch(`${devServer.url}/runtime-package`, { cache: "no-store" });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        const body = (await response.json()) as { error?: unknown };
+        if (typeof body.error === "string") detail = body.error;
+      } catch {
+        // Keep the HTTP status text for non-JSON development server errors.
+      }
+      throw new Error(getDevelopmentRuntimePackageError(response.status, detail));
+    }
+
+    const runtimePackage = (await response.json()) as DevRuntimePackage;
+    if (
+      !Number.isSafeInteger(runtimePackage.generation) ||
+      runtimePackage.generation < 1 ||
+      !Array.isArray(runtimePackage.assets) ||
+      !Array.isArray(runtimePackage.files) ||
+      !runtimePackage.files.some((file) => file.isMain)
+    ) {
+      throw new Error("Development server returned an invalid runtime package");
+    }
+    return runtimePackage;
+  }
+
+  private async activateRuntimePackage(
+    devServer: AddonDevServer,
+    runtimePackage: DevRuntimePackage,
+  ): Promise<void> {
+    const mainFile = runtimePackage.files.find((file) => file.isMain);
+    if (!mainFile) {
+      throw new Error("Development runtime package has no addon entry point");
+    }
+
+    // Record the attempted generation before execution so a broken build is
+    // retried only after the dev server publishes another generation.
+    devServer.generation = runtimePackage.generation;
+    await this.executeAddonCode(
+      mainFile.content,
+      runtimePackage.manifest,
+      devServer.id,
+      runtimePackage.files,
+      runtimePackage.assets,
+      devServer.url,
+      runtimePackage.generation,
+    );
+
+    // Dev addons don't flow through loadInstalledAddons, so ingest their
+    // manifest contributions here. Clear-then-ingest keeps this idempotent.
+    clearAddonContributions(devServer.id);
+    if (runtimePackage.manifest) {
+      ingestAddonContributions(devServer.id, runtimePackage.manifest as AddonManifest);
+    }
+
+    devServer.status = "running";
   }
 
   /**
    * Execute addon code in a sandboxed environment
    */
-  private async executeAddonCode(code: string, _manifest: unknown, addonId: string): Promise<void> {
+  private async executeAddonCode(
+    code: string,
+    manifest: Partial<AddonManifest> | null,
+    addonId: string,
+    files: AddonFile[],
+    assets: AddonAsset[],
+    devServerUrl: string,
+    generation: number,
+  ): Promise<void> {
     try {
-      // Runtime guard: Verify React singletons are available
-      const g = globalThis as unknown as { ReactDOM?: { createPortal?: unknown } };
-      if (typeof g.ReactDOM?.createPortal !== "function") {
-        throw new Error(
-          "Host did not expose ReactDOM.createPortal. Portal-based UI components will not work.",
-        );
-      }
-
-      // Create a blob URL for the addon code
-      const blob = new Blob([code], { type: "text/javascript" });
-      const blobUrl = URL.createObjectURL(blob);
-
-      // Import and execute the addon
-      const mod = await import(/* @vite-ignore */ blobUrl);
-
-      if (typeof mod.default === "function") {
-        // Create addon-specific context with scoped secrets
-        const addonSpecificContext = createAddonContext(addonId);
-        const addonInstance = mod.default(addonSpecificContext);
-
-        // Store for cleanup
-        if (addonInstance && typeof addonInstance.disable === "function") {
-          const g2 = globalThis as unknown as {
-            __DEV_ADDONS__?: Map<string, { disable?: () => void }>;
-          };
-          g2.__DEV_ADDONS__ = g2.__DEV_ADDONS__ ?? new Map();
-          g2.__DEV_ADDONS__.set(addonId, addonInstance);
-        }
-      }
-
-      // Cleanup blob URL
-      URL.revokeObjectURL(blobUrl);
+      const handle = await addonIframeManager.startAddon({
+        addonId,
+        assets,
+        code,
+        files,
+        loadAsset: async (assetId) => {
+          const assetUrl = new URL(`/runtime-assets/${encodeURIComponent(assetId)}`, devServerUrl);
+          assetUrl.searchParams.set("generation", String(generation));
+          const response = await fetch(assetUrl, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`Failed to load development addon asset: ${response.status}`);
+          }
+          return response.blob();
+        },
+        manifest: {
+          id: addonId,
+          name: manifest?.name ?? addonId,
+          version: manifest?.version ?? "0.0.0-dev",
+          ...manifest,
+        },
+        permissions: manifest?.permissions,
+      });
+      this.devAddons.set(addonId, handle);
     } catch (error) {
-      logger.error(`Failed to execute addon code for ${addonId}: ${error}`);
+      logger.error(`Failed to execute addon code for ${addonId}: ${String(error)}`);
       throw error;
     }
   }
@@ -252,19 +334,15 @@ class AddonDevManager {
    */
   private async checkForUpdates(): Promise<void> {
     for (const [addonId, devServer] of this.devServers) {
-      if (devServer.status !== "running") continue;
+      if (devServer.status === "stopped") continue;
 
       try {
         const response = await fetch(`${devServer.url}/status`);
         if (response.ok) {
-          const status = await response.json();
-
-          if (status.lastModified && devServer.lastUpdated) {
-            const lastModified = new Date(status.lastModified);
-            if (lastModified > devServer.lastUpdated) {
-              logger.info(`🔄 Detected changes in ${devServer.name}, auto-reloading...`);
-              await this.reloadAddon(addonId);
-            }
+          const status = (await response.json()) as DevRuntimeStatus;
+          if (shouldReloadDevelopmentAddon(status, devServer.generation)) {
+            logger.info(`🔄 Detected changes in ${devServer.name}, auto-reloading...`);
+            await this.reloadAddon(addonId);
           }
         }
       } catch (_error) {
@@ -277,20 +355,28 @@ class AddonDevManager {
    * Reload a specific addon
    */
   private async reloadAddon(addonId: string): Promise<void> {
+    if (this.reloadsInProgress.has(addonId)) return;
+    this.reloadsInProgress.add(addonId);
+
+    let unloaded = false;
     try {
+      const devServer = this.devServers.get(addonId);
+      if (!devServer) {
+        throw new Error(`No dev server registered for addon: ${addonId}`);
+      }
+      const runtimePackage = await this.fetchRuntimePackage(devServer);
+      if (runtimePackage.generation <= (devServer.generation ?? 0)) {
+        return;
+      }
+
       // Clean up existing instance
-      const devAddons = (
-        globalThis as unknown as {
-          __DEV_ADDONS__?: Map<string, { disable?: () => void }>;
-        }
-      ).__DEV_ADDONS__;
-      if (devAddons?.has(addonId)) {
-        const instance = devAddons.get(addonId);
-        if (instance?.disable) {
+      if (this.devAddons.has(addonId)) {
+        const instance = this.devAddons.get(addonId);
+        if (instance) {
           logger.info(`🧹 Cleaning up old instance of ${addonId}`);
-          instance.disable();
+          await instance.disable();
         }
-        devAddons.delete(addonId);
+        this.devAddons.delete(addonId);
       }
 
       // Also clean up from the main addon loader
@@ -298,26 +384,25 @@ class AddonDevManager {
       if (unloadAddon) {
         unloadAddon(addonId);
       }
+      unloaded = true;
 
       // Small delay to ensure cleanup is complete
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // Reload from dev server
-      const success = await this.loadAddonFromDevServer(addonId);
+      await this.activateRuntimePackage(devServer, runtimePackage);
+      logger.info(`✅ Successfully hot-reloaded ${addonId}`);
 
-      if (success) {
-        logger.info(`✅ Successfully hot-reloaded ${addonId}`);
-
-        // Trigger navigation update to refresh the UI
-        const { triggerNavigationUpdate } = await import("./addons-runtime-context");
-        if (triggerNavigationUpdate) {
-          triggerNavigationUpdate();
-        }
-      } else {
-        logger.error(`❌ Failed to reload ${addonId}`);
+      // Trigger navigation update to refresh the UI
+      const { triggerNavigationUpdate } = await import("./addons-runtime-context");
+      if (triggerNavigationUpdate) {
+        triggerNavigationUpdate();
       }
     } catch (error) {
-      logger.error(`❌ Error during hot reload of ${addonId}: ${error}`);
+      const devServer = this.devServers.get(addonId);
+      if (devServer && unloaded) devServer.status = "error";
+      logger.error(`❌ Error during hot reload of ${addonId}: ${String(error)}`);
+    } finally {
+      this.reloadsInProgress.delete(addonId);
     }
   }
 
@@ -331,9 +416,13 @@ class AddonDevManager {
         this.eventSource = new EventSource("http://localhost:3001/addon-updates");
 
         this.eventSource.onmessage = (event) => {
-          const data = JSON.parse(event.data) as { type?: string; addonId?: string };
-          if (data.type === "addon-changed" && data.addonId) {
-            this.reloadAddon(data.addonId);
+          const rawData = typeof event.data === "string" ? event.data : "";
+          const data: unknown = JSON.parse(rawData);
+          if (data && typeof data === "object") {
+            const update = data as Record<string, unknown>;
+            if (update.type === "addon-changed" && typeof update.addonId === "string") {
+              void this.reloadAddon(update.addonId);
+            }
           }
         };
 
@@ -351,7 +440,7 @@ class AddonDevManager {
    */
   private injectDevTools(): void {
     // Add development-specific APIs to a generic context
-    const devCtx = createAddonContext("dev-tools");
+    const devCtx = {};
     (
       devCtx as unknown as {
         dev?: {
@@ -382,20 +471,13 @@ class AddonDevManager {
       this.eventSource = null;
     }
 
-    // Clean up dev addon instances
-    const devAddons = (
-      globalThis as unknown as {
-        __DEV_ADDONS__?: Map<string, { disable?: () => void }>;
-      }
-    ).__DEV_ADDONS__;
-    if (devAddons) {
-      for (const [, instance] of devAddons) {
-        if (instance.disable) {
-          instance.disable();
-        }
-      }
-      devAddons.clear();
+    for (const [addonId, instance] of this.devAddons) {
+      void instance.disable();
+      // Drop the durable nav/routes ingested on load so disabling dev mode
+      // doesn't leave a stale sidebar entry behind.
+      clearAddonContributions(addonId);
     }
+    this.devAddons.clear();
   }
 
   /**
@@ -464,11 +546,24 @@ export const addonDevManager = new AddonDevManager();
 
 // Make debugging tools available globally in development mode
 if (import.meta.env.DEV) {
-  // Make available globally for debugging (dev only)
-  (globalThis as unknown as { __ADDON_DEV__?: unknown }).__ADDON_DEV__ = addonDevManager;
-
-  // Add global helper functions (dev only)
-  (globalThis as unknown as { discoverAddons?: () => void }).discoverAddons = () =>
-    addonDevManager.discoverAndRegister();
-  (globalThis as unknown as { reloadAddons?: () => void }).reloadAddons = () => reloadAllAddons();
+  Object.defineProperties(globalThis, {
+    __ADDON_DEV__: {
+      configurable: true,
+      enumerable: false,
+      value: addonDevManager,
+      writable: false,
+    },
+    discoverAddons: {
+      configurable: true,
+      enumerable: false,
+      value: () => addonDevManager.discoverAndRegister(),
+      writable: false,
+    },
+    reloadAddons: {
+      configurable: true,
+      enumerable: false,
+      value: () => reloadAllAddons(),
+      writable: false,
+    },
+  });
 }

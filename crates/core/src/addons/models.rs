@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -6,6 +7,24 @@ pub struct AddonFile {
     pub name: String,
     pub content: String,
     pub is_main: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonAsset {
+    /// Opaque, add-on-scoped identifier used to retrieve the asset bytes.
+    pub id: String,
+    /// Logical package path exposed to the add-on (for example `assets/logo.png`).
+    pub path: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonAssetContent {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
@@ -27,6 +46,54 @@ pub struct AddonPermission {
     pub category: String,
     pub functions: Vec<FunctionPermission>,
     pub purpose: String,
+}
+
+/// A durable addon page declared via `contributes.routes`. Ingested at boot
+/// without executing addon code — the lazy-activation surface.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonContributedRoute {
+    pub id: String,
+    /// Optional suffix below the host-owned `/addons/<addon-id>` mount.
+    /// `None` represents the addon root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A placement in a host slot (e.g. `"sidebar"`) declared via
+/// `contributes.links`, pointing at a declared route of the same addon.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonContributedLink {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub route: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+}
+
+/// Declarative contributions an addon makes to the host: durable routes plus
+/// links placed in host slots (map keyed by slot id; BTreeMap keeps
+/// serialization deterministic). Unknown slot keys round-trip untouched —
+/// they're future host surfaces.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonContributes {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<AddonContributedRoute>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub links: BTreeMap<String, Vec<AddonContributedLink>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonNetworkAccess {
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
+    pub approved_hosts: Vec<String>,
 }
 
 /// Unified addon manifest structure that handles both development and runtime scenarios
@@ -52,6 +119,11 @@ pub struct AddonManifest {
     pub min_wealthfolio_version: Option<String>,
     pub keywords: Option<Vec<String>>,
     pub icon: Option<String>,
+    pub network: Option<AddonNetworkAccess>,
+    #[serde(rename = "hostDependencies")]
+    pub host_dependencies: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contributes: Option<AddonContributes>,
 
     // Runtime fields (only present after installation)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +170,8 @@ impl AddonManifest {
 pub struct ExtractedAddon {
     pub metadata: AddonManifest,
     pub files: Vec<AddonFile>,
+    #[serde(default)]
+    pub assets: Vec<AddonAsset>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -113,6 +187,7 @@ pub struct InstalledAddon {
 pub struct AddonStoreListing {
     pub metadata: AddonManifest,
     pub download_url: String,
+    pub sha256: Option<String>,
     pub downloads: Option<u32>,
     pub rating: Option<f32>,
     pub review_count: Option<u32>,
@@ -130,6 +205,7 @@ pub struct AddonUpdateInfo {
     pub latest_version: String,
     pub update_available: bool,
     pub download_url: Option<String>,
+    pub sha256: Option<String>,
     pub release_notes: Option<String>,
     pub release_date: Option<String>,
     pub changelog_url: Option<String>,

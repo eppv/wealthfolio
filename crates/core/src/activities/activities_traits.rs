@@ -55,6 +55,31 @@ pub trait ActivityRepositoryTrait: Send + Sync {
         });
         Ok(activities)
     }
+    fn get_split_activities_by_asset_ids_in_date_range(
+        &self,
+        asset_ids: &[String],
+        start_utc: DateTime<Utc>,
+        end_exclusive_utc: DateTime<Utc>,
+    ) -> Result<Vec<Activity>> {
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested_assets: HashSet<&str> = asset_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities()?;
+        activities.retain(|activity| {
+            activity
+                .asset_id
+                .as_deref()
+                .is_some_and(|asset_id| requested_assets.contains(asset_id))
+                && activity.is_posted()
+                && activity.effective_type() == super::ACTIVITY_TYPE_SPLIT
+                && activity.activity_date >= start_utc
+                && activity.activity_date < end_exclusive_utc
+        });
+        activities.sort_by_key(|activity| activity.activity_date);
+        Ok(activities)
+    }
     fn get_transfer_activities_touching_account_ids_in_date_range(
         &self,
         account_ids: &[String],
@@ -138,6 +163,7 @@ pub trait ActivityRepositoryTrait: Send + Sync {
         date_from: Option<NaiveDate>,
         date_to: Option<NaiveDate>,
         instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
     ) -> Result<ActivitySearchResponse>;
     #[allow(clippy::too_many_arguments)]
     fn search_activities_in_utc_range(
@@ -152,6 +178,7 @@ pub trait ActivityRepositoryTrait: Send + Sync {
         date_from_utc: Option<DateTime<Utc>>,
         date_to_utc_exclusive: Option<DateTime<Utc>>,
         instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
     ) -> Result<ActivitySearchResponse> {
         let date_from = date_from_utc.map(|dt| dt.date_naive());
         let date_to =
@@ -168,6 +195,7 @@ pub trait ActivityRepositoryTrait: Send + Sync {
             date_from,
             date_to,
             instrument_type_filter,
+            activity_id_filter,
         )
     }
     async fn create_activity(&self, new_activity: NewActivity) -> Result<Activity>;
@@ -195,6 +223,21 @@ pub trait ActivityRepositoryTrait: Send + Sync {
         delete_ids: Vec<String>,
     ) -> Result<ActivityBulkMutationResult>;
     async fn create_activities(&self, activities: Vec<NewActivity>) -> Result<usize>;
+    /// Returns activities from both active and archived accounts.
+    fn get_activities_including_archived_accounts(&self) -> Result<Vec<Activity>> {
+        Err(crate::Error::Unexpected(
+            "Activity repository does not support archived-account activity reads".to_string(),
+        ))
+    }
+    async fn update_activities_for_final_cash_migration(
+        &self,
+        updates: Vec<ActivityFinalCashMigrationUpdate>,
+    ) -> Result<ActivityFinalCashMigrationWriteResult> {
+        let _ = updates;
+        Err(crate::Error::Unexpected(
+            "Activity repository does not support the final-cash migration".to_string(),
+        ))
+    }
     fn get_first_activity_date(
         &self,
         account_ids: Option<&[String]>,
@@ -311,6 +354,7 @@ pub trait ActivityServiceTrait: Send + Sync {
         date_from: Option<NaiveDate>,
         date_to: Option<NaiveDate>,
         instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
     ) -> Result<ActivitySearchResponse>;
     #[allow(clippy::too_many_arguments)]
     fn search_activities_in_utc_range(
@@ -325,6 +369,7 @@ pub trait ActivityServiceTrait: Send + Sync {
         date_from_utc: Option<DateTime<Utc>>,
         date_to_utc_exclusive: Option<DateTime<Utc>>,
         instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
     ) -> Result<ActivitySearchResponse> {
         let date_from = date_from_utc.map(|dt| dt.date_naive());
         let date_to =
@@ -341,6 +386,7 @@ pub trait ActivityServiceTrait: Send + Sync {
             date_from,
             date_to,
             instrument_type_filter,
+            activity_id_filter,
         )
     }
     fn get_first_activity_date(

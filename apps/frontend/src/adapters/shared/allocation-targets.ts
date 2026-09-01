@@ -7,6 +7,7 @@ import type {
   AllocationTarget,
   SaveAllocationTargetResult,
   RebalancePlan,
+  AllocationTargetConstraint,
   ScenarioMode,
 } from "@/lib/types";
 
@@ -84,18 +85,53 @@ export const getAllocationTargetDrift = async (
   });
 };
 
+// ── Sell constraints ─────────────────────────────────────────────────────────
+
+export const listTargetConstraints = async (
+  targetId: string,
+): Promise<AllocationTargetConstraint[]> => {
+  return invoke<AllocationTargetConstraint[]>("list_target_constraints", { targetId });
+};
+
+export const saveTargetConstraints = async (
+  targetId: string,
+  constraints: AllocationTargetConstraint[],
+): Promise<AllocationTargetConstraint[]> => {
+  return invoke<AllocationTargetConstraint[]>("save_target_constraints", {
+    targetId,
+    constraints,
+  });
+};
+
 // ── Rebalance ─────────────────────────────────────────────────────────────────
+
+export function canonicalizeEligibleAssetIds(
+  eligibleAssetIds?: readonly string[],
+): string[] | undefined {
+  if (eligibleAssetIds === undefined) return undefined;
+  return [...new Set(eligibleAssetIds)].sort();
+}
 
 export const calculateRebalancePlan = async (
   targetId: string,
   availableCash: number,
   filter: AccountScope,
   scenarioMode: ScenarioMode = "cash_flow_only",
+  eligibleAssetIds?: readonly string[],
 ): Promise<RebalancePlan> => {
-  return invoke<RebalancePlan>("calculate_rebalance_plan", {
+  const payload: {
+    targetId: string;
+    availableCash: number;
+    filter: AccountScope;
+    scenarioMode: ScenarioMode;
+    eligibleAssetIds?: string[];
+  } = {
     targetId,
     availableCash,
     filter,
     scenarioMode,
-  });
+  };
+  const canonicalIds = canonicalizeEligibleAssetIds(eligibleAssetIds);
+  if (canonicalIds !== undefined) payload.eligibleAssetIds = canonicalIds;
+  return invoke<RebalancePlan>("calculate_rebalance_plan", payload);
 };

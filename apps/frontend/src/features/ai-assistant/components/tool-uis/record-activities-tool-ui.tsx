@@ -18,9 +18,13 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  useDateFormatting,
+  useNumberFormatting,
 } from "@wealthfolio/ui";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import type { TFunction } from "i18next";
 import { memo, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useRuntimeContext } from "../../hooks/use-runtime-context";
 import type {
   RecordActivitiesArgs,
@@ -35,6 +39,7 @@ import {
 import {
   createActivityAmountFormatter,
   createActivityQuantityFormatter,
+  estimateDraftAmount,
   formatActivityAmount,
   formatActivityDate,
   formatActivityQuantity,
@@ -79,7 +84,9 @@ function RecordActivitiesLoadingSkeleton() {
         <Table>
           <TableHeader>
             <TableRow>
-              {Array.from({ length: 9 }).map((_, i) => (
+              {/* Matches the 10 real columns: date, type, symbol, qty,
+                  price, amount, fee, tax, account, status. */}
+              {Array.from({ length: 10 }).map((_, i) => (
                 <TableHead key={i}>
                   <Skeleton className="h-3 w-12" />
                 </TableHead>
@@ -89,7 +96,7 @@ function RecordActivitiesLoadingSkeleton() {
           <TableBody>
             {Array.from({ length: 4 }).map((_, row) => (
               <TableRow key={row}>
-                {Array.from({ length: 9 }).map((_, col) => (
+                {Array.from({ length: 10 }).map((_, col) => (
                   <TableCell key={col}>
                     <Skeleton className="h-4 w-full" />
                   </TableCell>
@@ -106,21 +113,22 @@ function RecordActivitiesLoadingSkeleton() {
 function getRowStatusBadge(
   status: RecordActivitiesSubmissionStatus | undefined,
   isValid: boolean,
+  t: TFunction,
 ): RowStatusBadge {
   if (status?.status === "submitted") {
     return {
-      label: "Submitted",
+      label: t("ai:recordActivities.submitted"),
       variant: "default",
       className: "",
     };
   }
   if (status?.status === "error") {
-    return { label: "Error", variant: "destructive", className: "" };
+    return { label: t("ai:recordActivities.error"), variant: "destructive", className: "" };
   }
   if (isValid) {
-    return { label: "Ready", variant: "outline", className: "" };
+    return { label: t("ai:recordActivities.ready"), variant: "outline", className: "" };
   }
-  return { label: "Invalid", variant: "secondary", className: "" };
+  return { label: t("ai:recordActivities.invalid"), variant: "secondary", className: "" };
 }
 
 function RecordActivitiesToolUIContentImpl({
@@ -128,6 +136,10 @@ function RecordActivitiesToolUIContentImpl({
   status,
   toolCallId,
 }: RecordActivitiesToolUIContentProps) {
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   const { settings } = useSettingsContext();
   const baseCurrency = settings?.baseCurrency ?? "USD";
   const { isBalanceHidden } = useBalancePrivacy();
@@ -137,8 +149,14 @@ function RecordActivitiesToolUIContentImpl({
     () => normalizeRecordActivitiesResult(result, baseCurrency),
     [baseCurrency, result],
   );
-  const amountFormatter = useMemo(() => createActivityAmountFormatter(), []);
-  const quantityFormatter = useMemo(() => createActivityQuantityFormatter(), []);
+  const amountFormatter = useMemo(
+    () => createActivityAmountFormatter(numberFormatting),
+    [numberFormatting],
+  );
+  const quantityFormatter = useMemo(
+    () => createActivityQuantityFormatter(numberFormatting),
+    [numberFormatting],
+  );
 
   const [localStatuses, setLocalStatuses] = useState<RecordActivitiesSubmissionStatus[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -177,7 +195,9 @@ function RecordActivitiesToolUIContentImpl({
     return (
       <Card className="border-destructive/30 bg-destructive/5">
         <CardContent className="py-4">
-          <p className="text-destructive text-sm font-medium">Failed to prepare activity drafts</p>
+          <p className="text-destructive text-sm font-medium">
+            {t("ai:recordActivities.failedPrepare")}
+          </p>
         </CardContent>
       </Card>
     );
@@ -187,7 +207,9 @@ function RecordActivitiesToolUIContentImpl({
     return (
       <Card className="border-destructive/30 bg-destructive/5">
         <CardContent className="py-4">
-          <p className="text-destructive text-sm font-medium">No batch activity draft available</p>
+          <p className="text-destructive text-sm font-medium">
+            {t("ai:recordActivities.noBatchDraft")}
+          </p>
         </CardContent>
       </Card>
     );
@@ -201,7 +223,7 @@ function RecordActivitiesToolUIContentImpl({
     try {
       const { creates, rowIndexByTempId } = buildRecordActivitiesCreatePayload(pendingValidRows);
       if (creates.length === 0) {
-        setSubmitError("No valid rows available to submit.");
+        setSubmitError(t("ai:recordActivities.noValidRows"));
         return;
       }
 
@@ -247,7 +269,7 @@ function RecordActivitiesToolUIContentImpl({
         }
       }
     } catch (error) {
-      setSubmitError(error instanceof Error ? error.message : "Failed to save activities");
+      setSubmitError(error instanceof Error ? error.message : t("ai:recordActivities.failedSave"));
     } finally {
       setIsSubmitting(false);
     }
@@ -263,46 +285,63 @@ function RecordActivitiesToolUIContentImpl({
       <CardHeader className="pb-2">
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div>
-            <CardTitle className="text-sm font-medium">Batch Activity Preview</CardTitle>
-            <p className="text-muted-foreground mt-1 text-xs">Review rows, then confirm once.</p>
+            <CardTitle className="text-sm font-medium">
+              {t("ai:recordActivities.batchPreview")}
+            </CardTitle>
+            <p className="text-muted-foreground mt-1 text-xs">
+              {t("ai:recordActivities.reviewHint")}
+            </p>
           </div>
           <Badge variant="outline" className="text-xs">
-            {validRows} ready
+            {t("ai:recordActivities.readyCount", { count: validRows })}
           </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-3 px-0 pb-3">
         <div className="grid grid-cols-2 gap-2 px-6 text-xs md:grid-cols-4">
-          <div className="rounded-md border px-2 py-1">Rows: {totalRows}</div>
-          <div className="rounded-md border px-2 py-1">Valid: {validRows}</div>
-          <div className="rounded-md border px-2 py-1">Errors: {errorRows}</div>
-          <div className="rounded-md border px-2 py-1">Will create: {pendingValidRows.length}</div>
+          <div className="rounded-md border px-2 py-1">
+            {t("ai:recordActivities.rows", { count: totalRows })}
+          </div>
+          <div className="rounded-md border px-2 py-1">
+            {t("ai:recordActivities.valid", { count: validRows })}
+          </div>
+          <div className="rounded-md border px-2 py-1">
+            {t("ai:recordActivities.errors", { count: errorRows })}
+          </div>
+          <div className="rounded-md border px-2 py-1">
+            {t("ai:recordActivities.willCreate", { count: pendingValidRows.length })}
+          </div>
         </div>
 
         <div className="max-h-[360px] overflow-y-auto">
           <Table>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
-                <TableHead className="pl-4 text-xs">Date</TableHead>
-                <TableHead className="text-xs">Type</TableHead>
-                <TableHead className="text-xs">Symbol</TableHead>
-                <TableHead className="text-right text-xs">Qty</TableHead>
-                <TableHead className="text-right text-xs">Price</TableHead>
-                <TableHead className="text-right text-xs">Amount</TableHead>
-                <TableHead className="text-right text-xs">Fee</TableHead>
-                <TableHead className="text-xs">Account</TableHead>
-                <TableHead className="pr-4 text-xs">Status</TableHead>
+                <TableHead className="pl-4 text-xs">{t("ai:recordActivities.date")}</TableHead>
+                <TableHead className="text-xs">{t("ai:recordActivities.type")}</TableHead>
+                <TableHead className="text-xs">{t("ai:recordActivities.symbol")}</TableHead>
+                <TableHead className="text-right text-xs">{t("ai:recordActivities.qty")}</TableHead>
+                <TableHead className="text-right text-xs">
+                  {t("ai:recordActivities.price")}
+                </TableHead>
+                <TableHead className="text-right text-xs">
+                  {t("ai:recordActivities.amount")}
+                </TableHead>
+                <TableHead className="text-right text-xs">{t("ai:recordActivities.fee")}</TableHead>
+                <TableHead className="text-right text-xs">{t("ai:recordActivities.tax")}</TableHead>
+                <TableHead className="text-xs">{t("ai:recordActivities.account")}</TableHead>
+                <TableHead className="pr-4 text-xs">{t("ai:recordActivities.status")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {rows.map((row) => {
                 const activityBadge = getActivityTypeBadge(row.draft.activityType);
                 const statusEntry = mergedStatuses.get(row.rowIndex);
-                const rowStatusBadge = getRowStatusBadge(statusEntry, row.validation.isValid);
+                const rowStatusBadge = getRowStatusBadge(statusEntry, row.validation.isValid, t);
                 return (
                   <TableRow key={row.rowIndex} className="text-xs">
                     <TableCell className="py-2 pl-4 tabular-nums">
-                      {formatActivityDate(row.draft.activityDate)}
+                      {formatActivityDate(row.draft.activityDate, dateFormatting)}
                     </TableCell>
                     <TableCell className="py-2">
                       <Badge
@@ -330,7 +369,9 @@ function RecordActivitiesToolUIContentImpl({
                     </TableCell>
                     <TableCell className="py-2 text-right tabular-nums">
                       {formatActivityAmount(
-                        row.draft.amount,
+                        // Stated amounts verbatim; trade totals preview the
+                        // mirror calc (the backend derives them at commit).
+                        estimateDraftAmount(row.draft, row.resolvedAsset?.instrumentType),
                         amountFormatter,
                         isBalanceHidden,
                         row.draft.currency,
@@ -339,6 +380,14 @@ function RecordActivitiesToolUIContentImpl({
                     <TableCell className="py-2 text-right tabular-nums">
                       {formatActivityAmount(
                         row.draft.fee,
+                        amountFormatter,
+                        isBalanceHidden,
+                        row.draft.currency,
+                      )}
+                    </TableCell>
+                    <TableCell className="py-2 text-right tabular-nums">
+                      {formatActivityAmount(
+                        row.draft.tax,
                         amountFormatter,
                         isBalanceHidden,
                         row.draft.currency,
@@ -362,7 +411,7 @@ function RecordActivitiesToolUIContentImpl({
                         )}
                         {!statusEntry?.error &&
                           row.errors[0] &&
-                          rowStatusBadge.label !== "Submitted" && (
+                          statusEntry?.status !== "submitted" && (
                             <p className="text-muted-foreground max-w-[180px] truncate text-[10px]">
                               {row.errors[0]}
                             </p>
@@ -385,8 +434,10 @@ function RecordActivitiesToolUIContentImpl({
 
         {(submitSummary || parsed.submittedAt) && (
           <div className="text-muted-foreground px-6 text-xs">
-            Created {(submitSummary?.createdCount ?? persistedSummary.createdCount) || 0} row(s),
-            errors {(submitSummary?.errorCount ?? persistedSummary.errorCount) || 0}.
+            {t("ai:recordActivities.createdSummary", {
+              created: (submitSummary?.createdCount ?? persistedSummary.createdCount) || 0,
+              errors: (submitSummary?.errorCount ?? persistedSummary.errorCount) || 0,
+            })}
           </div>
         )}
 
@@ -397,8 +448,9 @@ function RecordActivitiesToolUIContentImpl({
             ) : (
               <Icons.Check className="mr-2 h-4 w-4" />
             )}
-            Confirm{" "}
-            {pendingValidRows.length > 0 ? `${pendingValidRows.length} Activities` : "Activities"}
+            {pendingValidRows.length > 0
+              ? t("ai:recordActivities.confirmActivities", { count: pendingValidRows.length })
+              : t("ai:recordActivities.confirmActivitiesEmpty")}
           </Button>
         </div>
       </CardContent>

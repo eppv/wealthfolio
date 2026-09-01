@@ -1,3 +1,4 @@
+import type { FormattingApi } from "@wealthfolio/ui";
 /** Utilities for extracting numeric values from JSON and HTML responses. */
 
 // ---------------------------------------------------------------------------
@@ -10,6 +11,13 @@ export interface PathEntry {
   /** Original source-string form if this entry came from a stringified number
    *  (e.g. "105.90"). Preserves trailing zeros so downstream text lookups match. */
   raw?: string;
+}
+
+const DOT_NOTATION_KEY = /^(?!length\(\)$)[A-Za-z0-9_#/\\-]+$/;
+
+/** Append an object key using syntax accepted by the backend JSONPath parser. */
+export function appendJsonPathKey(path: string, key: string): string {
+  return DOT_NOTATION_KEY.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`;
 }
 
 /** Recursively collect all numeric leaf paths from a parsed JSON value.
@@ -34,7 +42,7 @@ export function walkJson(value: unknown, path = "$"): PathEntry[] {
     return [...wildcardEntries, ...specificEntries];
   }
   if (typeof value === "object" && value !== null) {
-    return Object.entries(value).flatMap(([k, v]) => walkJson(v, `${path}.${k}`));
+    return Object.entries(value).flatMap(([k, v]) => walkJson(v, appendJsonPathKey(path, k)));
   }
   return [];
 }
@@ -44,12 +52,12 @@ export function friendlyPath(path: string): string {
   return path.replace(/^\$\.?/, "") || "$";
 }
 
-export function formatNumber(n: number): string {
+export function formatNumber(n: number, formatting: Pick<FormattingApi, "formatDecimal">): string {
   if (Math.abs(n) >= 1000) {
-    return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    return formatting.formatDecimal(n, { maximumFractionDigits: 2 });
   }
   if (n !== Math.floor(n)) {
-    return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+    return formatting.formatDecimal(n, { maximumFractionDigits: 6 });
   }
   return String(n);
 }

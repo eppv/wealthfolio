@@ -1,11 +1,11 @@
-import type { Account, CategoryAllocation, Holding } from "@/lib/types";
-
-/** Minimal per-account valuation shape (matches the accounts simple-performance metrics). */
-export interface AccountValueSource {
-  accountId: string;
-  totalValue?: number | null;
-  fxRateToBase?: number | null;
-}
+import type {
+  Account,
+  AccountValueSource,
+  CategoryAllocation,
+  CurrentValuationSummary,
+  Holding,
+} from "@/lib/types";
+import type { FormattingApi } from "@wealthfolio/ui";
 
 /** Cycling palette built from the theme chart tokens (retargeted to the allocation palette). */
 export const CHART_PALETTE = [
@@ -40,45 +40,67 @@ export interface ValueStripData {
   cash: number;
   invested: number;
   investedPercent: number;
+  bookCost: number;
   holdingsCount: number;
   accountsCount: number;
   currencySplit: { currency: string; value: number; percentage: number }[];
   cashCurrencySplit: { currency: string; value: number; percentage: number }[];
+  bookCostCurrencySplit: { currency: string; value: number; percentage: number }[];
 }
 
 const num = (v: number | null | undefined): number => Number(v) || 0;
 
-function currencySymbol(currency: string): string {
-  try {
-    return new Intl.NumberFormat("en-US", { style: "currency", currency, maximumFractionDigits: 0 })
-      .format(0)
-      .replace(/[0-9.,\s]/g, "");
-  } catch {
-    return "";
+/**
+ * Total cost basis of invested (non-cash) holdings, plus a per-currency breakdown
+ * (local value + base-weighted percentage) — mirrors the cash-by-currency split.
+ */
+export function computeBookCost(holdings: Holding[]): {
+  total: number;
+  currencySplit: { currency: string; value: number; percentage: number }[];
+} {
+  let total = 0;
+  const byCurrency = new Map<string, { localValue: number; baseValue: number }>();
+
+  for (const holding of holdings) {
+    if (isCash(holding)) continue;
+    const base = num(holding.costBasis?.base);
+    const local = holding.costBasis?.local != null ? num(holding.costBasis.local) : base;
+    const currency = holding.localCurrency || holding.baseCurrency;
+    total += base;
+    const existing = byCurrency.get(currency) ?? { localValue: 0, baseValue: 0 };
+    byCurrency.set(currency, {
+      localValue: existing.localValue + local,
+      baseValue: existing.baseValue + base,
+    });
   }
+
+  const currencySplit = [...byCurrency.entries()]
+    .map(([currency, value]) => ({
+      currency,
+      value: value.localValue,
+      percentage: total > 0 ? (value.baseValue / total) * 100 : 0,
+    }))
+    .sort((a, b) => b.percentage - a.percentage);
+
+  return { total, currencySplit };
 }
 
 /** Compact money for tight spots (donut center, legend): $1.28M, $361K. */
-export function formatCompact(value: number, currency: string): string {
-  const symbol = currencySymbol(currency);
-  const abs = Math.abs(value);
-  const sign = value < 0 ? "-" : "";
-  if (abs >= 1e6) return `${sign}${symbol}${(abs / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${sign}${symbol}${Math.round(abs / 1e3)}K`;
-  return `${sign}${symbol}${Math.round(abs)}`;
+export function formatCompact(
+  value: number,
+  currency: string,
+  formatting: Pick<FormattingApi, "formatCompactAmount">,
+): string {
+  return formatting.formatCompactAmount(value, currency);
 }
 
 /** Whole-dollar money for the value strip headline figures: $1,284,500. */
-export function formatWhole(value: number, currency: string): string {
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency,
-      maximumFractionDigits: 0,
-    }).format(value);
-  } catch {
-    return `${Math.round(value)}`;
-  }
+export function formatWhole(
+  value: number,
+  currency: string,
+  formatting: Pick<FormattingApi, "formatRoundedAmount">,
+): string {
+  return formatting.formatRoundedAmount(value, currency);
 }
 
 function isCash(holding: Holding): boolean {
@@ -130,15 +152,54 @@ export function computeValueStrip(holdings: Holding[], accounts: Account[]): Val
   // Prefer in-scope accounts derived from holdings; fall back to the account list.
   const accountsCount = accountIds.size || accounts.length;
 
+  const bookCost = computeBookCost(holdings);
+
   return {
     total,
     cash,
     invested,
     investedPercent: total > 0 ? (invested / total) * 100 : 0,
+    bookCost: bookCost.total,
     holdingsCount: holdings.length,
     accountsCount,
     currencySplit,
     cashCurrencySplit,
+    bookCostCurrencySplit: bookCost.currencySplit,
+  };
+}
+
+/**
+ * Map a scoped current-valuation summary into value-strip data. The summary has no cost basis,
+ * so pass `holdings` to populate book cost; otherwise it falls back to 0.
+ */
+export function valueStripFromCurrentSummary(
+  summary: CurrentValuationSummary,
+  holdings: Holding[] = [],
+): ValueStripData {
+  const total = num(summary.totalValueBase);
+  const cash = num(summary.cashBalanceBase);
+  const invested = num(summary.investmentMarketValueBase);
+  const bookCost = computeBookCost(holdings);
+
+  return {
+    total,
+    cash,
+    invested,
+    investedPercent: total > 0 ? (invested / total) * 100 : 0,
+    bookCost: bookCost.total,
+    holdingsCount: summary.holdingsCount,
+    accountsCount: summary.accountCount,
+    currencySplit: summary.currencySplit.map((split) => ({
+      currency: split.currency,
+      value: num(split.valueBase),
+      percentage: split.percentage,
+    })),
+    cashCurrencySplit: summary.cashCurrencySplit.map((split) => ({
+      currency: split.currency,
+      value: num(split.valueLocal ?? split.valueBase),
+      percentage: split.percentage,
+    })),
+    bookCostCurrencySplit: bookCost.currencySplit,
   };
 }
 
@@ -232,6 +293,7 @@ export function currencyLensItems(holdings: Holding[]): LensItem[] {
 
 /**
  * Nested account breakdown: account groups at the top level, individual accounts as children.
+ * A group stays a group at any member count, so its accounts are always reachable underneath.
  * Ungrouped accounts (no `account.group`) appear as flat top-level rows. Values come from real
  * per-account valuations (holdings are aggregated under a single id in "all" scope).
  */
@@ -242,17 +304,32 @@ export function accountTreeWeights(
   const accountMap = new Map(accounts.map((a) => [a.id, a]));
   const groups = new Map<
     string,
-    { name: string; value: number; accounts: { id: string; name: string; value: number }[] }
+    {
+      name: string;
+      groupName: string | null;
+      value: number;
+      accounts: { id: string; name: string; value: number }[];
+    }
   >();
   let total = 0;
   for (const v of valuations) {
     const account = accountMap.get(v.accountId);
     if (!account) continue;
-    const value = num(v.totalValue) * (num(v.fxRateToBase) || 1);
+    const value =
+      v.totalValueBase != null
+        ? num(v.totalValueBase)
+        : num(v.totalValue) * (num(v.fxRateToBase) || 1);
     if (value <= 0) continue;
     total += value;
-    const key = account.group || account.name;
-    const group = groups.get(key) ?? { name: key, value: 0, accounts: [] };
+    const groupName = account.group?.trim() || null;
+    // Ungrouped accounts key by id so two accounts sharing a name stay separate rows.
+    const key = groupName ? `grp:${groupName}` : `acct:${account.id}`;
+    const group = groups.get(key) ?? {
+      name: groupName ?? account.name,
+      groupName,
+      value: 0,
+      accounts: [],
+    };
     group.value += value;
     group.accounts.push({ id: account.id, name: account.name, value });
     groups.set(key, group);
@@ -261,15 +338,15 @@ export function accountTreeWeights(
     .sort((a, b) => b.value - a.value)
     .map((group, index) => {
       const color = paletteColor(index);
-      const nested = group.accounts.length > 1;
+      const isGroup = group.groupName != null;
       return {
-        id: `grp:${group.name}`,
+        id: isGroup ? `grp:${group.groupName}` : group.accounts[0].id,
         name: group.name,
         value: group.value,
         percentage: total > 0 ? (group.value / total) * 100 : 0,
         color,
         depth: 0,
-        children: nested
+        children: isGroup
           ? group.accounts
               .sort((a, b) => b.value - a.value)
               .map((acc) => ({

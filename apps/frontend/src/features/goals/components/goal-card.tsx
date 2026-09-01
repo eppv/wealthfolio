@@ -1,46 +1,64 @@
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
 import { useSettingsContext } from "@/lib/settings-provider";
 import type { Goal } from "@/lib/types";
-import { Card, cn, formatAmount, formatCompactAmount } from "@wealthfolio/ui";
+import {
+  Card,
+  cn,
+  useAmountFormatting,
+  type FormattingApi,
+  useDateFormatting,
+  useNumberFormatting,
+} from "@wealthfolio/ui";
+import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
-const DEFAULT_QUOTES: Record<string, string> = {
-  car: "for the road ahead",
-  home: "a place to come home to",
-  education: "for learning ahead",
-  retirement: "the long slow afternoon",
-  wedding: "the day to remember",
-  custom_save_up: "a little by a little",
-};
+type TFn = ReturnType<typeof useTranslation>["t"];
+
+function defaultQuote(goalType: string, t: TFn): string {
+  const quotes: Record<string, string> = {
+    car: t("goals:card.quote_car"),
+    home: t("goals:card.quote_home"),
+    education: t("goals:card.quote_education"),
+    retirement: t("goals:card.quote_retirement"),
+    wedding: t("goals:card.quote_wedding"),
+    custom_save_up: t("goals:card.quote_custom_save_up"),
+  };
+  return quotes[goalType] ?? "";
+}
 
 function coverImageSrc(goalType: string): string {
   return `/goals/${goalType}.png`;
 }
 
-function formatTimeLeft(targetDate?: string): string {
-  if (!targetDate) return "NO DEADLINE";
+function formatTimeLeft(t: TFn, targetDate?: string): string {
+  if (!targetDate) return t("goals:card.no_deadline");
   const target = new Date(targetDate);
   const now = new Date();
-  if (!Number.isFinite(target.getTime())) return "NO DEADLINE";
-  if (target.getTime() <= now.getTime()) return "DUE";
+  if (!Number.isFinite(target.getTime())) return t("goals:card.no_deadline");
+  if (target.getTime() <= now.getTime()) return t("goals:card.due");
   let months =
     (target.getFullYear() - now.getFullYear()) * 12 + (target.getMonth() - now.getMonth());
   if (target.getDate() < now.getDate()) months -= 1;
   if (months < 0) months = 0;
   const years = Math.floor(months / 12);
   const remMonths = months % 12;
-  if (years === 0) return `${remMonths}M LEFT`;
-  if (remMonths === 0) return `${years} YR${years === 1 ? "" : "S"} LEFT`;
-  return `${years}Y ${remMonths}M LEFT`;
+  if (years === 0) return t("goals:card.months_left", { count: remMonths });
+  if (remMonths === 0) return t("goals:card.years_left", { count: years });
+  return t("goals:card.years_months_left", { years, months: remMonths });
 }
 
-function formatTargetDate(targetDate?: string): string | null {
+function formatTargetDate(
+  targetDate: string | undefined,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+): string | null {
   if (!targetDate) return null;
-  const d = new Date(targetDate);
-  if (!Number.isFinite(d.getTime())) return null;
-  return d
-    .toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
-    .toUpperCase();
+  const value = targetDate.slice(0, 10);
+  const formatted = formatting.formatCalendarDate(value, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  return formatted === "-" ? null : formatted.toUpperCase();
 }
 
 function ProgressBar({ progress, fillClass }: { progress: number; fillClass: string }) {
@@ -58,6 +76,10 @@ function ProgressBar({ progress, fillClass }: { progress: number; fillClass: str
 }
 
 export function GoalCard({ goal }: { goal: Goal }) {
+  const dateFormatting = useDateFormatting();
+  const formatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const { settings } = useSettingsContext();
 
@@ -65,7 +87,7 @@ export function GoalCard({ goal }: { goal: Goal }) {
   const current = goal.summaryCurrentValue ?? 0;
   const target = goal.summaryTargetAmount ?? goal.targetAmount ?? 0;
   const progress = goal.summaryProgress ?? 0;
-  const rawQuote = goal.description?.trim() || DEFAULT_QUOTES[goal.goalType] || "";
+  const rawQuote = goal.description?.trim() || defaultQuote(goal.goalType, t) || "";
   const quote = rawQuote.length > 58 ? `${rawQuote.slice(0, 55).trimEnd()}…` : rawQuote;
   const coverImage = coverImageSrc(goal.coverImageKey ?? goal.goalType);
 
@@ -96,41 +118,41 @@ export function GoalCard({ goal }: { goal: Goal }) {
   let pill: { label: string; className: string } | null = null;
   if (isAchieved) {
     pill = {
-      label: "ACHIEVED",
+      label: t("goals:card.achieved"),
       className: "bg-success text-success-foreground",
     };
   } else if (isOffTrack) {
     pill = {
-      label: "OFF TRACK",
+      label: t("goals:card.off_track"),
       className: "bg-destructive text-destructive-foreground",
     };
   } else if (isAtRisk) {
     pill = {
-      label: "AT RISK",
+      label: t("goals:card.at_risk"),
       className: "bg-destructive text-destructive-foreground",
     };
   }
 
   const deadline = goal.targetDate ?? goal.projectedCompletionDate;
-  const targetDateStr = formatTargetDate(deadline);
-  const timeLeftStr = formatTimeLeft(deadline);
+  const targetDateStr = formatTargetDate(deadline, dateFormatting);
+  const timeLeftStr = formatTimeLeft(t, deadline);
 
   const remaining = Math.max(0, target - current);
   const hasRemaining = target > 0 && remaining > 0;
 
-  const currentDisplay = isBalanceHidden ? "••••" : formatAmount(current, currency);
+  const currentDisplay = isBalanceHidden ? "••••" : formatting.formatAmount(current, currency);
   const targetDisplay = isBalanceHidden
     ? "••••"
     : target > 0
-      ? formatAmount(target, currency)
+      ? formatting.formatAmount(target, currency)
       : "—";
   const remainingDisplay = isBalanceHidden
     ? "••••"
     : hasRemaining
-      ? formatCompactAmount(remaining, currency)
+      ? formatting.formatCompactAmount(remaining, currency)
       : "—";
 
-  const progressPct = (progress * 100).toFixed(1);
+  const progressPct = numberFormatting.formatPercent(progress, { digits: 1 });
 
   return (
     <Link to={`/goals/${goal.id}`} className="group block">
@@ -188,10 +210,9 @@ export function GoalCard({ goal }: { goal: Goal }) {
             <div className="text-right">
               <div className={cn("font-serif text-[20px] leading-none", accentClass)}>
                 {progressPct}
-                <span className="text-[11px]">%</span>
               </div>
               <div className="text-muted-foreground mt-0.5 text-[9px] tracking-[0.15em]">
-                COMPLETE
+                {t("goals:card.complete")}
               </div>
             </div>
           </div>
@@ -203,7 +224,7 @@ export function GoalCard({ goal }: { goal: Goal }) {
                 {currentDisplay}
               </div>
               <div className="text-muted-foreground mt-0.5 text-[10px]">
-                saved of <span className="tabular-nums">{targetDisplay}</span>
+                {t("goals:card.saved_of")} <span className="tabular-nums">{targetDisplay}</span>
               </div>
             </div>
             <div className="text-right">
@@ -211,7 +232,7 @@ export function GoalCard({ goal }: { goal: Goal }) {
                 {remainingDisplay}
               </div>
               <div className="text-muted-foreground mt-0.5 text-[10px]">
-                {hasRemaining ? "remaining" : "target met"}
+                {hasRemaining ? t("goals:card.remaining") : t("goals:card.target_met")}
               </div>
             </div>
           </div>

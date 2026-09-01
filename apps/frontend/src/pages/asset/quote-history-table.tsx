@@ -1,9 +1,8 @@
 import { Quote } from "@/lib/types";
-import { format } from "date-fns";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
-import { formatQuantity } from "@/lib/utils";
 import {
   createColumnHelper,
   flexRender,
@@ -14,23 +13,10 @@ import {
   SortingState,
   useReactTable,
 } from "@tanstack/react-table";
-
-declare module "@tanstack/react-table" {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  interface TableMeta<TData extends RowData> {
-    editingId?: string | null;
-    editedValues?: Record<string, unknown>;
-    handleInputChange?: (field: keyof Quote, value: string | Date, isNew?: boolean) => void;
-    handleEdit?: (quote: Quote) => void;
-    handleSave?: () => void;
-    handleCancel?: () => void;
-    handleDelete?: (quoteId: string) => void;
-  }
-}
 import {
   Button,
+  calendarDateFromLocalDate,
   DatePickerInput,
-  formatAmount,
   Icons,
   Input,
   Label,
@@ -50,7 +36,23 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  useAmountFormatting,
+  useDateFormatting,
+  useNumberFormatting,
 } from "@wealthfolio/ui";
+
+declare module "@tanstack/react-table" {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  interface TableMeta<TData extends RowData> {
+    editingId?: string | null;
+    editedValues?: Record<string, unknown>;
+    handleInputChange?: (field: keyof Quote, value: string | Date, isNew?: boolean) => void;
+    handleEdit?: (quote: Quote) => void;
+    handleSave?: () => void;
+    handleCancel?: () => void;
+    handleDelete?: (quoteId: string) => void;
+  }
+}
 
 interface QuoteHistoryTableProps {
   data: Quote[];
@@ -79,6 +81,11 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
   onDeleteQuote,
   onChangeDataSource,
 }) => {
+  const amountFormatting = useAmountFormatting();
+  const dateFormatting = useDateFormatting();
+  const numberFormatting = useNumberFormatting();
+
+  const { t } = useTranslation();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editedValues, setEditedValues] = useState<Partial<Quote>>({});
   const [isAddingQuote, setIsAddingQuote] = useState(false);
@@ -169,7 +176,7 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
   const columns = useMemo(
     () => [
       columnHelper.accessor("timestamp", {
-        header: "Date",
+        header: t("asset:quoteTable.date"),
         cell: (info) => {
           const { editingId, editedValues, handleInputChange } = info.table.options
             .meta as QuoteTableMeta;
@@ -180,13 +187,15 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
               onChange={(date: Date | undefined) => date && handleInputChange("timestamp", date)}
             />
           ) : (
-            format(new Date(value), "yyyy-MM-dd")
+            dateFormatting.formatCalendarDate(calendarDateFromLocalDate(new Date(value)), {
+              dateStyle: "short",
+            })
           );
         },
         enableSorting: true,
       }),
       columnHelper.accessor("open", {
-        header: "Open",
+        header: t("asset:quoteTable.open"),
         cell: (info) => {
           const { editingId, editedValues, handleInputChange } = info.table.options
             .meta as QuoteTableMeta;
@@ -197,13 +206,13 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
               onChange={(e) => handleInputChange("open", e.target.value)}
             />
           ) : (
-            formatAmount(value, info.row.original.currency, false)
+            amountFormatting.formatPrice(value, info.row.original.currency, false)
           );
         },
         enableSorting: false,
       }),
       columnHelper.accessor("high", {
-        header: "High",
+        header: t("asset:quoteTable.high"),
         cell: (info) => {
           const { editingId, editedValues, handleInputChange } = info.table.options
             .meta as QuoteTableMeta;
@@ -215,13 +224,13 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
               autoFocus={true}
             />
           ) : (
-            formatAmount(value, info.row.original.currency, false)
+            amountFormatting.formatPrice(value, info.row.original.currency, false)
           );
         },
         enableSorting: false,
       }),
       columnHelper.accessor("low", {
-        header: "Low",
+        header: t("asset:quoteTable.low"),
         cell: (info) => {
           const { editingId, editedValues, handleInputChange } = info.table.options
             .meta as QuoteTableMeta;
@@ -232,13 +241,13 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
               onChange={(e) => handleInputChange("low", e.target.value)}
             />
           ) : (
-            formatAmount(value, info.row.original.currency, false)
+            amountFormatting.formatPrice(value, info.row.original.currency, false)
           );
         },
         enableSorting: false,
       }),
       columnHelper.accessor("close", {
-        header: "Close",
+        header: t("asset:quoteTable.close"),
         cell: (info) => {
           const { editingId, editedValues, handleInputChange } = info.table.options
             .meta as QuoteTableMeta;
@@ -249,13 +258,13 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
               onChange={(e) => handleInputChange("close", e.target.value)}
             />
           ) : (
-            formatAmount(value, info.row.original.currency, false)
+            amountFormatting.formatPrice(value, info.row.original.currency, false)
           );
         },
         enableSorting: false,
       }),
       columnHelper.accessor("volume", {
-        header: "Volume",
+        header: t("asset:quoteTable.volume"),
         cell: (info) => {
           const { editingId, editedValues, handleInputChange } = info.table.options
             .meta as QuoteTableMeta;
@@ -266,7 +275,7 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
               onChange={(e) => handleInputChange("volume", e.target.value)}
             />
           ) : (
-            formatQuantity(value)
+            numberFormatting.formatQuantity(value)
           );
         },
         enableSorting: false,
@@ -275,7 +284,7 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
         ? [
             columnHelper.display({
               id: "actions",
-              header: "Actions",
+              header: t("asset:quoteTable.actions"),
               cell: (info) => {
                 const { editingId, handleEdit, handleSave, handleCancel, handleDelete } = info.table
                   .options.meta as QuoteTableMeta;
@@ -307,21 +316,20 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
                       </PopoverTrigger>
                       <PopoverContent>
                         <div className="flex flex-col items-center space-y-2">
-                          <h4 className="font-medium">Delete Quote</h4>
+                          <h4 className="font-medium">{t("asset:quoteTable.delete_quote")}</h4>
                           <p className="text-muted-foreground text-center text-sm">
-                            Are you sure you want to delete this historical quote? This action
-                            cannot be undone.
+                            {t("asset:quoteTable.delete_quote_confirm")}
                           </p>
                           <div className="flex space-x-2">
                             <Button variant="ghost" size="sm">
-                              Cancel
+                              {t("common:cancel")}
                             </Button>
                             <Button
                               variant="destructive"
                               size="sm"
                               onClick={() => handleDelete(quote.id)}
                             >
-                              Delete
+                              {t("asset:quoteTable.delete")}
                             </Button>
                           </div>
                         </div>
@@ -334,7 +342,7 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
           ]
         : []),
     ],
-    [isManualDataSource, handleInputChange, handleEdit, handleSave, handleCancel, handleDelete],
+    [columnHelper, amountFormatting, dateFormatting, numberFormatting, isManualDataSource, t],
   );
 
   const table = useReactTable({
@@ -378,45 +386,42 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
                 <div className="flex items-center space-x-2">
                   <Switch id="manual-tracking" checked={isManualDataSource} />
                   <Label htmlFor="manual-tracking" className="cursor-pointer">
-                    Manual tracking
+                    {t("asset:quoteTable.manual_tracking")}
                   </Label>
                 </div>
               </PopoverTrigger>
               <PopoverContent className="w-[360px] p-4">
                 <div className="space-y-4">
-                  <h4 className="font-medium">Change Tracking Mode</h4>
+                  <h4 className="font-medium">{t("asset:quoteTable.change_tracking_mode")}</h4>
                   {isManualDataSource ? (
                     <>
                       <p className="text-muted-foreground text-sm">
-                        Switching to automatic tracking will enable data fetching from Market Data
-                        Provider. Please note that this will override any manually entered quotes on
-                        the next sync.
+                        {t("asset:quoteTable.to_auto_description")}
                       </p>
                       <p className="text-sm font-medium text-yellow-600 dark:text-yellow-400">
-                        ⚠️ Your manually entered historical data may be lost.
+                        ⚠️ {t("asset:quoteTable.to_auto_warning")}
                       </p>
                     </>
                   ) : (
                     <>
                       <p className="text-muted-foreground text-sm">
-                        Switching to manual tracking will stop automatic data fetching from Market
-                        Data Provider. You&apos;ll need to enter and maintain price data manually.
+                        {t("asset:quoteTable.to_manual_description")}
                       </p>
                       <p className="text-sm font-medium text-yellow-600 dark:text-yellow-400">
-                        ⚠️ Automatic price updates will be disabled.
+                        ⚠️ {t("asset:quoteTable.to_manual_warning")}
                       </p>
                     </>
                   )}
                   <div className="flex justify-end space-x-2">
                     <Button variant="ghost" size="sm">
-                      Cancel
+                      {t("common:cancel")}
                     </Button>
                     <Button
                       variant="default"
                       size="sm"
                       onClick={() => onChangeDataSource?.(!isManualDataSource)}
                     >
-                      Confirm Change
+                      {t("asset:quoteTable.confirm_change")}
                     </Button>
                   </div>
                 </div>
@@ -431,12 +436,12 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
                   disabled={isAddingQuote}
                 >
                   <Icons.PlusCircle className="mr-2 h-4 w-4" />
-                  Add Quote
+                  {t("asset:quoteTable.add_quote")}
                 </Button>
                 <Button asChild variant="outline" size="sm">
                   <Link to="/settings/market-data/import" className="flex items-center gap-2">
                     <Icons.Import className="h-4 w-4" />
-                    Import Quotes
+                    {t("asset:quoteTable.import_quotes")}
                   </Link>
                 </Button>
               </div>
@@ -542,7 +547,10 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
 
       <div className="flex items-center justify-between">
         <div className="text-muted-foreground text-sm">
-          Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
+          {t("asset:quoteTable.page_of", {
+            page: table.getState().pagination.pageIndex + 1,
+            total: table.getPageCount(),
+          })}
         </div>
         <div className="flex items-center space-x-2">
           <Button
@@ -551,19 +559,19 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
             onClick={() => table.previousPage()}
             disabled={!table.getCanPreviousPage()}
           >
-            Previous
+            {t("asset:quoteTable.previous")}
           </Button>
           <Select
             value={(table.getState().pagination.pageIndex + 1).toString()}
             onValueChange={(value) => table.setPageIndex(parseInt(value) - 1)}
           >
             <SelectTrigger className="w-[100px]">
-              <SelectValue placeholder="Page..." />
+              <SelectValue placeholder={t("asset:quoteTable.page_placeholder")} />
             </SelectTrigger>
             <SelectContent>
               {Array.from({ length: table.getPageCount() }, (_, i) => (
                 <SelectItem key={i + 1} value={(i + 1).toString()}>
-                  Page {i + 1}
+                  {t("asset:quoteTable.page_number", { number: i + 1 })}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -574,7 +582,7 @@ export const QuoteHistoryTable: React.FC<QuoteHistoryTableProps> = ({
             onClick={() => table.nextPage()}
             disabled={!table.getCanNextPage()}
           >
-            Next
+            {t("asset:quoteTable.next")}
           </Button>
         </div>
       </div>

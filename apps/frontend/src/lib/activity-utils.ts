@@ -1,20 +1,36 @@
+import type { TFunction } from "i18next";
+import { resolveActivityCashMultiplier } from "./activity-final-amount";
 import {
   ACTIVITY_SUBTYPES,
+  ActivityStatus,
   ActivityType,
-  DECIMAL_PRECISION,
+  ActivityTypeNames,
   INCOME_ACTIVITY_TYPES,
-  InstrumentType,
   METADATA_CONTRACT_MULTIPLIER,
+  normalizePositionIntentAlias,
+  POSITION_INTENT_ALIASES,
+  SUBTYPE_DISPLAY_NAMES,
   SYMBOL_REQUIRED_TYPES,
 } from "./constants";
 import { ActivityDetails } from "./types";
 
-const roundCurrency = (value: number, precision = DECIMAL_PRECISION) => {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-  const factor = 10 ** precision;
-  return Math.round(value * factor) / factor;
+/**
+ * Localized display name for an activity type (e.g. BUY -> "Buy" / "买入").
+ * Falls back to the English name from {@link ActivityTypeNames}.
+ */
+export const localizeActivityTypeName = (t: TFunction, activityType: string): string => {
+  const fallback = (ActivityTypeNames as Record<string, string>)[activityType] ?? activityType;
+  return t(`activity:type_${activityType.toLowerCase()}`, fallback);
+};
+
+/**
+ * Localized display name for an activity subtype (e.g. DRIP, POSITION_OPEN).
+ * Falls back to the English name from {@link SUBTYPE_DISPLAY_NAMES}, then the raw value.
+ */
+export const localizeActivitySubtypeName = (t: TFunction, subtype: string): string => {
+  const normalized = subtype.trim().toUpperCase();
+  const fallback = SUBTYPE_DISPLAY_NAMES[normalized] ?? subtype;
+  return t(`activity:subtype_${normalized.toLowerCase()}`, fallback);
 };
 
 /**
@@ -23,6 +39,16 @@ const roundCurrency = (value: number, precision = DECIMAL_PRECISION) => {
  */
 export const isCashActivity = (activityType: string): boolean => {
   return !(SYMBOL_REQUIRED_TYPES as readonly string[]).includes(activityType);
+};
+
+/** Whether an activity can explicitly cross the tracked-account performance boundary. */
+export const supportsPerformanceBoundary = (activityType?: string | null): boolean => {
+  const normalizedActivityType = activityType?.trim().toUpperCase();
+  return (
+    normalizedActivityType === ActivityType.CREDIT ||
+    normalizedActivityType === ActivityType.TRANSFER_IN ||
+    normalizedActivityType === ActivityType.TRANSFER_OUT
+  );
 };
 
 /**
@@ -83,6 +109,41 @@ export const needsImportAssetResolution = (
   subtype?: string | null,
 ): boolean => {
   return isAssetIdentityRequired(activityType, subtype);
+};
+
+export const canonicalizeActivitySubtype = (
+  activityType: string,
+  subtype?: string | null,
+): string | undefined => {
+  const trimmedSubtype = subtype?.trim() ?? "";
+  if (!trimmedSubtype) return undefined;
+  const normalizedSubtype = normalizePositionIntentAlias(trimmedSubtype);
+
+  const normalizedActivityType = activityType?.trim().toUpperCase();
+  const sideAliases =
+    normalizedActivityType === ActivityType.BUY
+      ? POSITION_INTENT_ALIASES[ActivityType.BUY]
+      : normalizedActivityType === ActivityType.SELL
+        ? POSITION_INTENT_ALIASES[ActivityType.SELL]
+        : undefined;
+  if (sideAliases) {
+    if (
+      (sideAliases[ACTIVITY_SUBTYPES.POSITION_OPEN] as readonly string[]).includes(
+        normalizedSubtype,
+      )
+    ) {
+      return ACTIVITY_SUBTYPES.POSITION_OPEN;
+    }
+    if (
+      (sideAliases[ACTIVITY_SUBTYPES.POSITION_CLOSE] as readonly string[]).includes(
+        normalizedSubtype,
+      )
+    ) {
+      return ACTIVITY_SUBTYPES.POSITION_CLOSE;
+    }
+  }
+
+  return trimmedSubtype;
 };
 
 /**
@@ -235,165 +296,156 @@ export const formatSplitRatio = (amount: number): string => {
 };
 
 /**
- * Gets the fee amount from an activity
- * @param activity The activity to get the fee from
- * @returns The fee amount
- */
-export const getFee = (activity: ActivityDetails): number => {
-  return Number(activity.fee);
-};
-
-/**
- * Gets the amount from an activity, with a fallback to 0 if not provided
- * @param activity The activity to get the amount from
- * @returns The amount or 0 if not provided
- */
-export const getAmount = (activity: ActivityDetails): number => {
-  return Number(activity.amount ?? 0);
-};
-
-/**
- * Gets the quantity from an activity
- * @param activity The activity to get the quantity from
- * @returns The quantity
- */
-export const getQuantity = (activity: ActivityDetails): number => {
-  return Number(activity.quantity);
-};
-
-/**
- * Gets the unit price from an activity
- * @param activity The activity to get the unit price from
- * @returns The unit price
- */
-export const getUnitPrice = (activity: ActivityDetails): number => {
-  return Number(activity.unitPrice);
-};
-
-/**
- * Returns the contract multiplier for an activity's instrument. Options trade in
- * contracts that represent N underlying units (typically 100), so their cash
- * value is quantity × unitPrice × multiplier. A non-default multiplier is stored
- * on the activity metadata; otherwise options default to 100 and everything else
- * to 1.
- * @param activity The activity
- * @returns The contract multiplier
- */
-export const getContractMultiplier = (activity: ActivityDetails): number => {
-  const stored = Number(activity.metadata?.[METADATA_CONTRACT_MULTIPLIER]);
-  if (Number.isFinite(stored) && stored > 0) {
-    return stored;
-  }
-  return activity.instrumentType === InstrumentType.OPTION ? 100 : 1;
-};
-
-/**
- * Calculates the total value of an activity based on its type and data
- * @param activity The activity to calculate the value for
- * @returns The calculated value
+ * Returns the authoritative stored activity amount for display. Ledger views
+ * use `calculateActivityCashImpact` instead.
  */
 export const calculateActivityValue = (activity: ActivityDetails): number => {
-  const { activityType, assetSymbol, assetId, subtype } = activity;
-
-  // Handle special cases first
-  if (activityType === ActivityType.SPLIT) {
-    return 0; // Split activities don't have a monetary value
+  if (activity.activityType === ActivityType.SPLIT) return 0;
+  if (isSecuritiesTransfer(activity.activityType, activity.assetSymbol, activity.assetId)) {
+    const quantity = Math.abs(Number(activity.quantity));
+    const unitPrice = Math.abs(Number(activity.unitPrice));
+    const derived = quantity * unitPrice * activityCashMultiplier(activity);
+    if (Number.isFinite(derived) && derived > 0) return derived;
   }
-
-  if (activityType === ActivityType.FEE || activityType === ActivityType.TAX) {
-    const amount = getAmount(activity);
-    if (amount !== 0) {
-      return roundCurrency(amount);
-    }
-    return roundCurrency(getFee(activity));
-  }
-
-  const isSecTransfer = isSecuritiesTransfer(activityType, assetSymbol, assetId);
-
-  // Handle cash activities (but NOT securities transfers, which need qty × price)
-  if (
-    (isCashActivity(activityType) && !isSecTransfer) ||
-    isCashTransfer(activityType, assetSymbol, assetId) ||
-    isIncomeActivity(activityType)
-  ) {
-    let amount = getAmount(activity);
-    const fee = getFee(activity);
-
-    if (isAssetBackedIncomeSubtype(activityType, subtype) && amount === 0) {
-      const derivedAmount = getQuantity(activity) * getUnitPrice(activity);
-      if (Number.isFinite(derivedAmount) && derivedAmount > 0) {
-        amount = derivedAmount;
-      }
-    }
-
-    // For outgoing cash activities, subtract fee from amount
-    if (activityType === ActivityType.WITHDRAWAL || activityType === ActivityType.TRANSFER_OUT) {
-      return roundCurrency(Number(amount) + Number(fee));
-    }
-
-    // For incoming cash activities, subtract fee from amount
-    return roundCurrency(Number(amount) - Number(fee));
-  }
-
-  // Handle trading activities (and securities transfers)
-  const quantity = getQuantity(activity);
-  const unitPrice = getUnitPrice(activity);
-  const fee = getFee(activity);
-  let activityAmount = roundCurrency(
-    Number(quantity) * Number(unitPrice) * getContractMultiplier(activity),
-  );
-
-  // Securities transfers imported without a unit price (legacy / some broker
-  // exports) carry their monetary value on `amount`. Fall back to it so those
-  // rows don't render as 0 just because we no longer trust `amount` by default.
-  if (isSecTransfer && activityAmount === 0) {
-    const storedAmount = getAmount(activity);
-    if (storedAmount !== 0) {
-      activityAmount = roundCurrency(storedAmount);
-    }
-  }
-
-  if (activityType === ActivityType.BUY) {
-    return roundCurrency(Number(activityAmount) + Number(fee)); // Total cost including fees
-  }
-
-  if (activityType === ActivityType.SELL) {
-    return roundCurrency(Number(activityAmount) - Number(fee)); // Net proceeds after fees
-  }
-
-  // Default case - just return the activity amount
-  return roundCurrency(Number(activityAmount));
+  const value = Number(activity.amount ?? 0);
+  return Number.isFinite(value) ? Math.abs(value) : 0;
 };
 
-export const calculateActivityCashImpact = (activity: ActivityDetails): number => {
-  const { activityType, assetSymbol, assetId, subtype } = activity;
-  const activityValue = calculateActivityValue(activity);
+/**
+ * Derives the signed ledger movement from the authoritative final amount.
+ * This is presentation-only cash-audit logic; it never replaces a missing
+ * amount or changes persisted economics.
+ */
+export const calculateActivityCashImpact = (
+  activity: ActivityDetails,
+  isCreditCardAccount = false,
+): number => {
+  if (activity.status && activity.status !== ActivityStatus.POSTED) return 0;
+  if (activity.activityType === ActivityType.SPLIT) return 0;
 
-  if (!Number.isFinite(activityValue) || activityValue === 0) {
-    return 0;
+  if (isSecuritiesTransfer(activity.activityType, activity.assetSymbol, activity.assetId)) {
+    const fee = Math.abs(Number(activity.fee ?? 0));
+    return Number.isFinite(fee) && fee > 0 ? -fee : 0;
   }
 
-  switch (activityType) {
+  if (isAssetBackedIncomeSubtype(activity.activityType, activity.subtype)) return 0;
+
+  const amount = Math.abs(Number(activity.amount ?? 0));
+  if (!Number.isFinite(amount) || amount === 0) return 0;
+
+  switch (activity.activityType) {
     case ActivityType.BUY:
     case ActivityType.WITHDRAWAL:
     case ActivityType.FEE:
     case ActivityType.TAX:
-      return roundCurrency(-activityValue);
-    case ActivityType.SELL:
-    case ActivityType.DEPOSIT:
-    case ActivityType.CREDIT:
-      return roundCurrency(activityValue);
-    case ActivityType.TRANSFER_IN:
-      return isCashTransfer(activityType, assetSymbol, assetId) ? roundCurrency(activityValue) : 0;
     case ActivityType.TRANSFER_OUT:
-      return isCashTransfer(activityType, assetSymbol, assetId) ? roundCurrency(-activityValue) : 0;
-    case ActivityType.DIVIDEND:
+      return -amount;
+    case ActivityType.SELL:
+      return isProvenNegativeSell(activity, amount) ? -amount : amount;
     case ActivityType.INTEREST:
-      return isAssetBackedIncomeSubtype(activityType, subtype) ? 0 : roundCurrency(activityValue);
+      return isCreditCardAccount ? -amount : amount;
+    case ActivityType.DEPOSIT:
+    case ActivityType.DIVIDEND:
+    case ActivityType.CREDIT:
+    case ActivityType.TRANSFER_IN:
+      return amount;
     default:
       return 0;
   }
 };
+
+/**
+ * Keep in lockstep with the SELL reversal check in
+ * crates/core/src/portfolio/economic_events.rs, including the epsilon.
+ */
+function isProvenNegativeSell(activity: ActivityDetails, finalAmount: number): boolean {
+  const quantity = Math.abs(Number(activity.quantity));
+  const unitPrice = Math.abs(Number(activity.unitPrice));
+  const fee = Math.abs(Number(activity.fee ?? 0));
+  const tax = Math.abs(Number(activity.tax ?? 0));
+  const multiplier = activityCashMultiplier(activity);
+  if (![quantity, unitPrice, fee, tax, multiplier].every(Number.isFinite)) return false;
+  if (quantity === 0 || unitPrice === 0 || multiplier <= 0) return false;
+
+  const expected = quantity * unitPrice * multiplier - fee - tax;
+  if (expected >= 0) return false;
+  const tolerance = Math.max(currencyMinorUnit(activity.currency), finalAmount * 1e-8);
+  return Math.abs(Math.abs(expected) - finalAmount) <= tolerance;
+}
+
+/**
+ * Crypto quote currencies priced at 8 fraction digits. Keep in lockstep with
+ * the crypto arm of `currency_fraction_digits` in
+ * crates/core/src/fx/currency.rs (dollar-pegged stablecoins deliberately keep
+ * the two-decimal fiat default there and here).
+ */
+const CRYPTO_QUOTE_CURRENCIES = new Set([
+  "BTC",
+  "ETH",
+  "XRP",
+  "LTC",
+  "BCH",
+  "ADA",
+  "DOT",
+  "LINK",
+  "XLM",
+  "DOGE",
+  "UNI",
+  "SOL",
+  "AVAX",
+  "MATIC",
+  "ATOM",
+  "ALGO",
+  "VET",
+  "FIL",
+  "TRX",
+  "ETC",
+  "XMR",
+  "AAVE",
+  "MKR",
+  "COMP",
+  "SNX",
+  "YFI",
+  "SUSHI",
+  "CRV",
+]);
+
+const minorUnitCache = new Map<string, number>();
+
+/**
+ * One minor unit of the currency. Keep in lockstep with `currency_minor_unit`
+ * in crates/core/src/fx/currency.rs, including the crypto quote arm.
+ */
+function currencyMinorUnit(currency: string | undefined): number {
+  if (!currency) return 0.01;
+  const upper = currency.toUpperCase();
+  if (CRYPTO_QUOTE_CURRENCIES.has(upper)) return 1e-8;
+  const cached = minorUnitCache.get(upper);
+  if (cached !== undefined) return cached;
+  let unit = 0.01;
+  try {
+    const digits =
+      new Intl.NumberFormat("en", { style: "currency", currency: upper }).resolvedOptions()
+        .maximumFractionDigits ?? 2;
+    unit = Math.pow(10, -digits);
+  } catch {
+    unit = 0.01;
+  }
+  minorUnitCache.set(upper, unit);
+  return unit;
+}
+
+/**
+ * Uses the asset-owned multiplier, with the activity's creation seed as a
+ * compatibility fallback for older payloads. Presentation only: never let
+ * this decide a persisted amount.
+ */
+function activityCashMultiplier(activity: ActivityDetails): number {
+  return resolveActivityCashMultiplier(
+    activity.instrumentType,
+    activity.assetContractMultiplier ?? activity.metadata?.[METADATA_CONTRACT_MULTIPLIER],
+  );
+}
 
 /**
  * Determines if the value should be displayed as positive or negative

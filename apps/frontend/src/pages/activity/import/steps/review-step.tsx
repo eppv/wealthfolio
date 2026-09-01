@@ -4,6 +4,7 @@ import { ProgressIndicator } from "@wealthfolio/ui/components/ui/progress-indica
 import { FacetedFilter } from "@wealthfolio/ui";
 import { useAccounts } from "@/hooks/use-accounts";
 import { useCallback, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ImportAlert } from "../components/import-alert";
 import { ImportReviewGrid } from "../components/import-review-grid";
 import {
@@ -16,7 +17,7 @@ import {
   type DraftActivity,
 } from "../context";
 import { buildImportAssetCandidateFromDraft } from "../utils/asset-review-utils";
-import { validateDraft } from "../utils/draft-utils";
+import { reconcileExpenseReversalBoundary, validateDraft } from "../utils/draft-utils";
 import { getActivityImportProfileForResolvedAccountIds } from "../utils/activity-import-profile";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +91,7 @@ function findDuplicateContextRowIndexes(drafts: DraftActivity[]): number[] {
 
 export function ReviewStep() {
   const { state, dispatch, validateDrafts } = useImportContext();
+  const { t } = useTranslation();
   const { parsedRows, mapping, draftActivities } = state;
   const isValidating = state.isValidating;
   const { accounts = [] } = useAccounts({ filterActive: true, includeArchived: false });
@@ -141,11 +143,27 @@ export function ReviewStep() {
     }
 
     const statuses = [
-      { label: "Errors", value: "error", count: filterStats.errors },
-      { label: "Warnings", value: "warning", count: filterStats.warnings },
-      { label: "Duplicates", value: "duplicate", count: filterStats.duplicates },
-      { label: "Skipped", value: "skipped", count: filterStats.skipped },
-      { label: "Valid", value: "valid", count: filterStats.valid },
+      {
+        label: t("activity:import.review.statusErrors"),
+        value: "error",
+        count: filterStats.errors,
+      },
+      {
+        label: t("activity:import.review.statusWarnings"),
+        value: "warning",
+        count: filterStats.warnings,
+      },
+      {
+        label: t("activity:import.review.statusDuplicates"),
+        value: "duplicate",
+        count: filterStats.duplicates,
+      },
+      {
+        label: t("activity:import.review.statusSkipped"),
+        value: "skipped",
+        count: filterStats.skipped,
+      },
+      { label: t("activity:import.review.statusValid"), value: "valid", count: filterStats.valid },
     ].filter((o) => o.count > 0);
 
     return {
@@ -160,7 +178,7 @@ export function ReviewStep() {
       ),
       statuses,
     };
-  }, [draftActivities, filterStats]);
+  }, [draftActivities, filterStats, t]);
 
   // Apply all filters on top of drafts passed to the grid
   const { facetFilteredDrafts, nonSelectableRowIndexes } = useMemo(() => {
@@ -217,6 +235,11 @@ export function ReviewStep() {
       // Find the current draft and merge with updates
       const currentDraft = draftActivities.find((d) => d.rowIndex === rowIndex);
       if (currentDraft) {
+        const reconciledUpdates = reconcileExpenseReversalBoundary(
+          currentDraft,
+          updates,
+          accountTypeById,
+        );
         const changesAssetIdentity = [
           "symbol",
           "exchangeMic",
@@ -226,10 +249,10 @@ export function ReviewStep() {
           "isin",
           "accountId",
           "activityType",
-        ].some((field) => field in updates);
+        ].some((field) => field in reconciledUpdates);
         const mergedDraft = {
           ...currentDraft,
-          ...updates,
+          ...reconciledUpdates,
         } as DraftActivity;
         const nextCandidate = buildImportAssetCandidateFromDraft(mergedDraft);
         // Re-validate the merged draft
@@ -238,7 +261,7 @@ export function ReviewStep() {
         const shouldRevalidateStatus = currentDraft.status !== "skipped";
         dispatch(
           updateDraft(rowIndex, {
-            ...updates,
+            ...reconciledUpdates,
             ...(changesAssetIdentity
               ? {
                   assetId: undefined,
@@ -266,10 +289,10 @@ export function ReviewStep() {
 
   const handleBulkSkip = useCallback(
     (rowIndexes: number[]) => {
-      dispatch(bulkSkipDrafts(rowIndexes, "Skipped"));
+      dispatch(bulkSkipDrafts(rowIndexes, t("activity:import.review.skipReason")));
       setSelectedRows([]);
     },
-    [dispatch],
+    [dispatch, t],
   );
 
   const handleBulkUnskip = useCallback(
@@ -293,17 +316,19 @@ export function ReviewStep() {
         const currentDraft = draftActivities.find((draft) => draft.rowIndex === rowIndex);
         if (!currentDraft) continue;
 
-        const mergedDraft = {
-          ...currentDraft,
-          accountId: newAccountId,
-        } as DraftActivity;
+        const accountUpdates = reconcileExpenseReversalBoundary(
+          currentDraft,
+          { accountId: newAccountId },
+          accountTypeById,
+        );
+        const mergedDraft = { ...currentDraft, ...accountUpdates } as DraftActivity;
         const nextCandidate = buildImportAssetCandidateFromDraft(mergedDraft);
         const validation = validateDraft(mergedDraft, accountTypeById);
         const shouldRevalidateStatus = currentDraft.status !== "skipped";
 
         dispatch(
           updateDraft(rowIndex, {
-            accountId: newAccountId,
+            ...accountUpdates,
             assetId: undefined,
             importAssetKey: undefined,
             assetCandidateKey: nextCandidate?.key,
@@ -344,7 +369,11 @@ export function ReviewStep() {
     return (
       <div className="flex flex-col items-center justify-center py-12">
         <ProgressIndicator
-          message={isValidating ? "Validating activities..." : "Processing activities..."}
+          message={
+            isValidating
+              ? t("activity:import.review.validating")
+              : t("activity:import.review.processing")
+          }
           className="border-none shadow-none"
         />
       </div>
@@ -356,8 +385,8 @@ export function ReviewStep() {
     return (
       <ImportAlert
         variant="destructive"
-        title="No Data"
-        description="No CSV data available. Please go back and upload a file."
+        title={t("activity:import.review.noDataTitle")}
+        description={t("activity:import.review.noDataDescription")}
       />
     );
   }
@@ -367,8 +396,8 @@ export function ReviewStep() {
     return (
       <ImportAlert
         variant="warning"
-        title="Missing Mapping"
-        description="Column mappings are not configured. Please go back and configure the mapping."
+        title={t("activity:import.review.missingMappingTitle")}
+        description={t("activity:import.review.missingMappingDescription")}
       />
     );
   }
@@ -388,14 +417,14 @@ export function ReviewStep() {
       {state.validationError ? (
         <ImportAlert
           variant="destructive"
-          title="Backend validation failed"
+          title={t("activity:import.review.backendFailedTitle")}
           description={state.validationError}
         />
       ) : isStale ? (
         <ImportAlert
           variant="warning"
-          title="Review validation is out of date"
-          description="You changed one or more activities after the last backend validation. Revalidate before continuing to import."
+          title={t("activity:import.review.outOfDateTitle")}
+          description={t("activity:import.review.outOfDateDescription")}
         >
           <Button
             variant="outline"
@@ -403,7 +432,7 @@ export function ReviewStep() {
             className="mt-2"
             onClick={() => void validateDrafts(draftActivities)}
           >
-            Revalidate
+            {t("activity:import.review.revalidate")}
           </Button>
         </ImportAlert>
       ) : hasIssues ? (
@@ -411,13 +440,16 @@ export function ReviewStep() {
           variant={hasErrors ? "destructive" : "warning"}
           title={
             hasErrors
-              ? `${filterStats.errors} ${filterStats.errors === 1 ? "row needs fixing" : "rows need fixing"}`
-              : `${warningCount} ${warningCount === 1 ? "warning" : "warnings"} to review`
+              ? t("activity:import.review.rowNeedsFixing", { count: filterStats.errors })
+              : t("activity:import.review.warningsToReview", { count: warningCount })
           }
           description={
             hasErrors
-              ? `${validCount} of ${filterStats.all} rows are valid and ready to import. Fix errors below, or skip them to continue.`
-              : `All ${filterStats.all} activities are importable. Review warnings below or proceed.`
+              ? t("activity:import.review.errorsDescription", {
+                  valid: validCount,
+                  all: filterStats.all,
+                })
+              : t("activity:import.review.warningsDescription", { all: filterStats.all })
           }
         >
           <div className="mt-2 flex flex-wrap gap-2">
@@ -427,7 +459,7 @@ export function ReviewStep() {
                 className="border-destructive/50 text-destructive hover:bg-destructive/10 cursor-pointer"
                 onClick={() => setStatusFilter(new Set(["error"]))}
               >
-                {filterStats.errors} errors
+                {t("activity:import.review.errorsBadge", { count: filterStats.errors })}
               </Badge>
             )}
             {filterStats.warnings > 0 && (
@@ -436,7 +468,7 @@ export function ReviewStep() {
                 className="cursor-pointer border-yellow-500/50 text-yellow-700 hover:bg-yellow-500/10 dark:text-yellow-400"
                 onClick={() => setStatusFilter(new Set(["warning"]))}
               >
-                {filterStats.warnings} warnings
+                {t("activity:import.review.warningsBadge", { count: filterStats.warnings })}
               </Badge>
             )}
             {filterStats.duplicates > 0 && (
@@ -445,7 +477,7 @@ export function ReviewStep() {
                 className="cursor-pointer border-yellow-500/50 text-yellow-700 hover:bg-yellow-500/10 dark:text-yellow-400"
                 onClick={() => setStatusFilter(new Set(["duplicate"]))}
               >
-                {filterStats.duplicates} duplicates
+                {t("activity:import.review.duplicatesBadge", { count: filterStats.duplicates })}
               </Badge>
             )}
           </div>
@@ -453,43 +485,50 @@ export function ReviewStep() {
       ) : hasSkipped ? (
         <ImportAlert
           variant="success"
-          title={`${importCount} of ${filterStats.all} activities will be imported`}
-          description={`${filterStats.skipped} ${filterStats.skipped === 1 ? "activity is" : "activities are"} excluded. Your data is ready for import.`}
+          title={t("activity:import.review.willBeImportedTitle", {
+            count: importCount,
+            all: filterStats.all,
+          })}
+          description={t("activity:import.review.excludedDescription", {
+            count: filterStats.skipped,
+          })}
         />
       ) : (
         <ImportAlert
           variant="success"
-          title={`All ${filterStats.all} activities are valid`}
-          description="Your data is ready for import. You can still review and make adjustments if needed."
+          title={t("activity:import.review.allValidTitle", { all: filterStats.all })}
+          description={t("activity:import.review.allValidDescription")}
         />
       )}
 
       {/* Filter bar */}
       <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-muted-foreground mr-1 text-sm">{filterStats.all} activities</span>
+          <span className="text-muted-foreground mr-1 text-sm">
+            {t("activity:import.review.activitiesCount", { count: filterStats.all })}
+          </span>
           <FacetedFilter
-            title="Type"
+            title={t("activity:import.review.filterType")}
             options={facetedOptions.types}
             selectedValues={typeFilter}
             onFilterChange={setTypeFilter}
           />
           {importProfile.assetResolutionEnabled && (
             <FacetedFilter
-              title="Symbol"
+              title={t("activity:import.review.filterSymbol")}
               options={facetedOptions.symbols}
               selectedValues={symbolFilter}
               onFilterChange={setSymbolFilter}
             />
           )}
           <FacetedFilter
-            title="Account"
+            title={t("activity:import.review.filterAccount")}
             options={facetedOptions.accounts}
             selectedValues={accountFilter}
             onFilterChange={setAccountScope}
           />
           <FacetedFilter
-            title="Status"
+            title={t("activity:import.review.filterStatus")}
             options={facetedOptions.statuses}
             selectedValues={statusFilter}
             onFilterChange={setStatusFilter}
@@ -501,7 +540,7 @@ export function ReviewStep() {
               className="text-muted-foreground h-7 text-xs"
               onClick={clearAllFilters}
             >
-              Clear filters
+              {t("activity:import.review.clearFilters")}
             </Button>
           )}
         </div>

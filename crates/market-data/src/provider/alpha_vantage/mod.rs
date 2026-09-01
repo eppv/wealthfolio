@@ -288,6 +288,10 @@ struct CompanyOverviewResponse {
     sector: Option<String>,
     #[serde(rename = "Industry")]
     industry: Option<String>,
+    /// Trading currency of the listing OVERVIEW matched - used to confirm the
+    /// provider answered for the instrument that was asked for.
+    #[serde(rename = "Currency")]
+    currency: Option<String>,
 
     // Market data
     #[serde(rename = "MarketCapitalization")]
@@ -316,7 +320,7 @@ struct CompanyOverviewResponse {
     note: Option<String>,
     #[serde(rename = "Information")]
     information: Option<String>,
-    // Note: API provides many more fields (CIK, Exchange, Currency, EPS, Beta, etc.)
+    // Note: API provides many more fields (CIK, Exchange, EPS, Beta, etc.)
     // that are not currently mapped to AssetProfile
 }
 
@@ -423,8 +427,11 @@ impl EtfProfileResponse {
             source: Some(PROVIDER_ID.to_string()),
             name: None, // ETF_PROFILE doesn't include name
             quote_type: Some("ETF".to_string()),
-            sector: None, // ETFs have multiple sectors
+            currency: None, // ETF_PROFILE doesn't include currency
+            exchange: None, // Alpha Vantage's exchange names are not MIC-mappable
+            sector: None,   // ETFs have multiple sectors
             sectors: self.sectors_to_json(),
+            asset_allocation: None,
             industry: None,
             website: None,
             description: None,
@@ -478,8 +485,11 @@ impl CompanyOverviewResponse {
             source: Some(PROVIDER_ID.to_string()),
             name: self.name.clone(),
             quote_type,
+            currency: self.currency.clone(),
+            exchange: None, // Alpha Vantage's exchange names are not MIC-mappable
             sector: self.sector.clone(),
             sectors: None, // Alpha Vantage doesn't provide weighted sectors
+            asset_allocation: None,
             industry: self.industry.clone(),
             website: None, // Alpha Vantage doesn't provide website
             description: self.description.clone(),
@@ -1337,6 +1347,7 @@ mod tests {
                 base: Cow::Borrowed("EUR"),
                 quote: Cow::Borrowed(quote),
             },
+            identifiers: Default::default(),
             overrides: None,
             currency_hint: currency_hint.map(Cow::Borrowed),
             preferred_provider: None,

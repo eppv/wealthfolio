@@ -1,9 +1,10 @@
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{atomic::AtomicBool, Arc, RwLock};
 
 use crate::{
     ai_environment::ServerAiEnvironment, auth::AuthManager, config::Config,
-    domain_events::WebDomainEventSink, events::EventBus, secrets::build_secret_store,
+    domain_events::WebDomainEventSink, events::EventBus, oidc::OidcManager,
+    secrets::build_secret_store,
 };
 use tracing::{error, warn};
 use tracing_subscriber::prelude::*;
@@ -16,7 +17,10 @@ use wealthfolio_connect::{
 use wealthfolio_core::addons::{AddonService, AddonServiceTrait};
 use wealthfolio_core::{
     accounts::{AccountService, AccountServiceTrait},
-    activities::{ActivityService as CoreActivityService, ActivityServiceTrait},
+    activities::{
+        rebuild_pending_final_cash_accounts, run_final_cash_migration,
+        ActivityService as CoreActivityService, ActivityServiceTrait,
+    },
     assets::{
         AlternativeAssetRepositoryTrait, AlternativeAssetService, AlternativeAssetServiceTrait,
         AssetClassificationService, AssetService, AssetServiceTrait,
@@ -28,6 +32,7 @@ use wealthfolio_core::{
     limits::{ContributionLimitService, ContributionLimitServiceTrait},
     portfolio::allocation::{AllocationService, AllocationServiceTrait},
     portfolio::income::{IncomeService, IncomeServiceTrait},
+    portfolio::recalculation_gate::PortfolioRecalculationGate,
     portfolio::{
         holdings::{
             holdings_valuation_service::HoldingsValuationService, HoldingsService,
@@ -47,6 +52,8 @@ use wealthfolio_device_sync::{engine::DeviceSyncRuntimeState, DeviceEnrollServic
 use wealthfolio_storage_sqlite::{
     accounts::AccountRepository,
     activities::ActivityRepository,
+    addons::AddonStorageRepository,
+    agent::{McpAuditRepository, PatRepository},
     ai_chat::AiChatRepository,
     assets::{AlternativeAssetRepository, AssetRepository},
     db::{self, write_actor},
@@ -100,13 +107,14 @@ pub struct AppState {
     pub ai_chat_service: Arc<ChatService<ServerAiEnvironment>>,
     pub data_root: String,
     pub db_path: String,
-    pub instance_id: String,
     pub secret_store: Arc<dyn SecretStore>,
     pub event_bus: EventBus,
     pub auth: Option<Arc<AuthManager>>,
+    pub oidc: Option<Arc<OidcManager>>,
     pub device_enroll_service: Arc<DeviceEnrollService>,
     pub app_sync_repository: Arc<AppSyncRepository>,
     pub device_sync_runtime: Arc<DeviceSyncRuntimeState>,
+    pub broker_sync_running: Arc<AtomicBool>,
     pub health_service: Arc<dyn HealthServiceTrait + Send + Sync>,
     pub token_lifecycle: Arc<TokenLifecycleState>,
     pub custom_provider_service: Arc<wealthfolio_core::custom_provider::CustomProviderService>,
@@ -129,6 +137,13 @@ pub struct AppState {
     pub rebalance_service: Arc<
         dyn wealthfolio_core::portfolio::allocation_targets::RebalanceServiceTrait + Send + Sync,
     >,
+    pub pat_repository: Arc<PatRepository>,
+    pub mcp_audit_repository: Arc<McpAuditRepository>,
+    pub agent_environment: Arc<dyn wealthfolio_agent_tools::AgentEnvironment>,
+    /// Whether the `/mcp` endpoint is mounted (from `Config::mcp_enabled`).
+    pub mcp_enabled: bool,
+    /// Whether agent tool calls are audited (from `Config::mcp_audit_enabled`).
+    pub mcp_audit_enabled: bool,
 }
 
 pub fn init_tracing() {
@@ -281,6 +296,9 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
     let settings = settings_service.get_settings()?;
     let base_currency = Arc::new(RwLock::new(settings.base_currency));
     let timezone = Arc::new(RwLock::new(settings.timezone.clone()));
+    let rating_instance_id = settings_service
+        .get_setting_value("instance_id")?
+        .ok_or_else(|| anyhow::anyhow!("Missing internal instance ID"))?;
 
     let spending_settings_repo: Arc<
         dyn wealthfolio_spending::settings::SpendingSettingsRepositoryTrait,
@@ -307,6 +325,14 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         dyn wealthfolio_spending::activity_events::ActivityEventsRepositoryTrait,
     > = Arc::new(
         wealthfolio_storage_sqlite::spending::activity_events::ActivityEventsRepository::new(
+            pool.clone(),
+            writer.clone(),
+        ),
+    );
+    let activity_splits_repo: Arc<
+        dyn wealthfolio_spending::activity_splits::ActivitySplitRepositoryTrait,
+    > = Arc::new(
+        wealthfolio_storage_sqlite::spending::activity_splits::ActivitySplitRepository::new(
             pool.clone(),
             writer.clone(),
         ),
@@ -372,7 +398,9 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
 
     // Create taxonomy service for auto-classification
     let taxonomy_repository = Arc::new(TaxonomyRepository::new(pool.clone(), writer.clone()));
-    let taxonomy_service = Arc::new(TaxonomyService::new(taxonomy_repository));
+    let taxonomy_service = Arc::new(
+        TaxonomyService::new(taxonomy_repository).with_event_sink(domain_event_sink.clone()),
+    );
 
     let asset_service = Arc::new(
         AssetService::with_taxonomy_service(
@@ -382,6 +410,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         )?
         .with_event_sink(domain_event_sink.clone()),
     );
+    let recalculation_gate = Arc::new(PortfolioRecalculationGate::default());
     let snapshot_service = Arc::new(
         SnapshotService::new_with_timezone(
             base_currency.clone(),
@@ -393,7 +422,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
             fx_service.clone(),
         )
         .with_event_sink(domain_event_sink.clone())
-        .with_lot_repository(lots_repository.clone()),
+        .with_lot_repository(lots_repository.clone())
+        .with_recalculation_gate(recalculation_gate.clone()),
     );
 
     let valuation_repository = Arc::new(ValuationRepository::new(pool.clone(), writer.clone()));
@@ -405,7 +435,9 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
             quote_service.clone(),
             fx_service.clone(),
         )
-        .with_activity_repository(activity_repository.clone(), timezone.clone()),
+        .with_activity_repository(activity_repository.clone(), timezone.clone())
+        .with_lot_repository(lots_repository.clone())
+        .with_recalculation_gate(recalculation_gate.clone()),
     );
 
     let net_worth_service: Arc<dyn NetWorthServiceTrait + Send + Sync> =
@@ -439,7 +471,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
     );
 
     let allocation_service: Arc<dyn AllocationServiceTrait + Send + Sync> = Arc::new(
-        AllocationService::new(holdings_service.clone(), taxonomy_service.clone()),
+        AllocationService::new(holdings_service.clone(), taxonomy_service.clone())
+            .with_account_service(account_service.clone()),
     );
 
     let allocation_target_repository = Arc::new(
@@ -465,6 +498,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
             allocation_target_service.clone(),
             allocation_service.clone(),
         )
+        .with_holdings_service(holdings_service.clone())
         .with_taxonomy_service(taxonomy_service.clone()),
     );
     let rebalance_service: Arc<
@@ -528,8 +562,42 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
             quote_service.clone(),
             core_import_run_repository,
         )
+        .with_timezone(timezone.clone())
         .with_event_sink(domain_event_sink.clone()),
     );
+    let final_cash_migration = run_final_cash_migration(
+        settings_service.as_ref(),
+        activity_repository.as_ref(),
+        account_service.as_ref(),
+        asset_service.as_ref(),
+    )
+    .await?;
+    recalculation_gate.replace_pending_accounts(final_cash_migration.pending_account_ids.clone());
+    if !final_cash_migration.pending_account_ids.is_empty() {
+        // The recalculation gate already serializes and forces full
+        // recomputation for pending accounts, so the rebuild can always run
+        // in the background instead of blocking (or failing) startup.
+        tracing::info!(
+            "Rebuilding {} account(s) after final-cash migration in the background",
+            final_cash_migration.pending_account_ids.len()
+        );
+        let settings_service = settings_service.clone();
+        let snapshot_service = snapshot_service.clone();
+        let valuation_service = valuation_service.clone();
+        let recalculation_gate = recalculation_gate.clone();
+        tokio::spawn(async move {
+            if let Err(error) = rebuild_pending_final_cash_accounts(
+                settings_service.as_ref(),
+                snapshot_service.as_ref(),
+                valuation_service.as_ref(),
+                recalculation_gate.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!("Background final-cash rebuild failed: {}", error);
+            }
+        });
+    }
 
     // Spending: events + event_types
     let event_types_repo: Arc<dyn wealthfolio_spending::events::EventTypesRepositoryTrait> =
@@ -561,6 +629,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
             account_repo.clone(),
             spending_settings_service.clone(),
             activity_taxonomy_assignment_service.clone(),
+            activity_splits_repo.clone(),
             activity_events_repo.clone(),
             events_service.clone(),
         ),
@@ -595,6 +664,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         activity_repository.clone(),
         account_repo.clone(),
         activity_assignments_repo.clone(),
+        activity_splits_repo.clone(),
         spending_settings_service.clone(),
         taxonomy_service.clone(),
         fx_service.clone(),
@@ -614,6 +684,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
             activity_repository.clone(),
             account_repo.clone(),
             analytics_assignment_repo.clone(),
+            activity_splits_repo.clone(),
             spending_settings_service.clone(),
             taxonomy_service.clone(),
             events_service.clone(),
@@ -634,6 +705,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         activity_repository.clone(),
         account_repo.clone(),
         analytics_assignment_repo,
+        activity_splits_repo,
         spending_settings_service.clone(),
         taxonomy_service.clone(),
         fx_service.clone(),
@@ -670,6 +742,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
             snapshot_repository.clone(),
         )
         .with_event_sink(domain_event_sink.clone())
+        .with_timezone(timezone.clone())
         .with_snapshot_service(snapshot_service.clone())
         .with_quote_store(market_data_repository.clone()),
     );
@@ -713,11 +786,20 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         income_service.clone(),
         health_service.clone(),
         taxonomy_service.clone(),
+        portfolio_service.clone(),
+        net_worth_service.clone(),
+        limits_service.clone(),
         cash_activity_service.clone(),
         activity_taxonomy_assignment_service.clone(),
         categorization_rules_service.clone(),
     ));
+    let agent_environment: Arc<dyn wealthfolio_agent_tools::AgentEnvironment> =
+        ai_environment.clone();
     let ai_chat_service = Arc::new(ChatService::new(ai_environment, ChatConfig::default()));
+
+    // Agent access: PAT auth + MCP audit trail (server-mode MCP)
+    let pat_repository = Arc::new(PatRepository::new(pool.clone(), writer.clone()));
+    let mcp_audit_repository = Arc::new(McpAuditRepository::new(pool.clone(), writer.clone()));
 
     // Device enroll service for E2EE sync
     let cloud_api_url = crate::features::cloud_api_base_url().unwrap_or_default();
@@ -732,6 +814,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
 
     let event_bus = EventBus::new(256);
     let device_sync_runtime = Arc::new(DeviceSyncRuntimeState::new());
+    let broker_sync_running = Arc::new(AtomicBool::new(false));
     let token_lifecycle = Arc::new(TokenLifecycleState::new());
     let now = chrono::Utc::now();
     if let Err(err) = app_sync_repository
@@ -749,13 +832,16 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         asset_service.clone(),
         connect_sync_service.clone(),
         event_bus.clone(),
+        broker_sync_running.clone(),
         health_service.clone(),
         snapshot_service.clone(),
+        snapshot_repository.clone(),
         quote_service.clone(),
         valuation_service.clone(),
         account_service.clone(),
         goal_service.clone(),
         fx_service.clone(),
+        base_currency.clone(),
         timezone.clone(),
         secret_store.clone(),
         token_lifecycle.clone(),
@@ -763,9 +849,12 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         categorization_rules_service.clone(),
     );
 
+    let addon_storage_repository =
+        Arc::new(AddonStorageRepository::new(pool.clone(), writer.clone()));
     let addon_service: Arc<dyn AddonServiceTrait + Send + Sync> = Arc::new(AddonService::new(
         &config.addons_root,
-        &settings.instance_id,
+        rating_instance_id,
+        addon_storage_repository,
     ));
 
     let auth_manager = config
@@ -774,6 +863,13 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         .map(AuthManager::new)
         .transpose()?
         .map(Arc::new);
+
+    let oidc_manager = match config.oidc.as_ref() {
+        Some(oidc_config) => Some(Arc::new(
+            OidcManager::discover(oidc_config, config.secrets_encryption_key).await?,
+        )),
+        None => None,
+    };
 
     let state = Arc::new(AppState {
         domain_event_sink,
@@ -804,13 +900,14 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         ai_chat_service,
         data_root,
         db_path,
-        instance_id: settings.instance_id,
         secret_store,
         event_bus,
         auth: auth_manager,
+        oidc: oidc_manager,
         device_enroll_service,
         app_sync_repository,
         device_sync_runtime,
+        broker_sync_running,
         health_service,
         token_lifecycle,
         custom_provider_service,
@@ -825,6 +922,11 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
         allocation_target_service,
         drift_service,
         rebalance_service,
+        pat_repository,
+        mcp_audit_repository,
+        agent_environment,
+        mcp_enabled: config.mcp_enabled,
+        mcp_audit_enabled: config.mcp_audit_enabled,
     });
 
     #[cfg(feature = "device-sync")]

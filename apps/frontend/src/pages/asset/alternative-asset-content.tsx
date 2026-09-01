@@ -1,8 +1,17 @@
-import React, { useMemo, useState } from "react";
-import { format } from "date-fns";
-import { Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/ui/components/ui/card";
-import { Separator } from "@wealthfolio/ui/components/ui/separator";
-import { Badge } from "@wealthfolio/ui/components/ui/badge";
+import HistoryChart from "@/components/history-chart-symbol";
+import { useAlternativeHoldings, useLinkedLiabilities } from "@/hooks/use-alternative-assets";
+import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
+import type { AlternativeAssetHolding, Asset, DateRange, Quote, TimePeriod } from "@/lib/types";
+import { AlternativeAssetKind } from "@/lib/types";
+import {
+  AmountDisplay,
+  EmptyPlaceholder,
+  type FormattingApi,
+  Icons,
+  IntervalSelector,
+  useDateFormatting,
+  useNumberFormatting,
+} from "@wealthfolio/ui";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -13,29 +22,22 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@wealthfolio/ui/components/ui/alert-dialog";
+import { Badge } from "@wealthfolio/ui/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/ui/components/ui/card";
+import { Separator } from "@wealthfolio/ui/components/ui/separator";
+import type { TFunction } from "i18next";
+import React, { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
-  Icons,
-  IntervalSelector,
-  EmptyPlaceholder,
-  AmountDisplay,
-  formatPercent,
-} from "@wealthfolio/ui";
-import HistoryChart from "@/components/history-chart-symbol";
-import { ValueHistoryDataGrid } from "./alternative-assets";
-import {
+  AlternativeAssetQuickAddModal,
   AssetDetailsSheet,
   type AssetDetailsSheetAsset,
   UpdateValuationModal,
-  AlternativeAssetQuickAddModal,
+  ValueHistoryDataGrid,
 } from "./alternative-assets";
 import { useAlternativeAssetMutations } from "./alternative-assets/hooks/use-alternative-asset-mutations";
-import { LinkedLiabilitiesSection, LinkedAssetSection } from "./linked-liabilities-card";
 import { useQuoteMutations } from "./hooks/use-quote-mutations";
-import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
-import { useLinkedLiabilities, useAlternativeHoldings } from "@/hooks/use-alternative-assets";
-import type { AlternativeAssetHolding, Quote, Asset, TimePeriod, DateRange } from "@/lib/types";
-import { AlternativeAssetKind } from "@/lib/types";
-import { parseLocalDate } from "@/lib/utils";
+import { LinkedAssetSection, LinkedLiabilitiesSection } from "./linked-liabilities-card";
 
 interface AlternativeAssetContentProps {
   assetId: string;
@@ -57,6 +59,8 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
   quoteHistory,
   activeTab,
 }) => {
+  const formatting = useNumberFormatting();
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
 
   // Chart state
@@ -80,7 +84,10 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
   }, [holding.linkedAssetId, allHoldings]);
 
   // Quote mutations for history grid
-  const { saveQuoteMutation, deleteQuoteMutation } = useQuoteMutations(assetId);
+  const { saveQuoteMutation, deleteQuoteMutation, invalidateQuoteQueries } = useQuoteMutations(
+    assetId,
+    { invalidateOnSuccess: false },
+  );
 
   // Filter chart data by date range
   const filteredChartData = useMemo(() => {
@@ -199,13 +206,15 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
                     >
                       {isLiability ? (
                         <>
-                          {gainAmount <= 0 ? "Paid down " : "Increased "}
+                          {gainAmount <= 0
+                            ? t("asset:altContent.paid_down")
+                            : t("asset:altContent.increased")}
                           <AmountDisplay
                             value={Math.abs(gainAmount)}
                             currency={holding.currency}
                             isHidden={isBalanceHidden}
                           />{" "}
-                          ({formatPercent(Math.abs(gainPercent))}) {selectedIntervalDesc}
+                          ({formatting.formatPercent(Math.abs(gainPercent))}) {selectedIntervalDesc}
                         </>
                       ) : (
                         <>
@@ -214,7 +223,7 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
                             currency={holding.currency}
                             isHidden={isBalanceHidden}
                           />{" "}
-                          ({formatPercent(gainPercent)}) {selectedIntervalDesc}
+                          ({formatting.formatPercent(gainPercent)}) {selectedIntervalDesc}
                         </>
                       )}
                     </p>
@@ -236,8 +245,8 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
                 <div className="flex h-[200px] items-center justify-center">
                   <EmptyPlaceholder
                     icon={<Icons.Activity className="text-muted-foreground h-8 w-8" />}
-                    title="No valuation data"
-                    description="Add your first valuation to see the chart"
+                    title={t("asset:altContent.no_valuation_data")}
+                    description={t("asset:altContent.no_valuation_description")}
                   />
                 </div>
               )}
@@ -258,14 +267,14 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
 
         {/* Second row: About section */}
         <div className="space-y-4">
-          <h3 className="text-lg font-bold">About</h3>
+          <h3 className="text-lg font-bold">{t("asset:altContent.about")}</h3>
 
           {/* Kind and subtype badges */}
           <div className="flex flex-wrap items-center gap-2">
             {(() => {
               const kind = holding.kind.toLowerCase();
-              const kindConfig = KIND_CONFIG[kind] || KIND_CONFIG.other;
-              const subtypeLabel = getSubtypeLabel(kind, holding.metadata || {});
+              const kindLabelKey = KIND_LABEL_KEYS[kind] || KIND_LABEL_KEYS.other;
+              const subtypeLabel = getSubtypeLabel(kind, holding.metadata || {}, t);
 
               return (
                 <>
@@ -273,23 +282,23 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
                     variant="secondary"
                     className="gap-1.5"
                     style={{
-                      backgroundColor: `${kindConfig.color}15`,
-                      color: kindConfig.color,
+                      backgroundColor: `${KIND_COLOR}15`,
+                      color: KIND_COLOR,
                     }}
                   >
                     <span
                       className="h-2 w-2 rounded-full"
-                      style={{ backgroundColor: kindConfig.color }}
+                      style={{ backgroundColor: KIND_COLOR }}
                     />
-                    {kindConfig.label}
+                    {t(kindLabelKey)}
                   </Badge>
                   {subtypeLabel && (
                     <Badge
                       variant="secondary"
                       className="gap-1.5"
                       style={{
-                        backgroundColor: `${kindConfig.color}10`,
-                        color: kindConfig.color,
+                        backgroundColor: `${KIND_COLOR}10`,
+                        color: KIND_COLOR,
                       }}
                     >
                       {subtypeLabel}
@@ -302,7 +311,7 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
 
           {/* Notes */}
           <p className="text-muted-foreground text-sm">
-            {holding.notes || assetProfile?.notes || "No notes added."}
+            {holding.notes || assetProfile?.notes || t("asset:altContent.no_notes")}
           </p>
         </div>
       </div>
@@ -312,69 +321,73 @@ export const AlternativeAssetContent: React.FC<AlternativeAssetContentProps> = (
   // History tab
   return (
     <ValueHistoryDataGrid
+      key={assetId}
       data={quoteHistory}
+      assetId={assetId}
       currency={holding.currency}
       isLiability={isLiability}
-      onSaveQuote={(quote: Quote) => saveQuoteMutation.mutate(quote)}
-      onDeleteQuote={(id: string) => deleteQuoteMutation.mutate(id)}
+      onSaveQuote={(quote: Quote) => saveQuoteMutation.mutateAsync(quote)}
+      onDeleteQuote={(id: string) => deleteQuoteMutation.mutateAsync(id)}
+      onPersistComplete={invalidateQuoteQueries}
     />
   );
 };
 
-// Kind labels and colors for badges (subtle/muted colors)
-const KIND_CONFIG: Record<string, { label: string; color: string }> = {
-  property: { label: "Property", color: "#6b7280" },
-  vehicle: { label: "Vehicle", color: "#6b7280" },
-  collectible: { label: "Collectible", color: "#6b7280" },
-  precious: { label: "Precious Metal", color: "#6b7280" },
-  liability: { label: "Liability", color: "#6b7280" },
-  other: { label: "Other", color: "#6b7280" },
+// Kind colors for badges (subtle/muted colors); labels resolved via i18n
+const KIND_COLOR = "#6b7280";
+const KIND_LABEL_KEYS: Record<string, string> = {
+  property: "asset:altContent.kind.property",
+  vehicle: "asset:altContent.kind.vehicle",
+  collectible: "asset:altContent.kind.collectible",
+  precious: "asset:altContent.kind.precious",
+  liability: "asset:altContent.kind.liability",
+  other: "asset:altContent.kind.other",
 };
 
-// Type-specific subtype labels
-const PROPERTY_TYPE_LABELS: Record<string, string> = {
-  residence: "Primary Residence",
-  rental: "Rental Property",
-  land: "Land",
-  commercial: "Commercial",
+// Type-specific subtype label keys
+const PROPERTY_TYPE_LABEL_KEYS: Record<string, string> = {
+  residence: "asset:altContent.propertyType.residence",
+  rental: "asset:altContent.propertyType.rental",
+  land: "asset:altContent.propertyType.land",
+  commercial: "asset:altContent.propertyType.commercial",
 };
 
-const VEHICLE_TYPE_LABELS: Record<string, string> = {
-  car: "Car",
-  motorcycle: "Motorcycle",
-  boat: "Boat",
-  rv: "RV",
-  aircraft: "Aircraft",
+const VEHICLE_TYPE_LABEL_KEYS: Record<string, string> = {
+  car: "asset:altContent.vehicleType.car",
+  motorcycle: "asset:altContent.vehicleType.motorcycle",
+  boat: "asset:altContent.vehicleType.boat",
+  rv: "asset:altContent.vehicleType.rv",
+  aircraft: "asset:altContent.vehicleType.aircraft",
 };
 
-const COLLECTIBLE_TYPE_LABELS: Record<string, string> = {
-  art: "Art",
-  wine: "Wine",
-  watch: "Watch",
-  jewelry: "Jewelry",
-  memorabilia: "Memorabilia",
+const COLLECTIBLE_TYPE_LABEL_KEYS: Record<string, string> = {
+  art: "asset:altContent.collectibleType.art",
+  wine: "asset:altContent.collectibleType.wine",
+  watch: "asset:altContent.collectibleType.watch",
+  jewelry: "asset:altContent.collectibleType.jewelry",
+  memorabilia: "asset:altContent.collectibleType.memorabilia",
 };
 
-const METAL_TYPE_LABELS: Record<string, string> = {
-  gold: "Gold",
-  silver: "Silver",
-  platinum: "Platinum",
-  palladium: "Palladium",
+const METAL_TYPE_LABEL_KEYS: Record<string, string> = {
+  gold: "asset:altContent.metalType.gold",
+  silver: "asset:altContent.metalType.silver",
+  platinum: "asset:altContent.metalType.platinum",
+  palladium: "asset:altContent.metalType.palladium",
 };
 
-const LIABILITY_TYPE_LABELS: Record<string, string> = {
-  mortgage: "Mortgage",
-  auto_loan: "Auto Loan",
-  student_loan: "Student Loan",
-  credit_card: "Credit Card",
-  personal_loan: "Personal Loan",
-  heloc: "HELOC",
+const LIABILITY_TYPE_LABEL_KEYS: Record<string, string> = {
+  mortgage: "asset:altContent.liabilityType.mortgage",
+  auto_loan: "asset:altContent.liabilityType.auto_loan",
+  student_loan: "asset:altContent.liabilityType.student_loan",
+  credit_card: "asset:altContent.liabilityType.credit_card",
+  personal_loan: "asset:altContent.liabilityType.personal_loan",
+  heloc: "asset:altContent.liabilityType.heloc",
 };
 
-const WEIGHT_UNIT_LABELS: Record<string, string> = {
-  oz: "Troy Ounce",
-  g: "Gram",
-  kg: "Kilogram",
+const WEIGHT_UNIT_LABEL_KEYS: Record<string, string> = {
+  oz: "asset:altContent.weightUnit.oz",
+  g: "asset:altContent.weightUnit.g",
+  kg: "asset:altContent.weightUnit.kg",
 };
 
 interface AlternativeAssetDetailCardProps {
@@ -391,31 +404,42 @@ interface AlternativeAssetDetailCardProps {
  * Get subtype label from metadata based on asset kind.
  * Checks both the unified 'sub_type' field and legacy type-specific fields.
  */
-function getSubtypeLabel(kind: string, metadata: Record<string, unknown>): string | null {
+function getSubtypeLabel(
+  kind: string,
+  metadata: Record<string, unknown>,
+  t: TFunction,
+): string | null {
   // First check the unified sub_type field (used by quick-add modal)
   const subType = metadata.sub_type as string | undefined;
+  const resolve = (value: string | undefined, keys: Record<string, string>): string | null => {
+    if (!value) return null;
+    const key = keys[value];
+    return key ? t(key) : value;
+  };
 
   switch (kind) {
-    case "property": {
-      const propertyType = subType || (metadata.property_type as string | undefined);
-      return propertyType ? PROPERTY_TYPE_LABELS[propertyType] || propertyType : null;
-    }
-    case "vehicle": {
-      const vehicleType = subType || (metadata.vehicle_type as string | undefined);
-      return vehicleType ? VEHICLE_TYPE_LABELS[vehicleType] || vehicleType : null;
-    }
-    case "collectible": {
-      const collectibleType = subType || (metadata.collectible_type as string | undefined);
-      return collectibleType ? COLLECTIBLE_TYPE_LABELS[collectibleType] || collectibleType : null;
-    }
-    case "precious": {
-      const metalType = subType || (metadata.metal_type as string | undefined);
-      return metalType ? METAL_TYPE_LABELS[metalType] || metalType : null;
-    }
-    case "liability": {
-      const liabilityType = subType || (metadata.liability_type as string | undefined);
-      return liabilityType ? LIABILITY_TYPE_LABELS[liabilityType] || liabilityType : null;
-    }
+    case "property":
+      return resolve(
+        subType || (metadata.property_type as string | undefined),
+        PROPERTY_TYPE_LABEL_KEYS,
+      );
+    case "vehicle":
+      return resolve(
+        subType || (metadata.vehicle_type as string | undefined),
+        VEHICLE_TYPE_LABEL_KEYS,
+      );
+    case "collectible":
+      return resolve(
+        subType || (metadata.collectible_type as string | undefined),
+        COLLECTIBLE_TYPE_LABEL_KEYS,
+      );
+    case "precious":
+      return resolve(subType || (metadata.metal_type as string | undefined), METAL_TYPE_LABEL_KEYS);
+    case "liability":
+      return resolve(
+        subType || (metadata.liability_type as string | undefined),
+        LIABILITY_TYPE_LABEL_KEYS,
+      );
     default:
       return null;
   }
@@ -437,13 +461,17 @@ const AlternativeAssetDetailCard: React.FC<AlternativeAssetDetailCardProps> = ({
   isLiability,
   className,
 }) => {
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
 
   const metadata = holding.metadata || {};
   const kind = holding.kind.toLowerCase();
 
   // Build detail rows based on asset type
-  const detailRows = getDetailRows(kind, metadata, holding, isBalanceHidden);
+  const detailRows = getDetailRows(kind, metadata, holding, isBalanceHidden, t, dateFormatting);
 
   // Calculate liability progress
   const liabilityProgress = useMemo(() => {
@@ -477,9 +505,13 @@ const AlternativeAssetDetailCard: React.FC<AlternativeAssetDetailCardProps> = ({
         <CardHeader className="flex flex-row items-center justify-between pb-0">
           <CardTitle className="flex w-full justify-between text-lg font-bold">
             <div>
-              <div className="text-muted-foreground text-sm font-normal">Net Equity</div>
+              <div className="text-muted-foreground text-sm font-normal">
+                {t("asset:altContent.net_equity")}
+              </div>
               {!hasLinkedLiabilities && (
-                <div className="text-muted-foreground text-xs font-normal">(no liabilities)</div>
+                <div className="text-muted-foreground text-xs font-normal">
+                  {t("asset:altContent.no_liabilities")}
+                </div>
               )}
             </div>
             <div>
@@ -505,10 +537,14 @@ const AlternativeAssetDetailCard: React.FC<AlternativeAssetDetailCardProps> = ({
         <CardHeader className="flex flex-row items-center justify-between pb-0">
           <CardTitle className="flex w-full justify-between text-lg font-bold">
             <div>
-              <div className="text-muted-foreground text-sm font-normal">Amount Paid</div>
+              <div className="text-muted-foreground text-sm font-normal">
+                {t("asset:altContent.amount_paid")}
+              </div>
               {liabilityProgress.percentPaid !== null && (
                 <div className="text-muted-foreground text-xs font-normal">
-                  {formatPercent(liabilityProgress.percentPaid)} of original
+                  {t("asset:altContent.percent_of_original", {
+                    percent: numberFormatting.formatPercent(liabilityProgress.percentPaid),
+                  })}
                 </div>
               )}
             </div>
@@ -533,7 +569,7 @@ const AlternativeAssetDetailCard: React.FC<AlternativeAssetDetailCardProps> = ({
       {/* Fallback header for assets without special headers */}
       {!showNetEquityHeader && !showLiabilityHeader && (
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium">Details</CardTitle>
+          <CardTitle className="text-sm font-medium">{t("asset:altContent.details")}</CardTitle>
         </CardHeader>
       )}
 
@@ -543,7 +579,7 @@ const AlternativeAssetDetailCard: React.FC<AlternativeAssetDetailCardProps> = ({
         <div className="space-y-4 text-sm">
           {!isLiability && holding.purchasePrice && (
             <div className="flex justify-between">
-              <span className="text-muted-foreground">Purchase Price</span>
+              <span className="text-muted-foreground">{t("asset:altContent.purchase_price")}</span>
               <span className="font-medium">
                 <AmountDisplay
                   value={parseFloat(holding.purchasePrice)}
@@ -556,18 +592,18 @@ const AlternativeAssetDetailCard: React.FC<AlternativeAssetDetailCardProps> = ({
 
           {!isLiability && holding.purchaseDate && (
             <div className="flex justify-between">
-              <span className="text-muted-foreground">Purchase Date</span>
+              <span className="text-muted-foreground">{t("asset:altContent.purchase_date")}</span>
               <span className="font-medium">
-                {format(parseLocalDate(holding.purchaseDate), "MMM d, yyyy")}
+                {dateFormatting.formatCalendarDate(holding.purchaseDate)}
               </span>
             </div>
           )}
 
           {holding.valuationDate && (
             <div className="flex justify-between">
-              <span className="text-muted-foreground">Last Updated</span>
+              <span className="text-muted-foreground">{t("asset:altContent.last_updated")}</span>
               <span className="font-medium">
-                {format(parseLocalDate(holding.valuationDate), "MMM d, yyyy")}
+                {dateFormatting.formatCalendarDate(holding.valuationDate)}
               </span>
             </div>
           )}
@@ -621,6 +657,8 @@ function getDetailRows(
   metadata: Record<string, unknown>,
   holding: AlternativeAssetHolding,
   isBalanceHidden: boolean,
+  t: TFunction,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
 ): DetailRow[] {
   const rows: DetailRow[] = [];
 
@@ -629,7 +667,7 @@ function getDetailRows(
       // Address (type is shown in badge)
       const address = metadata.address as string | undefined;
       if (address) {
-        rows.push({ label: "Address", value: address });
+        rows.push({ label: t("asset:altContent.address"), value: address });
       }
       break;
     }
@@ -638,7 +676,7 @@ function getDetailRows(
       // Make/Model (type is shown in badge)
       const description = metadata.description as string | undefined;
       if (description) {
-        rows.push({ label: "Make/Model", value: description });
+        rows.push({ label: t("asset:altContent.make_model"), value: description });
       }
       break;
     }
@@ -647,7 +685,7 @@ function getDetailRows(
       // Description (type is shown in badge)
       const description = metadata.description as string | undefined;
       if (description) {
-        rows.push({ label: "Description", value: description });
+        rows.push({ label: t("asset:altContent.description"), value: description });
       }
       break;
     }
@@ -657,14 +695,18 @@ function getDetailRows(
       const quantity = metadata.quantity as string | number | undefined;
       const unit = metadata.unit as string | undefined;
       if (quantity) {
-        const unitLabel = unit ? WEIGHT_UNIT_LABELS[unit] || unit : "";
-        rows.push({ label: "Quantity", value: `${quantity} ${unitLabel}`.trim() });
+        const unitKey = unit ? WEIGHT_UNIT_LABEL_KEYS[unit] : undefined;
+        const unitLabel = unit ? (unitKey ? t(unitKey) : unit) : "";
+        rows.push({
+          label: t("asset:altContent.quantity"),
+          value: `${quantity} ${unitLabel}`.trim(),
+        });
       }
       // Purchase price per unit
       const pricePerUnit = metadata.purchase_price_per_unit as string | undefined;
       if (pricePerUnit) {
         rows.push({
-          label: "Purchase Price/Unit",
+          label: t("asset:altContent.purchase_price_per_unit"),
           value: (
             <AmountDisplay
               value={parseFloat(pricePerUnit)}
@@ -677,7 +719,7 @@ function getDetailRows(
       // Description
       const description = metadata.description as string | undefined;
       if (description) {
-        rows.push({ label: "Description", value: description });
+        rows.push({ label: t("asset:altContent.description"), value: description });
       }
       break;
     }
@@ -686,7 +728,7 @@ function getDetailRows(
       // Current balance (shown prominently for liabilities)
       const currentBalance = Math.abs(parseFloat(holding.marketValue));
       rows.push({
-        label: "Current Balance",
+        label: t("asset:altContent.current_balance"),
         value: (
           <AmountDisplay
             value={currentBalance}
@@ -702,7 +744,7 @@ function getDetailRows(
         | undefined;
       if (originalAmount) {
         rows.push({
-          label: "Original Amount",
+          label: t("asset:altContent.original_amount"),
           value: (
             <AmountDisplay
               value={parseFloat(originalAmount)}
@@ -716,7 +758,7 @@ function getDetailRows(
       // Interest rate
       const interestRate = metadata.interest_rate as string | undefined;
       if (interestRate) {
-        rows.push({ label: "Interest Rate", value: `${interestRate}%` });
+        rows.push({ label: t("asset:altContent.interest_rate"), value: `${interestRate}%` });
       }
 
       // Note: Linked asset is shown in its own section with LinkedAssetSection
@@ -727,8 +769,8 @@ function getDetailRows(
         | undefined;
       if (originationDate) {
         rows.push({
-          label: "Origination Date",
-          value: format(parseLocalDate(originationDate), "MMM d, yyyy"),
+          label: t("asset:altContent.origination_date"),
+          value: formatting.formatCalendarDate(originationDate),
         });
       }
       break;
@@ -738,7 +780,7 @@ function getDetailRows(
     default: {
       const description = metadata.description as string | undefined;
       if (description) {
-        rows.push({ label: "Description", value: description });
+        rows.push({ label: t("asset:altContent.description"), value: description });
       }
       break;
     }
@@ -762,6 +804,7 @@ export function useAlternativeAssetActions({
   allHoldings,
   onNavigateBack,
 }: AlternativeAssetActionsProps) {
+  const { t } = useTranslation();
   // Modal state
   const [updateValuationOpen, setUpdateValuationOpen] = useState(false);
   const [editDetailsOpen, setEditDetailsOpen] = useState(false);
@@ -896,21 +939,22 @@ export function useAlternativeAssetActions({
         defaultKind={AlternativeAssetKind.LIABILITY}
         linkedAssetId={holding.id}
         defaultLiabilityType="mortgage"
-        defaultName={`${holding.name} Mortgage`}
+        defaultName={`${holding.name} ${t("asset:altContent.mortgage_suffix")}`}
       />
 
       {/* Delete Confirmation Dialog */}
       <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete Asset</AlertDialogTitle>
+            <AlertDialogTitle>{t("asset:altContent.delete_asset_title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete <span className="font-semibold">{holding.name}</span>?
-              This will remove all valuation history and cannot be undone.
+              {t("asset:altContent.delete_asset_description", { name: holding.name })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={deleteMutation.isPending}>
+              {t("common:cancel")}
+            </AlertDialogCancel>
             <AlertDialogAction
               onClick={handleDelete}
               disabled={deleteMutation.isPending}
@@ -919,10 +963,10 @@ export function useAlternativeAssetActions({
               {deleteMutation.isPending ? (
                 <>
                   <Icons.Spinner className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
+                  {t("asset:altContent.deleting")}
                 </>
               ) : (
-                "Delete"
+                t("asset:altContent.delete")
               )}
             </AlertDialogAction>
           </AlertDialogFooter>

@@ -1,6 +1,11 @@
-import type { CashAuditReviewTarget } from "@/pages/account/cash-audit";
 import type { ActivityDetails } from "@/lib/types";
-import { Icons } from "@wealthfolio/ui";
+import type { CashAuditReviewTarget } from "@/pages/account/cash-audit";
+import {
+  Icons,
+  calendarDateFromLocalDate,
+  useDateFormatting,
+  type FormattingApi,
+} from "@wealthfolio/ui";
 import {
   Sheet,
   SheetContent,
@@ -8,8 +13,8 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@wealthfolio/ui/components/ui/sheet";
-import { format, parseISO } from "date-fns";
-import { parseLocalDate } from "@/lib/utils";
+import { parseISO } from "date-fns";
+import { useTranslation } from "react-i18next";
 import { ActivityDateList } from "./activity-date-list";
 
 interface ActivityDateSheetProps {
@@ -21,6 +26,7 @@ interface ActivityDateSheetProps {
   endingCashBalance?: number;
   cashCurrency?: string;
   cashAuditTarget?: CashAuditReviewTarget;
+  isCreditCardAccount?: boolean;
 }
 
 export function ActivityDateSheet({
@@ -32,13 +38,22 @@ export function ActivityDateSheet({
   endingCashBalance,
   cashCurrency,
   cashAuditTarget,
+  isCreditCardAccount = false,
 }: ActivityDateSheetProps) {
+  const { t } = useTranslation();
+  const formatting = useDateFormatting();
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="right" className="flex h-full w-full flex-col p-0 sm:max-w-xl">
         <SheetHeader className="border-b px-6 py-4">
-          <SheetTitle>Activities on {date ? formatActivityDate(date) : ""}</SheetTitle>
-          <SheetDescription>{activities.length} activities recorded on this date</SheetDescription>
+          <SheetTitle>
+            {t("activity:date_sheet.title", {
+              date: date ? formatActivityDate(date, formatting) : "",
+            })}
+          </SheetTitle>
+          <SheetDescription>
+            {t("activity:date_sheet.count", { count: activities.length })}
+          </SheetDescription>
         </SheetHeader>
         <div className="flex-1 overflow-auto px-4 py-4">
           {isLoading ? (
@@ -51,6 +66,7 @@ export function ActivityDateSheet({
               endingCashBalance={endingCashBalance}
               cashCurrency={cashCurrency}
               cashAuditTarget={cashAuditTarget}
+              isCreditCardAccount={isCreditCardAccount}
             />
           )}
         </div>
@@ -59,12 +75,17 @@ export function ActivityDateSheet({
   );
 }
 
-function formatActivityDate(date: string): string {
+function formatActivityDate(
+  date: string,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+): string {
   try {
-    return format(parseLocalDate(date), "MMMM d, yyyy");
+    return formatting.formatCalendarDate(date, { dateStyle: "long" });
   } catch {
     try {
-      return format(parseISO(date), "MMMM d, yyyy");
+      return formatting.formatCalendarDate(calendarDateFromLocalDate(parseISO(date)), {
+        dateStyle: "long",
+      });
     } catch {
       return date;
     }

@@ -1,6 +1,12 @@
-import { useEffect } from "react";
-import { useForm, type Resolver } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
+import {
+  DatePickerInput,
+  MoneyInput,
+  useAmountFormatting,
+  type FormattingApi,
+  useDateFormatting,
+} from "@wealthfolio/ui";
+import { Button } from "@wealthfolio/ui/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -17,18 +23,19 @@ import {
   FormLabel,
   FormMessage,
 } from "@wealthfolio/ui/components/ui/form";
-import { Button } from "@wealthfolio/ui/components/ui/button";
-import { Textarea } from "@wealthfolio/ui/components/ui/textarea";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
-import { MoneyInput, DatePickerInput } from "@wealthfolio/ui";
+import { Textarea } from "@wealthfolio/ui/components/ui/textarea";
+import { useEffect } from "react";
+import { useForm, type Resolver } from "react-hook-form";
+import { useTranslation } from "react-i18next";
 
+import {} from "@/lib/utils";
+import { useAlternativeAssetMutations } from "../hooks/use-alternative-asset-mutations";
 import {
+  getUpdateValuationDefaultValues,
   updateValuationSchema,
   type UpdateValuationFormValues,
-  getUpdateValuationDefaultValues,
 } from "./update-valuation-schema";
-import { useAlternativeAssetMutations } from "../hooks/use-alternative-asset-mutations";
-import { formatAmount } from "@/lib/utils";
 
 interface UpdateValuationModalProps {
   /** Whether the modal is open */
@@ -60,6 +67,9 @@ export function UpdateValuationModal({
   lastUpdatedDate,
   currency,
 }: UpdateValuationModalProps) {
+  const dateFormatting = useDateFormatting();
+  const formatting = useAmountFormatting();
+  const { t } = useTranslation();
   const { updateValuationMutation } = useAlternativeAssetMutations({
     onUpdateSuccess: () => {
       handleClose();
@@ -97,10 +107,10 @@ export function UpdateValuationModal({
   const isLoading = updateValuationMutation.isPending;
 
   // Format the current value for display
-  const formattedCurrentValue = formatAmount(parseFloat(currentValue) || 0, currency);
+  const formattedCurrentValue = formatting.formatAmount(parseFloat(currentValue) || 0, currency);
 
   // Format the last updated date for display
-  const formattedLastUpdatedDate = formatDisplayDate(lastUpdatedDate);
+  const formattedLastUpdatedDate = formatDisplayDate(lastUpdatedDate, dateFormatting);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -108,19 +118,19 @@ export function UpdateValuationModal({
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
             <DialogHeader>
-              <DialogTitle>Update Value: {assetName}</DialogTitle>
-              <DialogDescription>
-                Record a new valuation for this asset. Historical valuations are preserved.
-              </DialogDescription>
+              <DialogTitle>{t("asset:updateValuation.title", { name: assetName })}</DialogTitle>
+              <DialogDescription>{t("asset:updateValuation.description")}</DialogDescription>
             </DialogHeader>
 
             <div className="space-y-4">
               {/* Current Value Display */}
               <div className="bg-muted rounded-md p-4">
-                <div className="text-muted-foreground text-sm">Current Recorded Value</div>
+                <div className="text-muted-foreground text-sm">
+                  {t("asset:updateValuation.current_recorded_value")}
+                </div>
                 <div className="text-xl font-semibold">{formattedCurrentValue}</div>
                 <div className="text-muted-foreground mt-1 text-xs">
-                  Last updated: {formattedLastUpdatedDate}
+                  {t("asset:updateValuation.last_updated", { date: formattedLastUpdatedDate })}
                 </div>
               </div>
 
@@ -130,14 +140,13 @@ export function UpdateValuationModal({
                 name="value"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>New Value</FormLabel>
+                    <FormLabel>{t("asset:updateValuation.new_value")}</FormLabel>
                     <FormControl>
                       <MoneyInput
                         ref={field.ref}
                         name={field.name}
                         value={field.value}
                         onValueChange={field.onChange}
-                        placeholder="0.00"
                       />
                     </FormControl>
                     <FormMessage />
@@ -151,7 +160,7 @@ export function UpdateValuationModal({
                 name="date"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>As of Date</FormLabel>
+                    <FormLabel>{t("asset:updateValuation.as_of_date")}</FormLabel>
                     <FormControl>
                       <DatePickerInput value={field.value} onChange={field.onChange} />
                     </FormControl>
@@ -167,12 +176,15 @@ export function UpdateValuationModal({
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>
-                      Notes <span className="text-muted-foreground">(optional)</span>
+                      {t("asset:updateValuation.notes")}{" "}
+                      <span className="text-muted-foreground">
+                        {t("asset:updateValuation.optional")}
+                      </span>
                     </FormLabel>
                     <FormControl>
                       <Textarea
                         rows={3}
-                        placeholder="Add any context about this valuation (e.g., appraisal source, market conditions)"
+                        placeholder={t("asset:updateValuation.notes_placeholder")}
                         {...field}
                       />
                     </FormControl>
@@ -184,7 +196,7 @@ export function UpdateValuationModal({
 
             <DialogFooter className="gap-2">
               <Button type="button" variant="outline" onClick={handleClose} disabled={isLoading}>
-                Cancel
+                {t("common:cancel")}
               </Button>
               <Button type="submit" disabled={isLoading}>
                 {isLoading ? (
@@ -192,7 +204,7 @@ export function UpdateValuationModal({
                 ) : (
                   <Icons.Check className="mr-2 h-4 w-4" />
                 )}
-                Update Value
+                {t("asset:updateValuation.update_value")}
               </Button>
             </DialogFooter>
           </form>
@@ -215,11 +227,13 @@ function formatDateToISO(date: Date): string {
 /**
  * Helper to format ISO date string for display
  */
-function formatDisplayDate(isoDate: string): string {
+function formatDisplayDate(
+  isoDate: string,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+): string {
   if (!isoDate) return "N/A";
   try {
-    const date = new Date(isoDate + "T00:00:00");
-    return date.toLocaleDateString(undefined, {
+    return formatting.formatCalendarDate(isoDate, {
       year: "numeric",
       month: "short",
       day: "numeric",

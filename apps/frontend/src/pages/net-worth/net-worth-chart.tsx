@@ -1,12 +1,14 @@
 import { useHapticFeedback } from "@/hooks";
-import { ChartConfig, ChartContainer } from "@wealthfolio/ui/components/ui/chart";
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
 import { useIsMobileViewport } from "@/hooks/use-platform";
-import { formatDate } from "@/lib/utils";
-import { AmountDisplay } from "@wealthfolio/ui";
-import { useId, useMemo, useRef } from "react";
-import { Area, AreaChart, Tooltip, YAxis } from "recharts";
 import type { NetWorthHistoryPoint } from "@/lib/types";
+import { formatDate } from "@/lib/utils";
+import { AmountDisplay, useDateFormatting } from "@wealthfolio/ui";
+import { ChartConfig, ChartContainer } from "@wealthfolio/ui/components/ui/chart";
+import type { TFunction } from "i18next";
+import { useId, useMemo, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { Area, AreaChart, Tooltip, YAxis } from "recharts";
 import type { MouseHandlerDataParam } from "recharts/types/synchronisation/types";
 
 // Goldish orange for net worth chart (consistent across light/dark modes)
@@ -34,9 +36,12 @@ interface TooltipBaseProps {
 
 interface CustomTooltipProps extends TooltipBaseProps {
   isBalanceHidden: boolean;
+  t: TFunction;
 }
 
-const CustomTooltip = ({ active, payload, isBalanceHidden }: CustomTooltipProps) => {
+const CustomTooltip = ({ active, payload, isBalanceHidden, t }: CustomTooltipProps) => {
+  const dateFormatting = useDateFormatting();
+
   if (!active || !payload?.length) {
     return null;
   }
@@ -51,13 +56,15 @@ const CustomTooltip = ({ active, payload, isBalanceHidden }: CustomTooltipProps)
 
   return (
     <div className="bg-popover grid grid-cols-1 gap-1.5 rounded-md border p-2 shadow-md">
-      <p className="text-muted-foreground text-xs">{formatDate(entry.date)}</p>
+      <p className="text-muted-foreground text-xs">{formatDate(entry.date, dateFormatting)}</p>
 
       {/* Net Worth - primary value */}
       <div className="flex items-center justify-between space-x-4">
         <div className="flex items-center space-x-1.5">
           <span className="block h-0.5 w-3" style={{ backgroundColor: tooltipColor }} />
-          <span className="text-muted-foreground text-xs">Net Worth:</span>
+          <span className="text-muted-foreground text-xs">
+            {t("insights:networth.chart.net_worth_label")}
+          </span>
         </div>
         <AmountDisplay
           value={entry.netWorth}
@@ -71,7 +78,9 @@ const CustomTooltip = ({ active, payload, isBalanceHidden }: CustomTooltipProps)
       {hasLiabilities && (
         <div className="border-border mt-1 border-t pt-1.5">
           <div className="flex items-center justify-between space-x-4">
-            <span className="text-muted-foreground/70 text-xs">Assets:</span>
+            <span className="text-muted-foreground/70 text-xs">
+              {t("insights:networth.chart.assets_label")}
+            </span>
             <AmountDisplay
               value={entry.totalAssets}
               currency={entry.currency}
@@ -80,7 +89,9 @@ const CustomTooltip = ({ active, payload, isBalanceHidden }: CustomTooltipProps)
             />
           </div>
           <div className="flex items-center justify-between space-x-4">
-            <span className="text-muted-foreground/70 text-xs">Liabilities:</span>
+            <span className="text-muted-foreground/70 text-xs">
+              {t("insights:networth.chart.liabilities_label")}
+            </span>
             <span className="text-muted-foreground text-xs">
               -
               <AmountDisplay
@@ -116,6 +127,7 @@ interface NetWorthChartProps {
 }
 
 export function NetWorthChart({ data, isLoading }: NetWorthChartProps) {
+  const { t } = useTranslation();
   const { triggerHaptic } = useHapticFeedback();
   const { isBalanceHidden } = useBalancePrivacy();
   const isMobile = useIsMobileViewport();
@@ -130,7 +142,7 @@ export function NetWorthChart({ data, isLoading }: NetWorthChartProps) {
 
   const chartConfig = {
     netWorth: {
-      label: "Net Worth",
+      label: t("insights:networth.chart.net_worth"),
     },
   } satisfies ChartConfig;
 
@@ -242,6 +254,7 @@ export function NetWorthChart({ data, isLoading }: NetWorthChartProps) {
             <CustomTooltip
               {...(props as unknown as TooltipBaseProps)}
               isBalanceHidden={isBalanceHidden}
+              t={t}
             />
           )}
         />

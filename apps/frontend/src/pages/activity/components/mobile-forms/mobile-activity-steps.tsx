@@ -1,3 +1,4 @@
+import type { RefObject } from "react";
 import { useFormContext } from "react-hook-form";
 import type { AccountSelectOption } from "../forms/fields";
 import type { NewActivityFormValues } from "../forms/schemas";
@@ -8,25 +9,38 @@ interface MobileActivityStepsProps {
   currentStep: number;
   accounts: AccountSelectOption[];
   isEditing: boolean;
+  amountWasEdited: RefObject<boolean>;
 }
 
 export function MobileActivitySteps({
   currentStep,
   accounts,
   isEditing,
+  amountWasEdited,
 }: MobileActivityStepsProps) {
   const { watch } = useFormContext<NewActivityFormValues>();
   const activityType = watch("activityType");
 
   if (isEditing) {
-    return <MobileDetailsStep activityType={activityType} accounts={accounts} isEditing />;
+    return (
+      <MobileDetailsStep
+        activityType={activityType}
+        accounts={accounts}
+        isEditing
+        amountWasEdited={amountWasEdited}
+      />
+    );
   }
 
   return (
     <div className="h-full">
       {currentStep === 1 && <MobileActivityTypeStep />}
       {currentStep === 2 && activityType && (
-        <MobileDetailsStep activityType={activityType} accounts={accounts} />
+        <MobileDetailsStep
+          activityType={activityType}
+          accounts={accounts}
+          amountWasEdited={amountWasEdited}
+        />
       )}
     </div>
   );

@@ -16,6 +16,18 @@ pub struct AssetProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_type: Option<String>,
 
+    /// Trading currency the provider reports for the listing it matched.
+    ///
+    /// Not stored on the asset - it exists so a caller can confirm the provider
+    /// answered for the instrument that was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+
+    /// Provider-native exchange code for the listing it matched (Yahoo's "NEO",
+    /// "NGM", ...). Same purpose as `currency`: confirmation, not storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange: Option<String>,
+
     /// Business sector (e.g., "Technology") - single sector for stocks
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sector: Option<String>,
@@ -24,6 +36,11 @@ pub struct AssetProfile {
     /// Format: [{"name": "Technology", "weight": 0.30}, {"name": "Healthcare", "weight": 0.15}]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sectors: Option<String>,
+
+    /// Asset-class allocation as JSON array for ETFs/Mutual Funds
+    /// Format: [{"name": "stock", "weight": 0.60}, {"name": "bond", "weight": 0.35}]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_allocation: Option<String>,
 
     /// Industry within sector (e.g., "Consumer Electronics")
     #[serde(skip_serializing_if = "Option::is_none")]

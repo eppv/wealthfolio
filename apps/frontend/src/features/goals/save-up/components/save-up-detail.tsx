@@ -8,25 +8,36 @@ import type {
   SaveUpProjectionPointDTO,
 } from "@/lib/types";
 import { formatDateISO } from "@/lib/utils";
-import { AmountDisplay, Button, DatePickerInput, formatCurrencySymbol } from "@wealthfolio/ui";
+import {
+  AmountDisplay,
+  Button,
+  DatePickerInput,
+  useAmountFormatting,
+  useDateFormatting,
+  useNumberFormatting,
+  type FormattingApi,
+} from "@wealthfolio/ui";
 import { Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/ui/components/ui/card";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { GoalFundingEditor } from "../../components/goal-funding-editor";
+import {
+  DEFAULT_RETURN_SLIDER_MAX,
+  highReturnWarning,
+  RATE_SLIDER_INCREMENT,
+} from "../../components/goal-lever-constants";
 import {
   GoalLeverRow as LeverRow,
   rateSliderMaxFor,
   sliderMaxFor,
 } from "../../components/goal-lever-row";
-import {
-  DEFAULT_RETURN_SLIDER_MAX,
-  RATE_SLIDER_INCREMENT,
-  highReturnWarning,
-} from "../../components/goal-lever-constants";
-import { GoalFundingEditor } from "../../components/goal-funding-editor";
 import { useGoalPlanMutations, useSaveUpPreview } from "../../hooks/use-goal-detail";
 import { useGoalMutations } from "../../hooks/use-goals";
 import { SaveUpProjectionCard } from "./save-up-projection-card";
 import { buildSavingsMilestones, SavingsMilestonesCard } from "./savings-milestones-card";
+
+type TFn = ReturnType<typeof useTranslation>["t"];
 
 // Keep in sync with crates/core/src/planning/save_up.rs validator limits.
 const SAVE_UP_MAX_TARGET_AMOUNT = 1_000_000_000_000;
@@ -85,6 +96,11 @@ interface Props {
 }
 
 export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const { settings } = useSettingsContext();
   const { savePlanMutation } = useGoalPlanMutations(goal.id);
@@ -93,7 +109,7 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
   const progress = overview?.progress ?? goal.summaryProgress ?? 0;
   const currentValue = overview?.currentValue ?? goal.summaryCurrentValue ?? 0;
   const currency = settings?.baseCurrency ?? goal.currency ?? "USD";
-  const moneyPrefix = formatCurrencySymbol(currency);
+  const moneyPrefix = amountFormatting.formatCurrencySymbol(currency);
   const initialTargetAmount = goal.targetAmount ?? 0;
   const initialTargetDate = existingSettings.targetDate ?? goal.targetDate ?? "";
   const initialMonthlyContribution =
@@ -157,10 +173,10 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
   const savePending = savePlanMutation.isPending;
   const actionPending = savePending || previewPending || previewUnavailable;
   const actionPendingLabel = previewUnavailable
-    ? "Preview failed"
+    ? t("goals:save_up.preview_failed")
     : previewPending
-      ? "Previewing..."
-      : "Saving...";
+      ? t("goals:save_up.previewing")
+      : t("goals:save_up.saving");
 
   const chartData: SaveUpProjectionPointDTO[] = useMemo(() => {
     const raw = projection?.trajectory ?? [];
@@ -222,23 +238,27 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
     setIsEditingPlan(false);
   }, [initialTargetAmount, initialTargetDate, initialMonthlyContribution, initialAnnualReturn]);
 
-  const status = getSaveUpStatus({
-    goalTitle: goal.title,
-    currentValue,
-    targetAmount,
-    targetDate,
-    projection,
-  });
+  const status = getSaveUpStatus(
+    {
+      goalTitle: goal.title,
+      currentValue,
+      targetAmount,
+      targetDate,
+      projection,
+    },
+    t,
+    dateFormatting,
+  );
   const projectedGap = projection ? projection.projectedValueAtTargetDate - targetAmount : null;
   const monthlyDifference = projection
     ? projection.requiredMonthlyContribution - monthlyContribution
     : null;
   const monthlyDifferenceLabel =
     monthlyDifference === null || Math.abs(monthlyDifference) < 0.5
-      ? "Monthly difference"
+      ? t("goals:save_up.monthly_difference")
       : monthlyDifference > 0
-        ? "Monthly gap"
-        : "Monthly cushion";
+        ? t("goals:save_up.monthly_gap")
+        : t("goals:save_up.monthly_cushion");
   const monthlyDifferenceClass =
     monthlyDifference === null || Math.abs(monthlyDifference) < 0.5
       ? "text-foreground font-semibold"
@@ -246,12 +266,20 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
         ? "text-destructive font-semibold"
         : "text-success font-semibold";
   const gapMetricLabel =
-    projectedGap === null ? "Remaining" : projectedGap >= 0 ? "Surplus" : "Gap";
+    projectedGap === null
+      ? t("goals:save_up.remaining")
+      : projectedGap >= 0
+        ? t("goals:save_up.surplus")
+        : t("goals:save_up.gap");
   const gapMetricValue = projectedGap === null ? remainingNow : Math.abs(projectedGap);
-  const targetDateLabel = formatGoalDate(targetDate);
+  const targetDateLabel = formatGoalDate(targetDate, dateFormatting);
   const savingsMilestones = useMemo(
-    () => buildSavingsMilestones(chartData, targetAmount, currentValue),
-    [chartData, targetAmount, currentValue],
+    () =>
+      buildSavingsMilestones(chartData, targetAmount, currentValue, t, {
+        ...dateFormatting,
+        ...numberFormatting,
+      }),
+    [chartData, targetAmount, currentValue, t, dateFormatting, numberFormatting],
   );
 
   return (
@@ -270,7 +298,7 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
                     {status.label}
                   </span>
                   <span className="text-muted-foreground text-xs font-medium uppercase tracking-[0.15em]">
-                    Savings plan
+                    {t("goals:save_up.savings_plan")}
                   </span>
                 </div>
                 <h2 className="font-serif text-2xl leading-tight tracking-tight">
@@ -279,40 +307,40 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
                   {status.headlineSuffix}
                 </h2>
                 <p className="text-muted-foreground mt-4 max-w-3xl text-sm leading-6">
-                  At your current{" "}
+                  {t("goals:save_up.summary_prefix")}{" "}
                   <AmountDisplay
                     value={monthlyContribution}
                     currency={currency}
                     isHidden={isBalanceHidden}
                     className="text-foreground font-semibold"
                   />
-                  /mo contribution,{" "}
+                  {t("goals:save_up.summary_per_month")}{" "}
                   {projection && targetDateLabel && projectedGap !== null ? (
                     projectedGap >= 0 ? (
                       <>
-                        this plan is projected to be{" "}
+                        {t("goals:save_up.summary_projected_prefix")}{" "}
                         <AmountDisplay
                           value={projectedGap}
                           currency={currency}
                           isHidden={isBalanceHidden}
                           className="text-success font-semibold"
                         />{" "}
-                        above target by {targetDateLabel}.
+                        {t("goals:save_up.summary_above_target", { date: targetDateLabel })}
                       </>
                     ) : (
                       <>
-                        this plan is projected to be{" "}
+                        {t("goals:save_up.summary_projected_prefix")}{" "}
                         <AmountDisplay
                           value={Math.abs(projectedGap)}
                           currency={currency}
                           isHidden={isBalanceHidden}
                           className="text-destructive font-semibold"
                         />{" "}
-                        short by {targetDateLabel}.
+                        {t("goals:save_up.summary_short_by", { date: targetDateLabel })}
                       </>
                     )
                   ) : (
-                    "set a target amount and date to see the projected gap."
+                    t("goals:save_up.summary_set_target")
                   )}
                 </p>
                 <div className="bg-muted mt-5 h-2 overflow-hidden rounded-full">
@@ -324,14 +352,14 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
               </div>
             </div>
             <div className="border-border grid grid-cols-2 divide-x divide-y border-t md:grid-cols-4 md:divide-y-0">
-              <HeroMetric label="Saved">
+              <HeroMetric label={t("goals:save_up.saved")}>
                 <AmountDisplay
                   value={currentValue}
                   currency={currency}
                   isHidden={isBalanceHidden}
                 />
               </HeroMetric>
-              <HeroMetric label="Target">
+              <HeroMetric label={t("goals:save_up.target")}>
                 {targetAmount > 0 ? (
                   <AmountDisplay
                     value={targetAmount}
@@ -339,7 +367,7 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
                     isHidden={isBalanceHidden}
                   />
                 ) : (
-                  "Not set"
+                  t("goals:save_up.not_set")
                 )}
               </HeroMetric>
               <HeroMetric label={gapMetricLabel}>
@@ -349,7 +377,9 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
                   isHidden={isBalanceHidden}
                 />
               </HeroMetric>
-              <HeroMetric label="Target date">{targetDateLabel ?? "Not set"}</HeroMetric>
+              <HeroMetric label={t("goals:save_up.target_date")}>
+                {targetDateLabel ?? t("goals:save_up.not_set")}
+              </HeroMetric>
             </div>
           </CardContent>
         </Card>
@@ -389,9 +419,7 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
         {!plan && !projection && (
           <Card>
             <CardContent className="py-10 text-center">
-              <p className="text-muted-foreground text-sm">
-                Configure your plan to see projections.
-              </p>
+              <p className="text-muted-foreground text-sm">{t("goals:save_up.configure_plan")}</p>
             </CardContent>
           </Card>
         )}
@@ -400,8 +428,8 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
       {/* ── Sidebar ── */}
       <div className="space-y-6 lg:sticky lg:top-6 lg:col-span-1 lg:self-start">
         <SidebarCard
-          kicker="Plan"
-          title="Savings Inputs"
+          kicker={t("goals:save_up.plan_kicker")}
+          title={t("goals:save_up.savings_inputs")}
           editing={isEditingPlan}
           onEdit={() => setIsEditingPlan(true)}
           onSave={handleSave}
@@ -411,30 +439,36 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
           pendingLabel={actionPendingLabel}
           readContent={
             <div className="divide-border divide-y">
-              <SidebarRow label="Target amount">
+              <SidebarRow label={t("goals:save_up.field_target_amount")}>
                 <AmountDisplay
                   value={targetAmount}
                   currency={currency}
                   isHidden={isBalanceHidden}
                 />
               </SidebarRow>
-              <SidebarRow label="Target date">{targetDateLabel ?? "Not set"}</SidebarRow>
-              <SidebarRow label="Monthly contribution">
+              <SidebarRow label={t("goals:save_up.field_target_date")}>
+                {targetDateLabel ?? t("goals:save_up.not_set")}
+              </SidebarRow>
+              <SidebarRow label={t("goals:save_up.field_monthly_contribution")}>
                 <AmountDisplay
                   value={monthlyContribution}
                   currency={currency}
                   isHidden={isBalanceHidden}
                 />
-                <span className="text-muted-foreground font-normal">/mo</span>
+                <span className="text-muted-foreground font-normal">
+                  {t("goals:save_up.per_month_suffix")}
+                </span>
               </SidebarRow>
-              <SidebarRow label="Expected return">{(annualReturn * 100).toFixed(1)}%</SidebarRow>
+              <SidebarRow label={t("goals:save_up.field_expected_return")}>
+                {numberFormatting.formatPercent(annualReturn, { digits: 1 })}
+              </SidebarRow>
             </div>
           }
           editContent={
             <>
               <LeverRow
-                label="Target amount"
-                hint="Amount needed for this goal"
+                label={t("goals:save_up.field_target_amount")}
+                hint={t("goals:save_up.hint_target_amount")}
                 kind="money"
                 value={targetAmount}
                 onChange={setTargetAmount}
@@ -443,17 +477,17 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
                 inputMax={SAVE_UP_MAX_TARGET_AMOUNT}
                 step={100}
                 prefix={moneyPrefix}
-                format={(v) => Math.round(v).toLocaleString()}
+                format={(v) => numberFormatting.formatDecimal(Math.round(v))}
               />
               <DateRow
-                label="Target date"
-                hint="When you want this money available"
+                label={t("goals:save_up.field_target_date")}
+                hint={t("goals:save_up.hint_target_date")}
                 value={targetDate}
                 onChange={setTargetDate}
               />
               <LeverRow
-                label="Monthly contribution"
-                hint="Planned additions to this goal"
+                label={t("goals:save_up.field_monthly_contribution")}
+                hint={t("goals:save_up.hint_monthly_contribution")}
                 kind="money"
                 value={monthlyContribution}
                 onChange={setMonthlyContribution}
@@ -462,11 +496,11 @@ export default function SaveUpDetailPage({ goal, plan, overview }: Props) {
                 inputMax={SAVE_UP_MAX_MONTHLY_CONTRIBUTION}
                 step={25}
                 prefix={moneyPrefix}
-                format={(v) => Math.round(v).toLocaleString()}
+                format={(v) => numberFormatting.formatDecimal(Math.round(v))}
               />
               <LeverRow
-                label="Expected annual return"
-                hint="Set to 0% for pure cash goals"
+                label={t("goals:save_up.field_expected_annual_return")}
+                hint={t("goals:save_up.hint_expected_annual_return")}
                 value={annualReturn}
                 onChange={setAnnualReturn}
                 min={0}
@@ -505,27 +539,31 @@ interface SaveUpStatus {
   progressClass: string;
 }
 
-function getSaveUpStatus({
-  goalTitle,
-  currentValue,
-  targetAmount,
-  targetDate,
-  projection,
-}: {
-  goalTitle: string;
-  currentValue: number;
-  targetAmount: number;
-  targetDate: string;
-  projection: SaveUpOverviewDTO | null;
-}): SaveUpStatus {
-  const dateLabel = formatGoalDate(targetDate) ?? "your target date";
+function getSaveUpStatus(
+  {
+    goalTitle,
+    currentValue,
+    targetAmount,
+    targetDate,
+    projection,
+  }: {
+    goalTitle: string;
+    currentValue: number;
+    targetAmount: number;
+    targetDate: string;
+    projection: SaveUpOverviewDTO | null;
+  },
+  t: TFn,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+): SaveUpStatus {
+  const dateLabel = formatGoalDate(targetDate, formatting) ?? t("goals:save_up.your_target_date");
 
   if (!targetAmount || !targetDate) {
     return {
-      label: "Setup needed",
-      headlinePrefix: "Set a target to",
-      headlineEmphasis: "track",
-      headlineSuffix: ` ${goalTitle}.`,
+      label: t("goals:save_up.status_setup_needed"),
+      headlinePrefix: t("goals:save_up.headline_setup_prefix"),
+      headlineEmphasis: t("goals:save_up.headline_setup_emphasis"),
+      headlineSuffix: t("goals:save_up.headline_setup_suffix", { title: goalTitle }),
       badgeClass: "bg-muted text-muted-foreground",
       textClass: "text-muted-foreground",
       progressClass: "bg-muted-foreground/40",
@@ -534,10 +572,10 @@ function getSaveUpStatus({
 
   if (currentValue >= targetAmount) {
     return {
-      label: "Reached",
-      headlinePrefix: "You've",
-      headlineEmphasis: "reached",
-      headlineSuffix: ` ${goalTitle}.`,
+      label: t("goals:save_up.status_reached"),
+      headlinePrefix: t("goals:save_up.headline_reached_prefix"),
+      headlineEmphasis: t("goals:save_up.headline_reached_emphasis"),
+      headlineSuffix: t("goals:save_up.headline_reached_suffix", { title: goalTitle }),
       badgeClass: "bg-success text-success-foreground",
       textClass: "text-success",
       progressClass: "bg-success",
@@ -546,10 +584,13 @@ function getSaveUpStatus({
 
   if (projection?.health === "on_track") {
     return {
-      label: "On track",
-      headlinePrefix: "You're",
-      headlineEmphasis: "on track",
-      headlineSuffix: ` for ${goalTitle} by ${dateLabel}.`,
+      label: t("goals:save_up.status_on_track"),
+      headlinePrefix: t("goals:save_up.headline_on_track_prefix"),
+      headlineEmphasis: t("goals:save_up.headline_on_track_emphasis"),
+      headlineSuffix: t("goals:save_up.headline_on_track_suffix", {
+        title: goalTitle,
+        date: dateLabel,
+      }),
       badgeClass: "bg-success text-success-foreground",
       textClass: "text-success",
       progressClass: "bg-success",
@@ -558,10 +599,10 @@ function getSaveUpStatus({
 
   if (projection?.health === "at_risk") {
     return {
-      label: "At risk",
-      headlinePrefix: `${goalTitle} is`,
-      headlineEmphasis: "close",
-      headlineSuffix: ` but not fully covered by ${dateLabel}.`,
+      label: t("goals:save_up.status_at_risk"),
+      headlinePrefix: t("goals:save_up.headline_at_risk_prefix", { title: goalTitle }),
+      headlineEmphasis: t("goals:save_up.headline_at_risk_emphasis"),
+      headlineSuffix: t("goals:save_up.headline_at_risk_suffix", { date: dateLabel }),
       badgeClass: "bg-yellow-100 text-yellow-800",
       textClass: "text-yellow-700",
       progressClass: "bg-yellow-600",
@@ -569,24 +610,33 @@ function getSaveUpStatus({
   }
 
   return {
-    label: "Off track",
-    headlinePrefix: "You're",
-    headlineEmphasis: "short",
-    headlineSuffix: ` for ${goalTitle} by ${dateLabel}.`,
+    label: t("goals:save_up.status_off_track"),
+    headlinePrefix: t("goals:save_up.headline_off_track_prefix"),
+    headlineEmphasis: t("goals:save_up.headline_off_track_emphasis"),
+    headlineSuffix: t("goals:save_up.headline_off_track_suffix", {
+      title: goalTitle,
+      date: dateLabel,
+    }),
     badgeClass: "bg-destructive text-destructive-foreground",
     textClass: "text-destructive",
     progressClass: "bg-destructive",
   };
 }
 
-function formatGoalDate(value?: string | null) {
+function formatGoalDate(
+  value: string | null | undefined,
+  formatting: Pick<FormattingApi, "formatCalendarDate">,
+) {
   if (!value) return null;
   const [year, month, day] = value.split("-").map(Number);
   if (!year || !month) return null;
-  return new Date(year, month - 1, day || 1).toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-  });
+  return formatting.formatCalendarDate(
+    { year, month, day: day || 1 },
+    {
+      year: "numeric",
+      month: "short",
+    },
+  );
 }
 
 function HeroMetric({ label, children }: { label: string; children: React.ReactNode }) {
@@ -619,25 +669,33 @@ function MonthlyPlanCallout({
   currency: string;
   isHidden: boolean;
 }) {
+  const formatting = useDateFormatting();
+  const { t } = useTranslation();
   return (
     <Card>
       <CardContent className="p-5">
         <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div className="min-w-0">
             <div className="text-muted-foreground mb-1 text-xs font-medium uppercase tracking-[0.15em]">
-              Action
+              {t("goals:save_up.action")}
             </div>
-            <h3 className="text-md font-semibold leading-none tracking-tight">Monthly plan</h3>
+            <h3 className="text-md font-semibold leading-none tracking-tight">
+              {t("goals:save_up.monthly_plan")}
+            </h3>
           </div>
 
           <div className="grid flex-1 grid-cols-2 gap-3 md:max-w-3xl md:grid-cols-4">
-            <CalloutMetric label="Current">
+            <CalloutMetric label={t("goals:save_up.current")}>
               <AmountDisplay value={currentMonthly} currency={currency} isHidden={isHidden} />
-              <span className="text-muted-foreground font-normal">/mo</span>
+              <span className="text-muted-foreground font-normal">
+                {t("goals:save_up.per_month_suffix")}
+              </span>
             </CalloutMetric>
-            <CalloutMetric label="Needed">
+            <CalloutMetric label={t("goals:save_up.needed")}>
               <AmountDisplay value={neededMonthly} currency={currency} isHidden={isHidden} />
-              <span className="text-muted-foreground font-normal">/mo</span>
+              <span className="text-muted-foreground font-normal">
+                {t("goals:save_up.per_month_suffix")}
+              </span>
             </CalloutMetric>
             <CalloutMetric label={monthlyDifferenceLabel}>
               <AmountDisplay
@@ -646,10 +704,12 @@ function MonthlyPlanCallout({
                 isHidden={isHidden}
                 className={monthlyDifferenceClass}
               />
-              <span className="text-muted-foreground font-normal">/mo</span>
+              <span className="text-muted-foreground font-normal">
+                {t("goals:save_up.per_month_suffix")}
+              </span>
             </CalloutMetric>
-            <CalloutMetric label="Finish">
-              {formatGoalDate(completionDate) ?? "Not reached"}
+            <CalloutMetric label={t("goals:save_up.finish")}>
+              {formatGoalDate(completionDate, formatting) ?? t("goals:save_up.not_reached")}
             </CalloutMetric>
           </div>
         </div>
@@ -701,13 +761,14 @@ function SidebarCard({
   readContent: React.ReactNode;
   editContent: React.ReactNode;
 }) {
+  const { t } = useTranslation();
   const renderEditActions = () => (
     <div className="flex items-center justify-end gap-1.5">
       <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={onCancel}>
-        Cancel
+        {t("common:cancel")}
       </Button>
       <Button size="sm" className="h-7 text-xs" onClick={onSave} disabled={!dirty || pending}>
-        {pending ? (pendingLabel ?? "Saving...") : "Save"}
+        {pending ? (pendingLabel ?? t("goals:save_up.saving")) : t("common:save")}
       </Button>
     </div>
   );
@@ -727,11 +788,11 @@ function SidebarCard({
           <button
             type="button"
             onClick={onEdit}
-            aria-label={`Edit ${title}`}
+            aria-label={t("goals:save_up.edit_aria", { title })}
             className="text-muted-foreground hover:text-foreground inline-flex shrink-0 items-center gap-1.5 text-sm transition-colors"
           >
             <Icons.Pencil className="h-3.5 w-3.5" />
-            Edit
+            {t("common:edit")}
           </button>
         )}
       </CardHeader>

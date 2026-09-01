@@ -7,11 +7,12 @@ import {
   PageContent,
   PageHeader,
   Skeleton,
-  formatCompactAmount,
-  formatPercent,
+  useAmountFormatting,
+  useNumberFormatting,
 } from "@wealthfolio/ui";
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import { GoalCard } from "../components/goal-card";
 import { useGoals } from "../hooks/use-goals";
@@ -28,6 +29,10 @@ function StatBlock({ label, value }: { label: string; value: React.ReactNode }) 
 }
 
 function SummaryStats({ goals }: { goals: Goal[] }) {
+  const amountFormatting = useAmountFormatting();
+  const numberFormatting = useNumberFormatting();
+
+  const { t } = useTranslation();
   const { isBalanceHidden } = useBalancePrivacy();
   const { settings } = useSettingsContext();
   const currency = settings?.baseCurrency ?? goals[0]?.currency ?? "USD";
@@ -39,15 +44,25 @@ function SummaryStats({ goals }: { goals: Goal[] }) {
     (g) => g.statusHealth === "on_track" || g.statusLifecycle === "achieved",
   ).length;
 
-  const savedDisplay = isBalanceHidden ? "••••" : formatCompactAmount(saved, currency);
-  const targetDisplay = isBalanceHidden ? "••••" : formatCompactAmount(target, currency);
+  const savedDisplay = isBalanceHidden
+    ? "••••"
+    : amountFormatting.formatCompactAmount(saved, currency);
+  const targetDisplay = isBalanceHidden
+    ? "••••"
+    : amountFormatting.formatCompactAmount(target, currency);
 
   return (
     <div className="mb-6 flex flex-wrap items-baseline gap-x-8 gap-y-2">
-      <StatBlock label="SAVED" value={savedDisplay} />
-      <StatBlock label="TARGET" value={targetDisplay} />
-      <StatBlock label="OVERALL" value={formatPercent(overall)} />
-      <StatBlock label="ON TRACK" value={`${onTrackCount}/${goals.length}`} />
+      <StatBlock label={t("goals:dashboard.stat_saved")} value={savedDisplay} />
+      <StatBlock label={t("goals:dashboard.stat_target")} value={targetDisplay} />
+      <StatBlock
+        label={t("goals:dashboard.stat_overall")}
+        value={numberFormatting.formatPercent(overall)}
+      />
+      <StatBlock
+        label={t("goals:dashboard.stat_on_track")}
+        value={`${onTrackCount}/${goals.length}`}
+      />
     </div>
   );
 }
@@ -63,13 +78,14 @@ function GoalGrid({ goals }: { goals: Goal[] }) {
 }
 
 export default function GoalsDashboardPage() {
+  const { t } = useTranslation();
   const { active, atRisk, achieved, archived, isLoading } = useGoals();
   const [archivedOpen, setArchivedOpen] = useState(false);
 
   if (isLoading) {
     return (
       <Page>
-        <PageHeader heading="Goals" text="Track and plan your financial goals" />
+        <PageHeader heading={t("goals:goals")} text={t("goals:dashboard.subtitle")} />
         <PageContent>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             {[1, 2, 3].map((i) => (
@@ -93,13 +109,13 @@ export default function GoalsDashboardPage() {
   return (
     <Page>
       <PageHeader
-        heading="Goals"
-        text="Track and plan your financial goals"
+        heading={t("goals:goals")}
+        text={t("goals:dashboard.subtitle")}
         actions={
           <Link to="/goals/new">
             <Button size="sm">
               <Icons.Plus className="mr-1 h-4 w-4" />
-              New Goal
+              {t("goals:dashboard.new_goal")}
             </Button>
           </Link>
         }
@@ -111,16 +127,15 @@ export default function GoalsDashboardPage() {
               <Icons.Target className="text-muted-foreground h-8 w-8" />
             </div>
             <div className="space-y-2">
-              <p className="text-lg font-semibold">No goals yet</p>
+              <p className="text-lg font-semibold">{t("goals:dashboard.empty_title")}</p>
               <p className="text-muted-foreground max-w-md text-sm leading-relaxed">
-                Create your first financial goal — whether it's retirement, a home, education, or
-                anything else you're saving toward.
+                {t("goals:dashboard.empty_description")}
               </p>
             </div>
             <Link to="/goals/new">
               <Button size="lg" className="mt-2">
                 <Icons.Plus className="mr-2 h-4 w-4" />
-                Create Your First Goal
+                {t("goals:dashboard.create_first_goal")}
               </Button>
             </Link>
           </div>
@@ -142,7 +157,7 @@ export default function GoalsDashboardPage() {
                   <Icons.ChevronRight
                     className={`h-3.5 w-3.5 transition-transform ${archivedOpen ? "rotate-90" : ""}`}
                   />
-                  Archived ({archived.length})
+                  {t("goals:dashboard.archived_count", { count: archived.length })}
                 </button>
                 {archivedOpen && (
                   <div className="mt-3">

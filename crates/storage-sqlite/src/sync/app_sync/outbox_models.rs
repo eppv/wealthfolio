@@ -8,7 +8,9 @@ use crate::custom_provider::CustomProviderDB;
 use crate::goals::{GoalDB, GoalPlanDB, GoalsAllocationDB};
 use crate::limits::ContributionLimitDB;
 use crate::market_data::QuoteDB;
-use crate::portfolio::allocation_targets::{AllocationTargetDB, AllocationTargetWeightDB};
+use crate::portfolio::allocation_targets::{
+    AllocationTargetConstraintDB, AllocationTargetDB, AllocationTargetWeightDB,
+};
 use crate::portfolio::snapshot::AccountStateSnapshotDB;
 use crate::portfolios::{PortfolioAccountDB, PortfolioDB};
 use crate::settings::model::AppSettingDB;
@@ -208,7 +210,6 @@ impl SyncOutboxModel for AccountStateSnapshotDB {
     fn should_sync_outbox(&self, _op: SyncOperation) -> bool {
         let source = match self.source.as_str() {
             "MANUAL_ENTRY" => SnapshotSource::ManualEntry,
-            "SYNTHETIC" => SnapshotSource::Synthetic,
             "CSV_IMPORT" => SnapshotSource::CsvImport,
             "BROKER_IMPORTED" => SnapshotSource::BrokerImported,
             _ => SnapshotSource::Calculated,
@@ -251,6 +252,14 @@ impl SyncOutboxModel for AllocationTargetDB {
 
 impl SyncOutboxModel for AllocationTargetWeightDB {
     const ENTITY: SyncEntity = SyncEntity::AllocationTargetWeight;
+
+    fn sync_entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl SyncOutboxModel for AllocationTargetConstraintDB {
+    const ENTITY: SyncEntity = SyncEntity::AllocationTargetConstraint;
 
     fn sync_entity_id(&self) -> &str {
         &self.id

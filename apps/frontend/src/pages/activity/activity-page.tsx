@@ -1,4 +1,4 @@
-import { getAccounts, getTransferPairForActivity } from "@/adapters";
+import { getAccounts } from "@/adapters";
 import { ActionPalette, type ActionPaletteGroup } from "@/components/action-palette";
 import { SwipablePage, type SwipablePageView } from "@/components/page";
 import {
@@ -22,6 +22,7 @@ import type { SortingState } from "@tanstack/react-table";
 import { Button, Icons, Page, PageContent, PageHeader } from "@wealthfolio/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DateRange } from "react-day-picker";
+import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { ActivityDataGrid } from "./components/activity-data-grid/activity-data-grid";
 import { ActivityDeleteModal } from "./components/activity-delete-modal";
@@ -31,10 +32,11 @@ import { ActivityPagination } from "./components/activity-pagination";
 import ActivityTable from "./components/activity-table/activity-table";
 import ActivityTableMobile from "./components/activity-table/activity-table-mobile";
 import { ActivityViewControls, type ActivityViewMode } from "./components/activity-view-controls";
+import { NeedsReviewBanner } from "./components/needs-review-banner";
 import { BulkHoldingsModal } from "./components/forms/bulk-holdings-modal";
 import { MobileActivityForm } from "./components/mobile-forms/mobile-activity-form";
 import { TransferMatchDialog } from "./components/transfer-match-dialog";
-import { useActivityMutations } from "./hooks/use-activity-mutations";
+import { useActivityActionDialogs } from "./hooks/use-activity-action-dialogs";
 import { useActivitySearch, type ActivityStatusFilter } from "./hooks/use-activity-search";
 import {
   clearActivityUrlFilters,
@@ -81,9 +83,7 @@ function fromDateRange(range: DateRange | undefined): ActivityDateRangeFilter {
 }
 
 const ActivityPage = () => {
-  const [showForm, setShowForm] = useState(false);
-  const [selectedActivity, setSelectedActivity] = useState<Partial<ActivityDetails> | undefined>();
-  const [showDeleteAlert, setShowDeleteAlert] = useState(false);
+  const { t } = useTranslation();
   const [showBulkHoldingsForm, setShowBulkHoldingsForm] = useState(false);
   const [showAlternativeAssetModal, setShowAlternativeAssetModal] = useState(false);
   const [transferMatchDialog, setTransferMatchDialog] = useState<{
@@ -95,6 +95,18 @@ const ActivityPage = () => {
   const [showSpendingActionPalette, setShowSpendingActionPalette] = useState(false);
   const isMobileViewport = useIsMobileViewport();
   const isCompactTableViewport = useIsCompactTableViewport();
+  const {
+    selectedActivity,
+    formOpen: showForm,
+    deleteDialogOpen: showDeleteAlert,
+    isDeleting,
+    openForm: handleEdit,
+    closeForm: handleFormClose,
+    requestDelete: handleDelete,
+    cancelDelete: handleDeleteCancel,
+    confirmDelete: handleDeleteConfirm,
+    duplicateActivity: handleDuplicate,
+  } = useActivityActionDialogs();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const activityUrlFilterKey = searchParams.toString();
@@ -136,7 +148,6 @@ const ActivityPage = () => {
     "activity-mobile-view-compact",
     true,
   );
-
   // Pagination state for datagrid view
   const [pageIndex, setPageIndex] = usePersistentState("activity-datagrid-page-index", 0);
   const [pageSize, setPageSize] = usePersistentState("activity-datagrid-page-size", 50);
@@ -153,7 +164,10 @@ const ActivityPage = () => {
     searchParams.has("types") ||
     searchParams.has("from") ||
     searchParams.has("to") ||
-    searchParams.has("q");
+    searchParams.has("q") ||
+    searchParams.has("activity") ||
+    searchParams.has("healthContext");
+  const isHealthActivityDeepLink = activityUrlFilters.healthContext === "activity";
   const accountScope =
     activityUrlFilters.accountScope ??
     (hasActivityUrlFilters ? ALL_ACCOUNT_SCOPE : persistedAccountScope);
@@ -261,6 +275,18 @@ const ActivityPage = () => {
     [materializeInvestmentFilters],
   );
 
+  // handle filter changes in mobile form
+  const setMobileFilters = useCallback(
+    (types: ActivityType[], range: DateRange | undefined, scope: AccountScope) => {
+      materializeInvestmentFilters({
+        accountScope: scope,
+        activityTypes: types,
+        dateRange: fromDateRange(range),
+      });
+    },
+    [materializeInvestmentFilters],
+  );
+
   // Coerce "spending" URL state back to investments when the module is disabled.
   const urlTab = searchParams.get("tab");
   useEffect(() => {
@@ -328,9 +354,6 @@ const ActivityPage = () => {
     queryKey: [QueryKeys.ACCOUNTS],
     queryFn: () => getAccounts(),
   });
-
-  const { deleteActivityMutation, duplicateActivityMutation } = useActivityMutations();
-
   const isDatagridView = viewMode === "datagrid";
   const shouldUseDatagridView = isDatagridView && !isCompactTableViewport;
 
@@ -402,11 +425,27 @@ const ActivityPage = () => {
   // branch's work). Empty effectiveAccountIds means "all" — collapses to
   // the investment-only set.
   const effectiveInvestmentAccountIds = useMemo(() => {
+    // Review is a cross-cutting data-quality workflow. Spending-enabled
+    // accounts normally stay on the Spending tab, but hiding their flagged
+    // activity rows here would make migration review impossible.
+    if (statusFilter === "pending") return effectiveAccountIds;
     if (!isSpendingEnabled || spendingAccountIds.length === 0) return effectiveAccountIds;
     if (!effectiveAccountIds || effectiveAccountIds.length === 0) return investmentAccountIds;
     const allowed = new Set(investmentAccountIds);
     return effectiveAccountIds.filter((id) => allowed.has(id));
-  }, [effectiveAccountIds, investmentAccountIds, isSpendingEnabled, spendingAccountIds]);
+  }, [
+    effectiveAccountIds,
+    investmentAccountIds,
+    isSpendingEnabled,
+    spendingAccountIds,
+    statusFilter,
+  ]);
+
+  // A health-check deep-link (?activity=<id>) pins the list to one transaction,
+  // filtered server-side so it's found regardless of paging.
+  const activityIdFilter = activityUrlFilters.activityId
+    ? [activityUrlFilters.activityId]
+    : undefined;
 
   // Infinite scroll search for table view
   const infiniteSearch = useActivitySearch({
@@ -418,6 +457,7 @@ const ActivityPage = () => {
       status: statusFilter,
       dateFrom: effectiveDateFrom,
       dateTo: effectiveDateTo,
+      activityIds: activityIdFilter,
     },
     searchQuery: effectiveSearchQuery,
     sorting,
@@ -433,6 +473,7 @@ const ActivityPage = () => {
       status: statusFilter,
       dateFrom: effectiveDateFrom,
       dateTo: effectiveDateTo,
+      activityIds: activityIdFilter,
     },
     searchQuery: effectiveSearchQuery,
     sorting,
@@ -458,7 +499,8 @@ const ActivityPage = () => {
     sorting,
   ]);
 
-  // Use appropriate data based on view mode
+  // Use appropriate data based on view mode. The ?activity=<id> deep-link is
+  // applied server-side via the activityIds filter, so no client-side narrowing.
   const tableActivities = infiniteSearch.data;
   const datagridActivities = paginatedSearch.data;
   const totalFetched = tableActivities.length;
@@ -466,76 +508,12 @@ const ActivityPage = () => {
     ? paginatedSearch.totalRowCount
     : infiniteSearch.totalRowCount;
 
-  const handleEdit = useCallback(
-    async (activity?: ActivityDetails, activityType?: ActivityType) => {
-      if (
-        activity?.id &&
-        (activity.activityType === ActivityType.TRANSFER_IN ||
-          activity.activityType === ActivityType.TRANSFER_OUT) &&
-        activity.sourceGroupId &&
-        ((activity.metadata?.flow as { is_external?: boolean } | undefined)?.is_external ??
-          false) !== true
-      ) {
-        try {
-          const pair = await getTransferPairForActivity(activity.id);
-          const counterpart =
-            activity.activityType === ActivityType.TRANSFER_IN ? pair.transferOut : pair.transferIn;
-          setSelectedActivity({
-            ...activity,
-            transferOutId: pair.transferOut.id,
-            transferInId: pair.transferIn.id,
-            counterpartActivityId: counterpart.id,
-            counterpartAccountId: counterpart.accountId,
-            counterpartAmount: counterpart.amount ?? null,
-            counterpartCurrency: counterpart.currency,
-            counterpartFxRate: pair.transferIn.fxRate ?? null,
-          });
-          setShowForm(true);
-          return;
-        } catch {
-          // Fall back to single-leg editing for invalid groups that are not valid internal pairs.
-          setSelectedActivity(activity);
-          setShowForm(true);
-          return;
-        }
-      }
-
-      setSelectedActivity(activity ?? { activityType });
-      setShowForm(true);
-    },
-    [],
-  );
-
-  const handleDelete = useCallback((activity: ActivityDetails) => {
-    setSelectedActivity(activity);
-    setShowDeleteAlert(true);
-  }, []);
-
-  const handleDuplicate = useCallback(
-    async (activity: ActivityDetails) => {
-      await duplicateActivityMutation.mutateAsync(activity);
-    },
-    [duplicateActivityMutation],
-  );
-
   const handleLinkTransfer = useCallback((activity: ActivityDetails) => {
     setTransferMatchDialog({ open: true, mode: "link", activity });
   }, []);
 
   const handleUnlinkTransfer = useCallback((activity: ActivityDetails) => {
     setTransferMatchDialog({ open: true, mode: "unlink", activity });
-  }, []);
-
-  const handleDeleteConfirm = async () => {
-    if (!selectedActivity?.id) return;
-    await deleteActivityMutation.mutateAsync(selectedActivity.id);
-    setShowDeleteAlert(false);
-    setSelectedActivity(undefined);
-  };
-
-  const handleFormClose = useCallback(() => {
-    setShowForm(false);
-    setSelectedActivity(undefined);
   }, []);
 
   const investmentsFiltersActive =
@@ -548,6 +526,7 @@ const ActivityPage = () => {
     displayedSearchInput.trim().length > 0;
 
   const clearInvestmentsFilters = useCallback(() => {
+    debouncedUpdateSearch.cancel();
     setPersistedAccountScope({ type: "all" });
     setSelectedActivityTypes([]);
     setSelectedInstrumentTypes([]);
@@ -558,6 +537,7 @@ const ActivityPage = () => {
     clearActivityUrlFilterParams();
   }, [
     clearActivityUrlFilterParams,
+    debouncedUpdateSearch,
     setPersistedAccountScope,
     setSelectedActivityTypes,
     setSelectedInstrumentTypes,
@@ -572,28 +552,32 @@ const ActivityPage = () => {
         items: [
           {
             icon: Icons.Activity,
-            label: "Add Transaction",
+            label: t("activity:add_transaction"),
+            testId: "add-transaction-action",
             onClick: () => handleEdit(undefined),
           },
           {
             icon: Icons.UploadSimple,
-            label: "Import from CSV",
+            label: t("activity:page.import_from_csv"),
+            testId: "import-activities-action",
             onClick: () => navigate("/import"),
           },
           {
             icon: Icons.Holdings,
-            label: "Transfer Holdings",
+            label: t("activity:page.transfer_holdings"),
+            testId: "transfer-holdings-action",
             onClick: () => setShowBulkHoldingsForm(true),
           },
           {
             icon: Icons.House,
-            label: "Add Personal Asset",
+            label: t("activity:page.add_personal_asset"),
+            testId: "add-personal-asset-action",
             onClick: () => setShowAlternativeAssetModal(true),
           },
         ],
       },
     ],
-    [handleEdit, navigate],
+    [handleEdit, navigate, t],
   );
 
   const investmentActions = (
@@ -606,9 +590,9 @@ const ActivityPage = () => {
           onOpenChange={setShowActionPalette}
           groups={actionPaletteGroups}
           trigger={
-            <Button size="sm">
+            <Button data-testid="add-activities-button" size="sm">
               <Icons.Plus className="mr-2 h-4 w-4" />
-              Add Activities
+              {t("activity:page.add_activities")}
             </Button>
           }
         />
@@ -616,12 +600,12 @@ const ActivityPage = () => {
 
       {/* Mobile add button */}
       <div className="flex items-center gap-2 sm:hidden">
-        <Button size="icon" title="Import" variant="outline" asChild>
+        <Button size="icon" title={t("common:import")} variant="outline" asChild>
           <Link to={"/import"}>
             <Icons.Import className="size-4" />
           </Link>
         </Button>
-        <Button size="icon" title="Add" onClick={() => handleEdit(undefined)}>
+        <Button size="icon" title={t("common:add")} onClick={() => handleEdit(undefined)}>
           <Icons.Plus className="size-4" />
         </Button>
       </div>
@@ -634,18 +618,20 @@ const ActivityPage = () => {
         items: [
           {
             icon: Icons.Activity,
-            label: "Add Transaction",
+            label: t("activity:add_transaction"),
+            testId: "add-transaction-action",
             onClick: () => spendingTabRef.current?.openAddForm(),
           },
           {
             icon: Icons.UploadSimple,
-            label: "Import from CSV",
+            label: t("activity:page.import_from_csv"),
+            testId: "import-activities-action",
             onClick: () => navigate("/import"),
           },
         ],
       },
     ],
-    [navigate],
+    [navigate, t],
   );
 
   const spendingActions = (
@@ -656,8 +642,8 @@ const ActivityPage = () => {
         asChild
         size="icon"
         variant="outline"
-        title="Ask AI to categorize"
-        aria-label="Ask AI to categorize"
+        title={t("activity:page.ask_ai_categorize")}
+        aria-label={t("activity:page.ask_ai_categorize")}
       >
         <Link
           to="/assistant"
@@ -673,9 +659,9 @@ const ActivityPage = () => {
           onOpenChange={setShowSpendingActionPalette}
           groups={spendingActionPaletteGroups}
           trigger={
-            <Button size="sm">
+            <Button data-testid="add-activities-button" size="sm">
               <Icons.Plus className="mr-2 h-4 w-4" />
-              Add Activities
+              {t("activity:page.add_activities")}
             </Button>
           }
         />
@@ -683,12 +669,16 @@ const ActivityPage = () => {
 
       {/* Mobile add button */}
       <div className="flex items-center gap-2 sm:hidden">
-        <Button size="icon" title="Import" variant="outline" asChild>
+        <Button size="icon" title={t("common:import")} variant="outline" asChild>
           <Link to={"/import"}>
             <Icons.Import className="size-4" />
           </Link>
         </Button>
-        <Button size="icon" title="Add" onClick={() => spendingTabRef.current?.openAddForm()}>
+        <Button
+          size="icon"
+          title={t("common:add")}
+          onClick={() => spendingTabRef.current?.openAddForm()}
+        >
           <Icons.Plus className="size-4" />
         </Button>
       </div>
@@ -697,6 +687,28 @@ const ActivityPage = () => {
 
   const investmentContent = (
     <div className="flex min-h-0 flex-1 flex-col space-y-4 overflow-hidden">
+      {statusFilter !== "pending" && (
+        <NeedsReviewBanner
+          accountIds={effectiveInvestmentAccountIds}
+          onReview={() => setStatusFilter("pending")}
+        />
+      )}
+      {isHealthActivityDeepLink && (
+        <div className="border-border bg-muted/30 flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <Icons.Info className="text-muted-foreground h-4 w-4 shrink-0" />
+            <p className="text-sm">
+              {activityUrlFilters.activityId
+                ? t("activity:page.health_filter_single")
+                : t("activity:page.health_filter_multiple")}
+            </p>
+          </div>
+          <Button variant="ghost" size="sm" onClick={clearActivityUrlFilterParams}>
+            {t("common:clear")}
+          </Button>
+        </div>
+      )}
+
       {isMobileViewport ? (
         <ActivityMobileControls
           accounts={investmentAccounts}
@@ -704,13 +716,11 @@ const ActivityPage = () => {
           searchQuery={displayedSearchInput}
           onSearchQueryChange={handleSearchChange}
           accountScope={accountScope}
-          onAccountScopeChange={setAccountScope}
           selectedActivityTypes={effectiveActivityTypes}
-          onActivityTypesChange={setInvestmentActivityTypes}
           dateRange={effectiveDateRange}
-          onDateRangeChange={setInvestmentDateRange}
           isCompactView={isCompactView}
           onCompactViewChange={setIsCompactView}
+          onFilterChange={setMobileFilters}
         />
       ) : (
         <ActivityViewControls
@@ -728,6 +738,7 @@ const ActivityPage = () => {
           onStatusFilterChange={setStatusFilter}
           dateRange={effectiveDateRange}
           onDateRangeChange={setInvestmentDateRange}
+          onResetFilters={clearInvestmentsFilters}
           viewMode={viewMode}
           onViewModeChange={setViewMode}
           totalFetched={shouldUseDatagridView ? undefined : totalFetched}
@@ -750,6 +761,11 @@ const ActivityPage = () => {
           filtersActive={investmentsFiltersActive}
           onAdd={() => handleEdit(undefined)}
           onClearFilters={clearInvestmentsFilters}
+          onLoadMore={infiniteSearch.fetchNextPage}
+          hasNextPage={infiniteSearch.hasNextPage}
+          isFetching={infiniteSearch.isFetching}
+          isFetchingNextPage={infiniteSearch.isFetchingNextPage}
+          hasLoadMoreError={infiniteSearch.isFetchNextPageError}
         />
       ) : shouldUseDatagridView ? (
         <ActivityDataGrid
@@ -781,13 +797,16 @@ const ActivityPage = () => {
           filtersActive={investmentsFiltersActive}
           onAdd={() => handleEdit(undefined)}
           onClearFilters={clearInvestmentsFilters}
+          onLoadMore={infiniteSearch.fetchNextPage}
+          hasNextPage={infiniteSearch.hasNextPage}
+          isFetching={infiniteSearch.isFetching}
+          isFetchingNextPage={infiniteSearch.isFetchingNextPage}
+          hasLoadMoreError={infiniteSearch.isFetchNextPageError}
         />
       )}
 
       {!shouldUseDatagridView && (
         <ActivityPagination
-          hasMore={infiniteSearch.hasNextPage ?? false}
-          onLoadMore={infiniteSearch.fetchNextPage}
           isFetching={infiniteSearch.isFetchingNextPage}
           totalFetched={totalFetched}
           totalCount={infiniteSearch.totalRowCount}
@@ -818,13 +837,10 @@ const ActivityPage = () => {
       )}
       <ActivityDeleteModal
         isOpen={showDeleteAlert}
-        isDeleting={deleteActivityMutation.isPending}
+        isDeleting={isDeleting}
         linkedTransfer={!!selectedActivity?.sourceGroupId}
         onConfirm={handleDeleteConfirm}
-        onCancel={() => {
-          setShowDeleteAlert(false);
-          setSelectedActivity(undefined);
-        }}
+        onCancel={handleDeleteCancel}
       />
       <BulkHoldingsModal
         open={showBulkHoldingsForm}
@@ -868,14 +884,14 @@ const ActivityPage = () => {
   const views: SwipablePageView[] = [
     {
       value: "investments",
-      label: "Investments",
+      label: t("activity:page.investments"),
       icon: Icons.TrendingUp,
       content: investmentContent,
       actions: investmentActions,
     },
     {
       value: "spending",
-      label: "Spending",
+      label: t("activity:page.spending"),
       icon: Icons.Wallet,
       content: <SpendingTransactionsTab ref={spendingTabRef} />,
       actions: spendingActions,

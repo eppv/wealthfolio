@@ -12,10 +12,12 @@ wealthfolio-storage-sqlite = { workspace = true }
 wealthfolio-device-sync = { workspace = true }
 wealthfolio-ai = { workspace = true }
 wealthfolio-spending = { workspace = true }
+wealthfolio-agent-tools = { workspace = true }
+wealthfolio-mcp = { workspace = true }
 
 # Web framework
 axum = { version = "0.8", features = ["json", "macros", "multipart"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-full", "timeout", "request-id", "fs"] }
 
 # Workspace dependencies
@@ -53,6 +55,9 @@ futures = "0.3"
 futures-core = "0.3"
 semver = "1"
 hyper = { version = "0.14", features = ["full"] }
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+rmcp = { workspace = true }
+subtle = "2"
 
 [features]
 default = ["connect-sync", "device-sync"]

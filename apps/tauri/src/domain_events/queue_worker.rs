@@ -14,20 +14,26 @@ use tokio::sync::mpsc;
 use wealthfolio_core::events::DomainEvent;
 use wealthfolio_core::health::HealthServiceTrait;
 use wealthfolio_core::portfolio::snapshot::{
-    reconcile_quote_sync_from_latest_account_snapshots, SnapshotRecalcMode,
+    reconcile_quote_sync_from_latest_account_snapshots, snapshot_date_requires_remediation,
+    SnapshotRecalcMode,
 };
-use wealthfolio_core::portfolio::valuation::ValuationRecalcMode;
+use wealthfolio_core::portfolio::valuation::{CurrentAccountValuationService, ValuationRecalcMode};
+use wealthfolio_core::utils::time_utils::{parse_user_timezone_or_default, user_today};
 
 #[cfg(feature = "connect-sync")]
 use super::planner::plan_broker_sync;
-use super::planner::{plan_asset_enrichment, plan_categorization_job, plan_portfolio_job};
+use super::planner::{
+    plan_asset_classification_change, plan_asset_enrichment, plan_categorization_job,
+    plan_portfolio_job,
+};
 #[cfg(feature = "connect-sync")]
 use crate::commands::brokers_sync::perform_broker_sync;
 use crate::context::ServiceContext;
 use crate::events::{
-    MarketSyncResult, PortfolioRequestPayload, ASSET_ENRICHMENT_COMPLETE,
-    ASSET_ENRICHMENT_PROGRESS, ASSET_ENRICHMENT_START, MARKET_SYNC_COMPLETE, MARKET_SYNC_ERROR,
-    MARKET_SYNC_START, PORTFOLIO_UPDATE_COMPLETE, PORTFOLIO_UPDATE_ERROR, PORTFOLIO_UPDATE_START,
+    MarketSyncResult, PortfolioRequestPayload, ASSET_CLASSIFICATIONS_CHANGED,
+    ASSET_ENRICHMENT_COMPLETE, ASSET_ENRICHMENT_PROGRESS, ASSET_ENRICHMENT_START,
+    MARKET_SYNC_COMPLETE, MARKET_SYNC_ERROR, MARKET_SYNC_START, PORTFOLIO_UPDATE_COMPLETE,
+    PORTFOLIO_UPDATE_ERROR, PORTFOLIO_UPDATE_START,
 };
 
 /// Debounce window duration in milliseconds.
@@ -114,6 +120,16 @@ async fn process_event_batch(
     }
 
     info!("Processing batch of {} domain events", events.len());
+
+    if let Some(plan) = plan_asset_classification_change(events) {
+        let _ = app_handle.emit(
+            ASSET_CLASSIFICATIONS_CHANGED,
+            serde_json::json!({
+                "assetIds": plan.asset_ids,
+                "taxonomyIds": plan.taxonomy_ids,
+            }),
+        );
+    }
 
     // 1. Plan and run asset enrichment FIRST so that bond metadata (coupon rate,
     //    maturity date, etc.) is available before the portfolio job tries to
@@ -299,11 +315,18 @@ async fn run_portfolio_job(
 ) {
     let market_sync_mode = payload.market_sync_mode.clone();
     let accounts_to_recalc = payload.account_ids.clone();
-    let snapshot_mode = match payload.since_date {
+    let today = user_today(parse_user_timezone_or_default(&context.get_timezone()));
+    let safe_since_date = payload
+        .since_date
+        .filter(|date| !snapshot_date_requires_remediation(*date, today));
+    if payload.since_date.is_some() && safe_since_date.is_none() {
+        warn!("Ignoring an invalid portfolio recalculation boundary and rebuilding safely");
+    }
+    let snapshot_mode = match safe_since_date {
         Some(date) => SnapshotRecalcMode::SinceDate(date),
         None => SnapshotRecalcMode::Full,
     };
-    let valuation_mode = match payload.since_date {
+    let valuation_mode = match safe_since_date {
         Some(date) => ValuationRecalcMode::SinceDate(date),
         None => ValuationRecalcMode::Full,
     };
@@ -367,6 +390,7 @@ async fn run_portfolio_job(
                 let result_payload = MarketSyncResult {
                     failed_syncs,
                     skipped_reasons,
+                    show_skipped_reasons: false,
                 };
                 if let Err(e) = app_handle.emit(MARKET_SYNC_COMPLETE, &result_payload) {
                     error!("Failed to emit market:sync-complete event: {}", e);
@@ -396,9 +420,22 @@ async fn run_portfolio_job(
                     error!("Failed to emit market:sync-error event: {}", e_emit);
                 }
                 error!(
-                    "Market data sync failed: {}. Skipping portfolio calculation.",
+                    "Market data sync failed: {}. Recalculating with cached quotes.",
                     e
                 );
+
+                // The change that queued this job — an edited asset, a new
+                // activity — still has to reach the portfolio. Fetching quotes
+                // is a separate concern, and a provider outage or an offline
+                // device must not leave the portfolio on stale values.
+                run_portfolio_calculation(
+                    app_handle,
+                    context,
+                    accounts_to_recalc,
+                    snapshot_mode,
+                    valuation_mode,
+                )
+                .await;
             }
         }
     } else {
@@ -496,19 +533,32 @@ async fn run_portfolio_calculation(
         );
     }
 
-    // Calculate valuation history for each account
+    // Calculate valuation histories as one bounded batch.
     let valuation_service = context.valuation_service();
-    for account_id in account_ids_vec {
-        if let Err(err) = valuation_service
-            .calculate_valuation_history(&account_id, valuation_mode.clone())
-            .await
-        {
-            let err_msg = format!(
-                "Valuation history calculation failed for {}: {}",
-                account_id, err
-            );
-            warn!("{}", err_msg);
-            let _ = app_handle.emit(PORTFOLIO_UPDATE_ERROR, &err_msg);
+    match valuation_service
+        .calculate_valuation_histories(&account_ids_vec, valuation_mode)
+        .await
+    {
+        Ok(outcome) => {
+            if outcome
+                .failures
+                .iter()
+                .any(|failure| failure.code == "INVALID_SNAPSHOT_DATE")
+            {
+                context.health_service().clear_cache().await;
+            }
+            for failure in outcome.failures {
+                warn!(
+                    "Valuation history calculation failed for {}: {}",
+                    failure.account_id, failure.message
+                );
+                let _ = app_handle.emit(PORTFOLIO_UPDATE_ERROR, &failure);
+            }
+        }
+        Err(error) => {
+            let message = format!("Failed to load shared valuation facts: {}", error);
+            warn!("{}", message);
+            let _ = app_handle.emit(PORTFOLIO_UPDATE_ERROR, &message);
         }
     }
 
@@ -540,7 +590,6 @@ async fn refresh_all_goal_summaries(context: &Arc<ServiceContext>) {
         return;
     }
 
-    // Fetch valuations once for all accounts
     let accounts = match context.account_service().get_active_non_archived_accounts() {
         Ok(a) => a,
         Err(e) => {
@@ -549,19 +598,43 @@ async fn refresh_all_goal_summaries(context: &Arc<ServiceContext>) {
         }
     };
     let account_ids: Vec<String> = accounts.into_iter().map(|a| a.id).collect();
-    let valuations = match context
-        .valuation_service()
-        .get_latest_valuations(&account_ids)
+    let base_currency = context.get_base_currency();
+    let timezone = context.get_timezone();
+    let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
+    let account_service = context.account_service();
+    let snapshot_repository = context.snapshot_repository();
+    let asset_service = context.asset_service();
+    let quote_service = context.quote_service();
+    let fx_service = context.fx_service();
+    let service = CurrentAccountValuationService::new(
+        account_service.as_ref(),
+        snapshot_repository.as_ref(),
+        asset_service.as_ref(),
+        quote_service.as_ref(),
+        fx_service.as_ref(),
+    );
+    let response = match service
+        .get_current_valuation_for_scope(
+            "all",
+            &account_ids,
+            &base_currency,
+            latest_snapshot_cutoff,
+            true,
+        )
+        .await
     {
-        Ok(v) => v,
+        Ok(response) => response,
         Err(e) => {
-            warn!("Failed to load valuations for goal summary refresh: {}", e);
+            warn!(
+                "Failed to load current valuations for goal summary refresh: {}",
+                e
+            );
             return;
         }
     };
 
     let mut valuation_map = std::collections::HashMap::new();
-    for v in &valuations {
+    for v in &response.accounts {
         let Some(value_in_base) = v.total_value_base.to_f64() else {
             warn!(
                 "Skipping goal summary refresh: invalid base valuation total for account {}",

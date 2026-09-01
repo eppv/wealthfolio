@@ -3,7 +3,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { calculateRebalancePlan as calculateTauriRebalancePlan } from "./tauri";
 import { COMMANDS, invoke } from "./web/core";
+
+const { platformInvokeMock } = vi.hoisted(() => ({
+  platformInvokeMock: vi.fn(),
+}));
+
+vi.mock("#platform", () => ({ invoke: platformInvokeMock }));
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const frontendSrcDir = path.resolve(currentDir, "..");
@@ -107,6 +114,38 @@ function collectNamedReexports(
   return { hasStar, names };
 }
 
+describe("rebalance eligibility transport", () => {
+  it("canonicalizes the Tauri shared request before web transport", async () => {
+    const mock = stubFetch({});
+    platformInvokeMock
+      .mockReset()
+      .mockImplementation((command, payload) => invoke(command, payload));
+
+    await calculateTauriRebalancePlan("target-1", 100, { type: "all" }, "cash_flow_only", [
+      "asset-z",
+      "asset-a",
+      "asset-z",
+    ]);
+
+    const { body } = lastCall(mock);
+    const parsed = JSON.parse(body as string) as { eligibleAssetIds?: unknown };
+    expect(parsed.eligibleAssetIds).toEqual(["asset-a", "asset-z"]);
+  });
+
+  it("omits the allowlist when no restriction is supplied", async () => {
+    const mock = stubFetch({});
+    await invoke("calculate_rebalance_plan", {
+      targetId: "target-1",
+      availableCash: 100,
+      filter: { type: "all" },
+      scenarioMode: "cash_flow_only",
+    });
+
+    const { body } = lastCall(mock);
+    expect(JSON.parse(body as string)).not.toHaveProperty("eligibleAssetIds");
+  });
+});
+
 describe("adapter command parity", () => {
   it("registers every command reachable from the web adapter", () => {
     const files = [
@@ -187,6 +226,25 @@ describe("adapter command parity", () => {
       categoryId: "EQUITY",
     });
   });
+
+  it("routes historical exchange-rate batches with the request payload", async () => {
+    const response = new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response);
+    vi.stubGlobal("fetch", fetchMock);
+    const request = {
+      pairs: [{ fromCurrency: "USD", toCurrency: "EUR", date: "2026-05-18" }],
+    };
+
+    await invoke("get_exchange_rates_for_dates", { request });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/exchange-rates/historical");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual(request);
+  });
 });
 
 // ─── Scope routing coverage ───────────────────────────────────────────────────
@@ -245,6 +303,75 @@ describe("scope-based routing — get_holdings", () => {
     expect(method).toBe("POST");
     expect(JSON.parse(body as string)).toEqual({
       filter: { type: "accounts", accountIds: ["acc_1", "acc_2"] },
+    });
+  });
+});
+
+describe("scope-based routing — get_holdings_list", () => {
+  it("all → POST /holdings/list/query", async () => {
+    const mock = stubFetch();
+    await invoke("get_holdings_list", { filter: { type: "all" } });
+    const { url, method, body } = lastCall(mock);
+    expect(url).toBe("/api/v1/holdings/list/query");
+    expect(method).toBe("POST");
+    expect(JSON.parse(body as string)).toEqual({ filter: { type: "all" } });
+  });
+
+  it("account → GET /holdings/list?accountId=...", async () => {
+    const mock = stubFetch();
+    await invoke("get_holdings_list", { filter: { type: "account", accountId: "acc_1" } });
+    const { url, method } = lastCall(mock);
+    expect(url).toBe("/api/v1/holdings/list?accountId=acc_1");
+    expect(method).toBe("GET");
+  });
+
+  it("account with closed positions → GET with includeClosed", async () => {
+    const mock = stubFetch();
+    await invoke("get_holdings_list", {
+      filter: { type: "account", accountId: "acc_1" },
+      includeClosed: true,
+    });
+    const { url, method } = lastCall(mock);
+    expect(url).toBe("/api/v1/holdings/list?accountId=acc_1&includeClosed=true");
+    expect(method).toBe("GET");
+  });
+
+  it("portfolio → POST /holdings/list/query", async () => {
+    const mock = stubFetch();
+    await invoke("get_holdings_list", { filter: { type: "portfolio", portfolioId: "pf_1" } });
+    const { url, method, body } = lastCall(mock);
+    expect(url).toBe("/api/v1/holdings/list/query");
+    expect(method).toBe("POST");
+    expect(JSON.parse(body as string)).toEqual({
+      filter: { type: "portfolio", portfolioId: "pf_1" },
+    });
+  });
+
+  it("accounts → POST /holdings/list/query", async () => {
+    const mock = stubFetch();
+    await invoke("get_holdings_list", {
+      filter: { type: "accounts", accountIds: ["acc_1", "acc_2"] },
+    });
+    const { url, method, body } = lastCall(mock);
+    expect(url).toBe("/api/v1/holdings/list/query");
+    expect(method).toBe("POST");
+    expect(JSON.parse(body as string)).toEqual({
+      filter: { type: "accounts", accountIds: ["acc_1", "acc_2"] },
+    });
+  });
+
+  it("all with closed positions → POST with includeClosed", async () => {
+    const mock = stubFetch();
+    await invoke("get_holdings_list", {
+      filter: { type: "all" },
+      includeClosed: true,
+    });
+    const { url, method, body } = lastCall(mock);
+    expect(url).toBe("/api/v1/holdings/list/query");
+    expect(method).toBe("POST");
+    expect(JSON.parse(body as string)).toEqual({
+      filter: { type: "all" },
+      includeClosed: true,
     });
   });
 });
@@ -440,7 +567,7 @@ describe("scope-based routing — performance filters", () => {
       scopes: [{ accountIds: ["acc_2", "acc_1"] }],
       startDate: "2026-01-01",
       endDate: "2026-01-31",
-      profile: "headline",
+      profile: "summary",
     });
 
     const { url, method, body } = lastCall(mock);
@@ -450,7 +577,7 @@ describe("scope-based routing — performance filters", () => {
       scopes: [{ accountIds: ["acc_2", "acc_1"] }],
       startDate: "2026-01-01",
       endDate: "2026-01-31",
-      profile: "headline",
+      profile: "summary",
     });
   });
 });

@@ -1,6 +1,7 @@
 import type { SaveUpProjectionPointDTO } from "@/lib/types";
-import { formatCompactAmount } from "@wealthfolio/ui";
+import { useAmountFormatting, useDateFormatting, useNumberFormatting } from "@wealthfolio/ui";
 import { Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/ui/components/ui/card";
+import { useTranslation } from "react-i18next";
 import {
   Area,
   AreaChart,
@@ -18,22 +19,11 @@ type ProjectionPoint = SaveUpProjectionPointDTO;
 // Keep in sync with the +/- range used by crates/core/src/planning/save_up.rs.
 const RANGE_RATE_DELTA = 0.02;
 
-function formatRate(rate: number) {
-  return `${(rate * 100).toFixed(1)}%`;
-}
-
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
 const COLORS = {
   nominal: { fill: "hsl(92, 24%, 70%)", stroke: "var(--success)" },
   range: { stroke: "hsl(91, 24%, 46%)" },
   target: "var(--muted-foreground)",
 };
-
-function formatDateLabel(v: string) {
-  const [y, m] = v.split("-");
-  return `${MONTHS[Number(m) - 1]} ${y.slice(2)}`;
-}
 
 function ProjectionTooltip({
   active,
@@ -49,28 +39,49 @@ function ProjectionTooltip({
   isHidden: boolean;
   annualReturn: number;
 }) {
+  const formatting = useAmountFormatting();
+  const dateFormatting = useDateFormatting();
+  const numberFormatting = useNumberFormatting();
+  const { t } = useTranslation();
   if (!active || !payload?.length) return null;
   const point = payload[0]?.payload as ProjectionPoint | undefined;
   if (!point) return null;
 
-  const [y, m] = point.date.split("-");
-  const label = `${MONTHS[Number(m) - 1]} ${y}`;
-  const fmt = (v: number) => (isHidden ? "***" : formatCompactAmount(v, currency));
+  const label = dateFormatting.formatCalendarDate(`${point.date}-01`, {
+    calendar: "gregory",
+    month: "short",
+    year: "numeric",
+  });
+  const fmt = (v: number) => (isHidden ? "***" : formatting.formatCompactAmount(v, currency));
 
   const highRate = annualReturn + RANGE_RATE_DELTA;
   const lowRate = Math.max(0, annualReturn - RANGE_RATE_DELTA);
 
   const rows = [
-    { label: "Projected", value: point.nominal, color: COLORS.nominal.stroke, style: "solid" },
-    { label: "Target", value: point.target, color: COLORS.target, style: "dashed" },
     {
-      label: `High range (${formatRate(highRate)})`,
+      label: t("goals:projection.series_projected"),
+      value: point.nominal,
+      color: COLORS.nominal.stroke,
+      style: "solid",
+    },
+    {
+      label: t("goals:projection.series_target"),
+      value: point.target,
+      color: COLORS.target,
+      style: "dashed",
+    },
+    {
+      label: t("goals:projection.high_range", {
+        rate: numberFormatting.formatPercent(highRate, { digits: 1 }),
+      }),
       value: point.optimistic,
       color: COLORS.range.stroke,
       style: "band",
     },
     {
-      label: `Low range (${formatRate(lowRate)})`,
+      label: t("goals:projection.low_range", {
+        rate: numberFormatting.formatPercent(lowRate, { digits: 1 }),
+      }),
       value: point.pessimistic,
       color: COLORS.range.stroke,
       style: "band",
@@ -113,12 +124,21 @@ function ProjectionChart({
   isHidden: boolean;
   annualReturn: number;
 }) {
+  const formatting = useAmountFormatting();
+  const dateFormatting = useDateFormatting();
   const target = data[0]?.target ?? 0;
   const last = data.length > 0 ? data[data.length - 1] : null;
   const finalTarget = last?.target ?? 0;
   const finalProjected = last?.nominal ?? 0;
   const finalDate = last?.date;
-  const fmtCompact = (v: number) => (isHidden ? "***" : formatCompactAmount(v, currency));
+  const fmtCompact = (v: number) =>
+    isHidden ? "***" : formatting.formatCompactAmount(v, currency);
+  const formatDateLabel = (value: string) =>
+    dateFormatting.formatCalendarDate(`${value}-01`, {
+      calendar: "gregory",
+      month: "short",
+      year: "2-digit",
+    });
 
   return (
     <ResponsiveContainer width="100%" height={300}>
@@ -197,8 +217,8 @@ function ProjectionChart({
                 // Render a custom date label anchored to the bottom-right of the
                 // vertical line, matching how the amount callouts sit outside
                 // the plot area on the right. Keeps it clear of the X-axis ticks.
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const vb = (props as any).viewBox ?? {};
+
+                const vb = props.viewBox ?? {};
                 const x = (typeof vb.x === "number" ? vb.x : 0) + 6;
                 const y =
                   (typeof vb.y === "number" ? vb.y : 0) +
@@ -265,14 +285,18 @@ export function SaveUpProjectionCard({
   isHidden: boolean;
   annualReturn: number;
 }) {
+  const { t } = useTranslation();
+  const numberFormatting = useNumberFormatting();
   return (
     <Card>
       <CardHeader className="flex-row items-start justify-between gap-4">
         <div>
           <div className="text-muted-foreground mb-1 text-xs font-medium uppercase tracking-[0.15em]">
-            Projection
+            {t("goals:projection.kicker")}
           </div>
-          <CardTitle className="text-md leading-none tracking-tight">Savings trajectory</CardTitle>
+          <CardTitle className="text-md leading-none tracking-tight">
+            {t("goals:projection.title")}
+          </CardTitle>
         </div>
         <div className="text-muted-foreground flex flex-wrap justify-end gap-x-4 gap-y-1 text-xs">
           <span className="flex items-center gap-1.5">
@@ -280,21 +304,23 @@ export function SaveUpProjectionCard({
               className="inline-block h-[2px] w-5"
               style={{ backgroundColor: COLORS.nominal.stroke }}
             />
-            Projected
+            {t("goals:projection.legend_projected")}
           </span>
           <span className="flex items-center gap-1.5">
             <span
               className="inline-block h-0 w-5 border-t border-dashed"
               style={{ borderColor: COLORS.target }}
             />
-            Target
+            {t("goals:projection.legend_target")}
           </span>
           <span className="flex items-center gap-1.5">
             <span
               className="inline-block h-2 w-5 rounded-[1px]"
               style={{ backgroundColor: COLORS.range.stroke, opacity: 0.18 }}
             />
-            Range (±{(RANGE_RATE_DELTA * 100).toFixed(0)}%)
+            {t("goals:projection.legend_range", {
+              pct: numberFormatting.formatPercent(RANGE_RATE_DELTA, { digits: 0 }),
+            })}
           </span>
         </div>
       </CardHeader>

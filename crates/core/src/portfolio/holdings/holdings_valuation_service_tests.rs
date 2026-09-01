@@ -199,6 +199,16 @@ mod tests {
             Ok(HashMap::new())
         }
 
+        fn get_sparse_asset_market_facts(
+            &self,
+            _requests: &[(String, NaiveDate)],
+        ) -> Result<crate::quotes::SparseAssetMarketFacts> {
+            Err(Error::Unexpected(
+                "MockMarketDataService::get_sparse_asset_market_facts should not be called"
+                    .to_string(),
+            ))
+        }
+
         fn get_latest_quotes_snapshot(
             &self,
             asset_ids: &[String],
@@ -492,6 +502,7 @@ mod tests {
                 pricing_mode: "MARKET".to_string(),
                 preferred_provider: None,
                 exchange_mic: None,
+                instrument_type: None,
                 classifications: None,
             })
         } else {
@@ -502,6 +513,7 @@ mod tests {
             id: id.to_string(),
             account_id: "acc_1".to_string(),
             holding_type,
+            is_closed: false,
             quantity,
             local_currency: local_currency.to_string(),
             base_currency: base_currency.to_string(),
@@ -717,6 +729,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn security_short_valuation_uses_absolute_basis_for_percentages() {
+        let (_fx_service, market_data_service, valuation_service) = setup_test_env();
+
+        let latest_quote = create_quote("2024-01-10", dec!(90.0), "USD");
+        let prev_quote = create_quote("2024-01-09", dec!(100.0), "USD");
+        market_data_service.add_quote_pair("AAPL", latest_quote, Some(prev_quote));
+
+        let mut holdings = vec![create_holding(
+            "h-short",
+            HoldingType::Security,
+            "AAPL",
+            dec!(-10),
+            "USD",
+            "USD",
+            Some(dec!(-1000)),
+            Some("Apple Inc."),
+        )];
+
+        valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await
+            .unwrap();
+        let holding = &holdings[0];
+
+        assert_monetary_value_approx(
+            Some(&holding.market_value),
+            dec!(-900),
+            dec!(-900),
+            TOLERANCE,
+            "Market Value",
+        );
+        assert_monetary_value_approx(
+            holding.cost_basis.as_ref(),
+            dec!(-1000),
+            dec!(-1000),
+            TOLERANCE,
+            "Cost Basis",
+        );
+        assert_monetary_value_approx(
+            holding.unrealized_gain.as_ref(),
+            dec!(100),
+            dec!(100),
+            TOLERANCE,
+            "Unrealized Gain",
+        );
+        assert_decimal_approx(
+            holding.unrealized_gain_pct,
+            dec!(0.1),
+            TOLERANCE,
+            "Unrealized Gain Pct",
+        );
+        assert_monetary_value_approx(
+            holding.prev_close_value.as_ref(),
+            dec!(-1000),
+            dec!(-1000),
+            TOLERANCE,
+            "Prev Close Value",
+        );
+        assert_monetary_value_approx(
+            holding.day_change.as_ref(),
+            dec!(100),
+            dec!(100),
+            TOLERANCE,
+            "Day Change",
+        );
+        assert_decimal_approx(
+            holding.day_change_pct,
+            dec!(0.1),
+            TOLERANCE,
+            "Day Change Pct",
+        );
+        assert_monetary_value_approx(
+            holding.total_gain.as_ref(),
+            dec!(100),
+            dec!(100),
+            TOLERANCE,
+            "Total Gain",
+        );
+        assert_decimal_approx(
+            holding.total_gain_pct,
+            dec!(0.1),
+            TOLERANCE,
+            "Total Gain Pct",
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_short_option_reports_positive_full_gain_percentage() {
+        let (_fx_service, _market_data_service, valuation_service) = setup_test_env();
+
+        let mut holding = create_holding(
+            "h-expired-short-option",
+            HoldingType::Security,
+            "AAPL260116C00200000",
+            dec!(-1),
+            "USD",
+            "USD",
+            Some(dec!(-200)),
+            Some("AAPL expired call"),
+        );
+        holding.metadata = Some(serde_json::json!({
+            "option": {
+                "expiration": "2000-01-01"
+            }
+        }));
+        let mut holdings = vec![holding];
+
+        valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await
+            .unwrap();
+        let holding = &holdings[0];
+
+        assert_eq!(holding.market_value, MonetaryValue::zero());
+        assert_monetary_value_approx(
+            holding.unrealized_gain.as_ref(),
+            dec!(200),
+            dec!(200),
+            TOLERANCE,
+            "Unrealized Gain",
+        );
+        assert_decimal_approx(
+            holding.unrealized_gain_pct,
+            dec!(1),
+            TOLERANCE,
+            "Unrealized Gain Pct",
+        );
+        assert_monetary_value_approx(
+            holding.total_gain.as_ref(),
+            dec!(200),
+            dec!(200),
+            TOLERANCE,
+            "Total Gain",
+        );
+        assert_decimal_approx(holding.total_gain_pct, dec!(1), TOLERANCE, "Total Gain Pct");
+    }
+
+    #[tokio::test]
+    async fn security_valuation_with_zero_basis_returns_no_gain_percent() {
+        let (_fx_service, market_data_service, valuation_service) = setup_test_env();
+
+        let latest_quote = create_quote("2024-01-10", dec!(100.0), "CAD");
+        market_data_service.add_quote_pair("ZERO", latest_quote, None);
+
+        let mut holdings = vec![create_holding(
+            "h-zero",
+            HoldingType::Security,
+            "ZERO",
+            dec!(10),
+            "CAD",
+            "CAD",
+            Some(Decimal::ZERO),
+            Some("Zero Basis Corp"),
+        )];
+
+        let result = valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await;
+        assert!(result.is_ok());
+
+        let holding = &holdings[0];
+        assert_monetary_value_approx(
+            Some(&holding.market_value),
+            dec!(1000),
+            dec!(1000),
+            TOLERANCE,
+            "Market Value",
+        );
+        assert_monetary_value_approx(
+            holding.unrealized_gain.as_ref(),
+            dec!(1000),
+            dec!(1000),
+            TOLERANCE,
+            "Unrealized Gain",
+        );
+        assert!(holding.unrealized_gain_pct.is_none());
+        assert!(holding.total_gain_pct.is_none());
+    }
+
+    #[tokio::test]
     async fn test_security_valuation_with_fx() {
         let (fx_service, market_data_service, valuation_service) = setup_test_env();
         let usd_cad_rate = fx_service.get_latest_exchange_rate("USD", "CAD").unwrap(); // 1.3
@@ -815,6 +1007,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn security_valuation_with_fx_equal_cost_and_price_has_zero_gain_percent() {
+        let (_fx_service, market_data_service, valuation_service) = setup_test_env();
+
+        let latest_quote = create_quote("2024-01-10", dec!(50.0), "USD");
+        market_data_service.add_quote_pair("FXFLAT", latest_quote, None);
+
+        let mut holdings = vec![create_holding(
+            "h-fx-flat",
+            HoldingType::Security,
+            "FXFLAT",
+            dec!(100),
+            "CAD",
+            "CAD",
+            Some(dec!(6500.0)),
+            Some("FX Flat Corp"),
+        )];
+
+        let result = valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await;
+        assert!(result.is_ok());
+
+        let holding = &holdings[0];
+        assert_monetary_value_approx(
+            Some(&holding.market_value),
+            dec!(6500.0),
+            dec!(6500.0),
+            TOLERANCE,
+            "Market Value",
+        );
+        assert_monetary_value_approx(
+            holding.unrealized_gain.as_ref(),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            TOLERANCE,
+            "Unrealized Gain",
+        );
+        assert_eq!(holding.unrealized_gain_pct, Some(Decimal::ZERO));
+        assert_eq!(holding.total_gain_pct, Some(Decimal::ZERO));
+    }
+
+    #[tokio::test]
+    async fn issue_1277_transfer_in_fx_effect_does_not_change_holding_return_pct() {
+        let (fx_service, market_data_service, valuation_service) = setup_test_env();
+        fx_service.add_rate("USD", "MXN", dec!(17.46));
+
+        market_data_service.add_quote_pair(
+            "TRANSFERRED",
+            create_quote("2024-01-10", dec!(91.63), "USD"),
+            None,
+        );
+
+        let mut holdings = vec![create_holding(
+            "h-transfer-in",
+            HoldingType::Security,
+            "TRANSFERRED",
+            dec!(1),
+            "USD",
+            "MXN",
+            Some(dec!(91.50)),
+            Some("Transferred security"),
+        )];
+        // A TRANSFER_IN lot keeps the base cost recorded at the historical FX rate.
+        holdings[0].cost_basis.as_mut().unwrap().base = dec!(726.61);
+
+        valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await
+            .unwrap();
+
+        let holding = &holdings[0];
+        assert_monetary_value_approx(
+            holding.unrealized_gain.as_ref(),
+            dec!(0.13),
+            dec!(873.2498),
+            TOLERANCE,
+            "Unrealized Gain",
+        );
+        assert_eq!(holding.unrealized_gain_pct, Some(dec!(0.0014)));
+        assert_eq!(holding.total_gain_pct, Some(dec!(0.0014)));
+    }
+
+    #[tokio::test]
     async fn issue_408_preserves_historical_base_cost_basis() {
         let (fx_service, market_data_service, valuation_service) = setup_test_env();
         fx_service.add_rate("USD", "EUR", dec!(0.8));
@@ -864,7 +1139,7 @@ mod tests {
         );
         assert_decimal_approx(
             holding.unrealized_gain_pct,
-            dec!(-0.1200),
+            dec!(0.1000),
             TOLERANCE,
             "Unrealized Gain Pct",
         );
@@ -1811,14 +2086,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_zero_quantity_security() {
+    async fn test_zero_quantity_security_does_not_fetch_quotes() {
         let (_fx_service, market_data_service, valuation_service) = setup_test_env();
 
-        market_data_service.add_quote_pair(
-            "XYZ.TO",
-            create_quote("2024-01-10", dec!(150.0), "CAD"),
-            Some(create_quote("2024-01-09", dec!(145.0), "CAD")),
-        );
+        *market_data_service.should_fail.lock().unwrap() = true;
 
         let mut holdings = vec![create_holding(
             "h_zero",
@@ -1984,5 +2255,63 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert!(holdings.is_empty()); // Should remain empty
+    }
+    #[tokio::test]
+    async fn test_security_valuation_applies_contract_multiplier() {
+        // Every other fixture in this suite uses multiplier 1, which hides
+        // any wrong multiplier completely (x1 is a no-op). Lock the actual
+        // multiplication: market value = price x qty x contract_multiplier,
+        // for a standard option (100) and a mini (10) - PR #1571 review, T2.
+        let (_fx_service, market_data_service, valuation_service) = setup_test_env();
+
+        let latest_quote = create_quote("2024-01-10", dec!(5.5), "USD");
+        market_data_service.add_quote_pair("OPT100", latest_quote.clone(), None);
+        market_data_service.add_quote_pair("OPT10", latest_quote, None);
+
+        let mut standard = create_holding(
+            "h-opt-100",
+            HoldingType::Security,
+            "OPT100",
+            dec!(2),
+            "USD",
+            "USD",
+            Some(dec!(1000.0)),
+            Some("Standard option"),
+        );
+        standard.contract_multiplier = dec!(100);
+        let mut mini = create_holding(
+            "h-opt-10",
+            HoldingType::Security,
+            "OPT10",
+            dec!(2),
+            "USD",
+            "USD",
+            Some(dec!(100.0)),
+            Some("Mini option"),
+        );
+        mini.contract_multiplier = dec!(10);
+
+        let mut holdings = vec![standard, mini];
+        valuation_service
+            .calculate_holdings_live_valuation(&mut holdings)
+            .await
+            .expect("valuation");
+
+        // 2 contracts x $5.50 x 100 = $1,100
+        assert_monetary_value_approx(
+            Some(&holdings[0].market_value),
+            dec!(1100.0),
+            dec!(1100.0),
+            TOLERANCE,
+            "Standard option market value",
+        );
+        // 2 contracts x $5.50 x 10 = $110 - NOT $1,100
+        assert_monetary_value_approx(
+            Some(&holdings[1].market_value),
+            dec!(110.0),
+            dec!(110.0),
+            TOLERANCE,
+            "Mini option market value",
+        );
     }
 }

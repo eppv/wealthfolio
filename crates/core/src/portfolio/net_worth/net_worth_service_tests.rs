@@ -8,11 +8,13 @@ use crate::assets::{
 };
 use crate::errors::Result;
 use crate::fx::{ExchangeRate, FxServiceTrait, NewExchangeRate};
+use crate::portfolio::economic_events::BasisStatus;
 use crate::portfolio::snapshot::{
     AccountStateSnapshot, Position, SnapshotRepositoryTrait, SnapshotSource,
 };
 use crate::portfolio::valuation::{
     DailyAccountValuation, ExternalFlowSource, NegativeBalanceInfo, ValuationRepositoryTrait,
+    ValuationStatus,
 };
 use crate::quotes::{
     LatestQuotePair, LatestQuoteSnapshot, ProviderInfo, Quote, QuoteImport, QuoteServiceTrait,
@@ -291,17 +293,6 @@ impl SnapshotRepositoryTrait for MockSnapshotRepository {
         unimplemented!()
     }
 
-    fn get_non_calculated_snapshot_count(&self, _account_id: &str) -> Result<usize> {
-        Ok(0)
-    }
-
-    fn get_earliest_non_calculated_snapshot(
-        &self,
-        _account_id: &str,
-    ) -> Result<Option<AccountStateSnapshot>> {
-        Ok(None)
-    }
-
     fn get_snapshot_positions(&self, _snapshot_id: &str) -> Result<HashMap<String, Position>> {
         Ok(HashMap::new())
     }
@@ -362,6 +353,16 @@ impl QuoteServiceTrait for MockMarketDataRepository {
         _as_of: chrono::NaiveDate,
     ) -> Result<HashMap<String, Quote>> {
         Ok(HashMap::new())
+    }
+
+    fn get_sparse_asset_market_facts(
+        &self,
+        _requests: &[(String, NaiveDate)],
+    ) -> Result<crate::quotes::SparseAssetMarketFacts> {
+        Err(crate::errors::Error::Unexpected(
+            "MockMarketDataRepository::get_sparse_asset_market_facts should not be called"
+                .to_string(),
+        ))
     }
 
     fn get_latest_quotes_snapshot(
@@ -919,6 +920,8 @@ fn create_test_position(
         last_updated: Utc::now(),
         is_alternative: false,
         contract_multiplier: Decimal::ONE,
+        cost_basis_account: None,
+        cost_basis_base: None,
     }
 }
 
@@ -1029,16 +1032,24 @@ fn create_total_valuation(
         investment_market_value: total_value,
         total_value,
         cost_basis: net_contribution,
+        book_basis: net_contribution,
         net_contribution,
         cash_balance_base: Decimal::ZERO,
         investment_market_value_base: total_value,
         total_value_base: total_value,
         cost_basis_base: net_contribution,
+        book_basis_base: net_contribution,
         net_contribution_base: net_contribution,
         external_inflow_base: Decimal::ZERO,
         external_outflow_base: Decimal::ZERO,
         external_flow_source: ExternalFlowSource::Unknown,
         performance_eligible_value_base: total_value,
+        value_status: ValuationStatus::Complete,
+        basis_status: if total_value.is_zero() {
+            BasisStatus::NotApplicable
+        } else {
+            BasisStatus::Complete
+        },
         calculated_at: Utc::now(),
     }
 }
@@ -1059,16 +1070,20 @@ fn create_account_valuation(
         investment_market_value: Decimal::ZERO,
         total_value,
         cost_basis: Decimal::ZERO,
+        book_basis: total_value,
         net_contribution: Decimal::ZERO,
         cash_balance_base: total_value,
         investment_market_value_base: Decimal::ZERO,
         total_value_base: total_value,
         cost_basis_base: Decimal::ZERO,
+        book_basis_base: total_value,
         net_contribution_base: Decimal::ZERO,
         external_inflow_base: Decimal::ZERO,
         external_outflow_base: Decimal::ZERO,
         external_flow_source: ExternalFlowSource::Unknown,
         performance_eligible_value_base: total_value,
+        value_status: ValuationStatus::Complete,
+        basis_status: BasisStatus::NotApplicable,
         calculated_at: Utc::now(),
     }
 }
@@ -1124,6 +1139,38 @@ async fn test_single_investment_account() {
     assert_eq!(result.assets.total, dec!(18500));
     assert_eq!(result.liabilities.total, Decimal::ZERO);
     assert_eq!(get_category_value(&result, "investments"), dec!(18500));
+}
+
+#[tokio::test]
+async fn test_net_worth_uses_stored_investment_valuation_and_keeps_alternatives() {
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let account = create_test_account("account-1", "SECURITIES", "USD");
+    let asset = create_test_asset("NFLX", AssetKind::Investment, "USD");
+    let property_asset = create_test_asset("PROP-1", AssetKind::Property, "USD");
+    let position = create_test_position("account-1", "NFLX", dec!(20), dec!(200), "USD");
+    let property_position = create_test_position("account-1", "PROP-1", dec!(1), dec!(5000), "USD");
+    let snapshot = create_test_snapshot(
+        "account-1",
+        vec![position, property_position],
+        HashMap::new(),
+    );
+    let quote = create_test_quote("NFLX", dec!(100), date, "USD");
+    let property_quote = create_test_quote("PROP-1", dec!(5000), date, "USD");
+
+    let service = create_net_worth_service_with_valuations(
+        vec![account],
+        vec![asset, property_asset],
+        vec![snapshot],
+        vec![quote, property_quote],
+        vec![create_total_valuation(date, dec!(20000), Decimal::ZERO)],
+    );
+
+    let result = service.get_net_worth(date).await.unwrap();
+
+    assert_eq!(result.net_worth, dec!(25000));
+    assert_eq!(result.assets.total, dec!(25000));
+    assert_eq!(get_category_value(&result, "investments"), dec!(20000));
+    assert_eq!(get_category_value(&result, "properties"), dec!(5000));
 }
 
 #[tokio::test]
@@ -1275,6 +1322,107 @@ async fn test_credit_card_multi_currency_nets_before_liability_split() {
     assert_eq!(history[0].total_assets, Decimal::ZERO);
     assert_eq!(history[0].total_liabilities, dec!(300));
     assert_eq!(history[0].net_worth, dec!(-300));
+}
+
+#[tokio::test]
+async fn test_dust_cash_balance_excluded_from_cash_breakdown() {
+    let dusty = create_test_account("acc1", "SECURITIES", "USD");
+    let funded = create_test_account("acc2", "SECURITIES", "USD");
+    let mut dust = HashMap::new();
+    dust.insert("USD".to_string(), dec!(0.000000000000001));
+    let mut funds = HashMap::new();
+    funds.insert("USD".to_string(), dec!(2500));
+
+    let service = create_net_worth_service(
+        vec![dusty, funded],
+        vec![],
+        vec![
+            create_test_snapshot("acc1", vec![], dust),
+            create_test_snapshot("acc2", vec![], funds),
+        ],
+        vec![],
+    );
+
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let result = service.get_net_worth(date).await.unwrap();
+
+    assert_eq!(get_category_value(&result, "cash"), dec!(2500));
+
+    // The dusty account must not appear as a $0 row in the Cash drill-down.
+    let cash = result
+        .assets
+        .breakdown
+        .iter()
+        .find(|b| b.category == "cash")
+        .unwrap();
+    assert_eq!(cash.children.len(), 1);
+    assert_eq!(cash.children[0].name, "Test Account acc2 (USD)");
+}
+
+#[tokio::test]
+async fn test_real_small_cash_balance_still_included() {
+    let account = create_test_account("acc1", "SECURITIES", "USD");
+    let mut cash = HashMap::new();
+    cash.insert("USD".to_string(), dec!(0.02));
+    let snapshot = create_test_snapshot("acc1", vec![], cash);
+
+    let service = create_net_worth_service(vec![account], vec![], vec![snapshot], vec![]);
+
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let result = service.get_net_worth(date).await.unwrap();
+
+    assert_eq!(get_category_value(&result, "cash"), dec!(0.02));
+}
+
+#[tokio::test]
+async fn test_dust_stored_valuation_cash_excluded_from_cash_breakdown() {
+    let dusty = create_test_account("acc1", "SECURITIES", "USD");
+    let funded = create_test_account("acc2", "SECURITIES", "USD");
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+
+    let service = create_net_worth_service_with_valuations(
+        vec![dusty, funded],
+        vec![],
+        vec![
+            create_test_snapshot("acc1", vec![], HashMap::new()),
+            create_test_snapshot("acc2", vec![], HashMap::new()),
+        ],
+        vec![],
+        vec![
+            create_account_valuation("acc1", date, dec!(0.000000000000001)),
+            create_account_valuation("acc2", date, dec!(2500)),
+        ],
+    );
+
+    let result = service.get_net_worth(date).await.unwrap();
+
+    assert_eq!(get_category_value(&result, "cash"), dec!(2500));
+
+    let cash = result
+        .assets
+        .breakdown
+        .iter()
+        .find(|b| b.category == "cash")
+        .unwrap();
+    assert_eq!(cash.children.len(), 1);
+    assert_eq!(cash.children[0].name, "Test Account acc2");
+}
+
+#[tokio::test]
+async fn test_dust_credit_card_balance_produces_no_liability_row() {
+    let account = create_test_account("card1", "CREDIT_CARD", "USD");
+    let mut cash = HashMap::new();
+    cash.insert("USD".to_string(), dec!(-0.000000000000001));
+    let snapshot = create_test_snapshot("card1", vec![], cash);
+
+    let service = create_net_worth_service(vec![account], vec![], vec![snapshot], vec![]);
+
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let result = service.get_net_worth(date).await.unwrap();
+
+    assert!(result.liabilities.breakdown.is_empty());
+    assert_eq!(result.liabilities.total, Decimal::ZERO);
+    assert_eq!(result.net_worth, Decimal::ZERO);
 }
 
 #[tokio::test]

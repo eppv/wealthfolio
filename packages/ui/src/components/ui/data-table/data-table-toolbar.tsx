@@ -1,5 +1,6 @@
 import { Table } from "@tanstack/react-table";
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { cn } from "../../../lib/utils";
 import { Button } from "../button";
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuTrigger } from "../dropdown-menu";
@@ -15,6 +16,8 @@ interface DataTableToolbarProps<TData> {
   table: Table<TData>;
   searchBy?: string;
   filters?: DataTableFacetedFilterProps<TData, unknown>[];
+  viewControl?: React.ReactNode;
+  additionalFilters?: React.ReactNode;
   showColumnToggle?: boolean;
   actions?: React.ReactNode;
 }
@@ -23,18 +26,22 @@ export function DataTableToolbar<TData>({
   table,
   searchBy,
   filters,
+  viewControl,
+  additionalFilters,
   showColumnToggle = false,
   actions,
 }: DataTableToolbarProps<TData>) {
+  const { t } = useTranslation();
   const isFiltered = table.getState().columnFilters.length > 0 || table.getState().globalFilter;
   const hideableColumns = table.getAllColumns().filter((column) => column.getCanHide());
 
   return (
-    <div className="flex items-center justify-between">
-      <div className="flex flex-1 items-center space-x-2">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+        {viewControl}
         {searchBy && (
           <SearchInput
-            placeholder="Search ..."
+            placeholder={t("ui:dataTable.search", "Search ...")}
             value={table.getState().globalFilter ?? ""}
             onChange={(value) => table.setGlobalFilter(value)}
             className="w-[150px] lg:w-[250px]"
@@ -49,6 +56,7 @@ export function DataTableToolbar<TData>({
             options={filter.options}
           />
         ))}
+        {additionalFilters}
         {isFiltered && (
           <Button
             variant="ghost"
@@ -58,7 +66,7 @@ export function DataTableToolbar<TData>({
             }}
             className="h-8 px-2 lg:px-3"
           >
-            Reset
+            {t("ui:dataTable.reset", "Reset")}
             <Icons.Close className="ml-2 h-4 w-4" />
           </Button>
         )}
@@ -73,7 +81,7 @@ export function DataTableToolbar<TData>({
                 size="sm"
                 className="bg-secondary/30 hover:bg-muted/80 ml-auto gap-1.5 rounded-md border-[1.5px] border-none px-3 py-1 text-sm font-medium"
               >
-                Columns <Icons.ChevronDown className="ml-2 h-4 w-4" />
+                {t("ui:dataTable.columns", "Columns")} <Icons.ChevronDown className="ml-2 h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
@@ -109,6 +117,7 @@ function SearchInput({
   placeholder?: string;
   className?: string;
 }) {
+  const { t } = useTranslation();
   const [value, setValue] = useState(initialValue);
 
   useEffect(() => {
@@ -153,7 +162,7 @@ function SearchInput({
           className="text-muted-foreground hover:text-foreground absolute right-2 top-1/2 -translate-y-1/2"
         >
           <Icons.Close className="h-4 w-4" />
-          <span className="sr-only">Clear search</span>
+          <span className="sr-only">{t("ui:search.clear", "Clear search")}</span>
         </button>
       )}
     </div>

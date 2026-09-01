@@ -64,6 +64,9 @@ export default defineConfig({
     port: Number.isFinite(devPort) ? devPort : 1420,
     strictPort: true,
     host: host ? "0.0.0.0" : false,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+    },
     hmr: host
       ? {
           protocol: "ws",
@@ -81,10 +84,19 @@ export default defineConfig({
   // https://tauri.app/v1/api/config#buildconfig.beforedevcommand
   envPrefix: ["VITE_", "TAURI_", "CONNECT_"],
   build: {
+    target: ["chrome107", "edge107", "firefox104", "safari16"],
     // Output to project root's dist folder (for Tauri)
     outDir: "../../dist",
-    // Tauri uses Chromium on Windows and WebKit on macOS and Linux
-    // Keep target unset to use modern defaults for desktop WebView engines.
+    // outDir is outside the Vite root, so Vite won't clean it by default —
+    // stale hashed bundles then accumulate and Tauri embeds the ENTIRE dist
+    // tree into release builds (tauri.conf.json frontendDist).
+    emptyOutDir: true,
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        "addon-sandbox": path.resolve(__dirname, "addon-sandbox.html"),
+      },
+    },
     // don't minify for debug builds
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
     // produce sourcemaps for debug builds

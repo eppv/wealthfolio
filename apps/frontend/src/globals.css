@@ -456,7 +456,9 @@
 
   --mobile-nav-ui-height: 64px; /* nav bar height */
   --mobile-nav-gap: 12px; /* space between nav and bottom */
-  --mobile-nav-bottom-offset: max(var(--mobile-nav-gap), env(safe-area-inset-bottom));
+  /* iOS WKWebView can report an oversized bottom inset after relaunch. */
+  --mobile-safe-area-bottom: min(env(safe-area-inset-bottom, 0px), 44px);
+  --mobile-nav-bottom-offset: max(var(--mobile-nav-gap), var(--mobile-safe-area-bottom));
   --mobile-nav-total-offset: calc(var(--mobile-nav-ui-height) + var(--mobile-nav-bottom-offset));
 
   /* Sonner toast overrides - solid backgrounds for better readability */
@@ -671,6 +673,14 @@ body.qr-scan-active .scan-hide-target {
     padding-bottom: var(--mobile-nav-total-offset) !important;
   }
 
+  /* Add-on routes scroll inside their sandbox iframe, so host page padding
+     cannot create bottom-nav clearance. Keep the entire sandbox viewport,
+     including its loading/error states, above the floating navigation. */
+  [data-page-scroll-container][data-with-mobile-nav-offset="true"]
+    [data-addon-route-viewport="true"] {
+    height: calc(100% - var(--mobile-nav-total-offset));
+  }
+
   .touch-manipulation {
     touch-action: manipulation;
   }
@@ -701,6 +711,19 @@ body.qr-scan-active .scan-hide-target {
   .safe-area-inset-x {
     padding-left: env(safe-area-inset-left, 0);
     padding-right: env(safe-area-inset-right, 0);
+  }
+
+  /*
+   * Nudges a header's leading group clear of the macOS traffic lights when no
+   * sidebar covers the top-left corner. Uses a transform, not padding or
+   * margin, so only this group moves -- the row's other content (page actions
+   * on the trailing edge) keeps its original position.
+   */
+  .titlebar-nudge {
+    /* Holds the whole transform so the default is `none`, not translateY(0px):
+       any transform other than `none` would create a stacking context and a
+       containing block for fixed/absolute descendants on every platform. */
+    transform: var(--titlebar-nudge, none);
   }
 
   /* Dynamic viewport height to avoid mobile address bar issues */

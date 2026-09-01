@@ -1,10 +1,11 @@
 import { useHapticFeedback } from "@/hooks";
-import { ChartConfig, ChartContainer } from "@wealthfolio/ui/components/ui/chart";
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
 import { useIsMobileViewport } from "@/hooks/use-platform";
 import { formatDate } from "@/lib/utils";
-import { AmountDisplay } from "@wealthfolio/ui";
+import { AmountDisplay, useDateFormatting } from "@wealthfolio/ui";
+import { ChartConfig, ChartContainer } from "@wealthfolio/ui/components/ui/chart";
 import { useId, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Area, AreaChart, ReferenceDot, Tooltip, XAxis, YAxis } from "recharts";
 import type { MouseHandlerDataParam } from "recharts/types/synchronisation/types";
 import {
@@ -62,6 +63,9 @@ const CustomTooltip = ({
   isBalanceHidden,
   isChartHovered,
 }: CustomTooltipProps) => {
+  const dateFormatting = useDateFormatting();
+
+  const { t } = useTranslation();
   if (!active || !payload?.length) {
     return null;
   }
@@ -87,12 +91,14 @@ const CustomTooltip = ({
 
   return (
     <div className="bg-popover pointer-events-none grid grid-cols-1 gap-1.5 rounded-md border p-2 shadow-md">
-      <p className="text-muted-foreground text-xs">{formatDate(tvPayload.date)}</p>
+      <p className="text-muted-foreground text-xs">{formatDate(tvPayload.date, dateFormatting)}</p>
 
       <div className="flex items-center justify-between space-x-2">
         <div className="flex items-center space-x-1.5">
           <span className="block h-0.5 w-3" style={{ backgroundColor: tooltipColor }} />
-          <span className="text-muted-foreground text-xs">Total Value:</span>
+          <span className="text-muted-foreground text-xs">
+            {t("common:component.total_value_label")}
+          </span>
         </div>
         <AmountDisplay
           value={tvPayload.totalValue}
@@ -108,7 +114,9 @@ const CustomTooltip = ({
               className="block h-0 w-3 border-b-2 border-dashed"
               style={{ borderColor: "var(--muted-foreground)" }}
             />
-            <span className="text-muted-foreground text-xs">Net Deposit:</span>
+            <span className="text-muted-foreground text-xs">
+              {t("common:component.net_deposit_label")}
+            </span>
           </div>
           <AmountDisplay
             value={netContributionPayload.netContribution}
@@ -132,6 +140,7 @@ export function HistoryChart({
   netContributionMaxDomainSpanRatio,
   minDomainSpanRatio,
 }: HistoryChartProps) {
+  const { t } = useTranslation();
   const { triggerHaptic } = useHapticFeedback();
   const { isBalanceHidden } = useBalancePrivacy();
   const [isChartHovered, setIsChartHovered] = useState(false);
@@ -157,10 +166,10 @@ export function HistoryChart({
 
   const chartConfig = {
     totalValue: {
-      label: "Total Value",
+      label: t("common:component.total_value"),
     },
     netContribution: {
-      label: "Net Contribution",
+      label: t("common:component.net_contribution"),
     },
   } satisfies ChartConfig;
 
@@ -215,6 +224,8 @@ export function HistoryChart({
     () => new Set(markerDataPoints.map((p) => p.date)),
     [markerDataPoints],
   );
+  const singleDataPoint =
+    data.length === 1 && !markerDateSet.has(data[0].date) ? data[0] : undefined;
 
   if (isLoading && data.length === 0) {
     return null;
@@ -397,6 +408,16 @@ export function HistoryChart({
               )}
             />
           ))}
+        {singleDataPoint && (
+          <ReferenceDot
+            x={singleDataPoint.date}
+            y={singleDataPoint.totalValue}
+            r={4}
+            fill={singleDataPoint.totalValue >= 0 ? "var(--success)" : "var(--destructive)"}
+            stroke="var(--background)"
+            strokeWidth={2}
+          />
+        )}
       </AreaChart>
     </ChartContainer>
   );
