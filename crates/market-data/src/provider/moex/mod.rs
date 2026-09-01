@@ -43,7 +43,6 @@ struct MoexDataTable {
 #[derive(Debug, Deserialize)]
 struct MoexLatestResponse {
     marketdata: Option<MoexDataTable>,
-    securities: Option<MoexDataTable>,
     dataversion: Option<MoexDataTable>,
 }
 
@@ -51,8 +50,6 @@ struct MoexLatestResponse {
 #[derive(Debug, Deserialize)]
 struct MoexHistoryResponse {
     history: MoexDataTable,
-    #[serde(rename = "history.cursor")]
-    cursor: Option<MoexDataTable>,
 }
 
 /// Search response structure.
@@ -65,7 +62,6 @@ struct MoexSearchResponse {
 #[derive(Debug, Deserialize)]
 struct MoexProfileResponse {
     description: Option<MoexDataTable>,
-    boards: Option<MoexDataTable>,
 }
 
 // ============================================================================
